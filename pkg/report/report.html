@@ -1,0 +1,2024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Out-of-Band Exposure</title>
+<style>
+:root{
+  --paper:#f5f7f5; --surface:#ffffff; --ink:#152019; --muted:#65726b; --faint:#98a49d;
+  --rule:#dde4df; --rule-2:#c6d0c9; --shadow:0 18px 50px rgba(20,34,25,.14);
+  --danger:#c02a3d; --crit:#b0243a; --high:#d5602c; --med:#c9960e; --low:#6b8f3f; --info:#7f8c85;
+  /* per-source accents (filled in per index by JS via --a0.. as needed) */
+  --a0:#0f8a5f; --a1:#d5602c; --a2:#2f6bc4; --a3:#7c4bc0; --a4:#0f9a9a; --a5:#c0398a;
+  --a0soft:#dcf0e8; --a1soft:#f9e2d7; --a2soft:#e0eafa; --a3soft:#ece2f8; --a4soft:#d9f1f1; --a5soft:#f9e0ef;
+}
+*{box-sizing:border-box}
+html{background:var(--paper)}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font:15px/1.4 "Atkinson Hyperlegible","Inter","Avenir Next","Segoe UI",Verdana,sans-serif;letter-spacing:0}
+button,input,select{font:inherit;color:inherit}
+::selection{background:#bfe9d7;color:#0b3326}
+h1,h2,h3{margin:0;font-weight:700}
+.num{font-variant-numeric:tabular-nums}
+
+/* ---- Top bar ---- */
+.topbar{position:sticky;top:0;z-index:40;height:58px;display:flex;align-items:center;gap:18px;
+  padding:0 20px;background:rgba(255,255,255,.94);border-bottom:1px solid var(--rule);backdrop-filter:blur(14px)}
+.brand{display:flex;align-items:center;font-weight:700;white-space:nowrap}
+.nav{display:flex;align-items:stretch;gap:2px;height:100%;margin-left:6px;overflow-x:auto;scrollbar-width:none}
+.nav::-webkit-scrollbar{display:none}
+.tab{appearance:none;border:0;background:transparent;padding:0 12px;position:relative;color:var(--muted);
+  cursor:pointer;font-weight:700;font-size:13px;white-space:nowrap;display:flex;align-items:center;gap:7px}
+.tab::after{content:"";position:absolute;height:3px;left:8px;right:8px;bottom:0;background:var(--ink);
+  transform:scaleX(0);transition:transform .3s cubic-bezier(.2,.8,.2,1)}
+.tab:hover{color:var(--ink)}
+.tab.on{color:var(--ink)}
+.tab.on::after{transform:scaleX(1)}
+.tab .dot{width:8px;height:8px;border-radius:50%}
+.spacer{flex:1}
+.dropdown{position:relative}
+.dropdown>button{border:1px solid var(--rule-2);background:var(--surface);height:34px;padding:0 12px;border-radius:6px;
+  font-weight:700;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:7px;white-space:nowrap;flex:none}
+.dropdown>button:hover{border-color:var(--ink)}
+.menu{position:absolute;right:0;top:40px;min-width:230px;background:var(--surface);border:1px solid var(--rule-2);
+  border-radius:8px;box-shadow:var(--shadow);padding:6px;display:none;z-index:60;max-height:70vh;overflow:auto}
+.menu.on{display:block}
+.menu .grp{padding:8px 10px 4px;color:var(--faint);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
+.menu button{display:flex;align-items:center;gap:8px;width:100%;text-align:left;border:0;background:transparent;
+  padding:7px 10px;border-radius:6px;cursor:pointer;font-size:13px;white-space:nowrap}
+.menu button:hover{background:var(--paper)}
+.act{border:1px solid var(--rule-2);background:var(--surface);height:34px;padding:0 12px;border-radius:6px;
+  font-weight:700;font-size:12px;cursor:pointer;white-space:nowrap;flex:none;
+  transition:border-color .15s,transform .15s,box-shadow .15s}
+.act:hover{border-color:var(--ink);box-shadow:0 4px 14px rgba(20,34,25,.09);transform:translateY(-1px)}
+.act.primary{background:var(--ink);color:#fff;border-color:var(--ink)}
+kbd{min-width:18px;height:18px;display:inline-grid;place-items:center;border:1px solid var(--rule-2);
+  border-bottom-width:2px;background:var(--paper);border-radius:4px;font:700 11px/1 inherit;padding:0 4px}
+
+/* ---- Stage ---- */
+.stage{max-width:1500px;margin:0 auto;padding:22px 26px 70px}
+.view{display:none}
+.view.on{display:block}
+@keyframes vin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* Slide scenes: bounded 16:9 canvas so a screenshot is deck-ready. */
+.slide{background:var(--surface);border:1px solid var(--rule);border-radius:14px;box-shadow:var(--shadow);
+  padding:30px 34px;overflow:hidden}
+@media(min-width:1120px){
+  .slide{aspect-ratio:16/9;display:flex;flex-direction:column}
+  .slide .fill{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin}
+}
+.detail{padding:2px}
+.detail .bar{grid-template-columns:minmax(240px,360px) 1fr auto}
+.detail .bar .k{max-width:360px}
+
+.slide-head{display:flex;justify-content:space-between;align-items:flex-start;gap:24px;margin-bottom:16px}
+.eyebrow{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);margin-bottom:6px}
+/* Consistent headline size across every slide (no big/small variance). */
+.slide-head h1,.slide-head h2{font-size:26px;line-height:1.06;font-weight:800;letter-spacing:-.01em}
+.slide-sub{color:var(--muted);font-size:12px;text-align:right;white-space:nowrap}
+.slide-sub b{display:block;color:var(--ink);font-size:14px}
+
+/* Metric strip */
+.metrics{display:grid;gap:0;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule)}
+.metrics.cols{grid-auto-flow:column;grid-auto-columns:1fr}
+.metric{padding:14px 20px;border-left:1px solid var(--rule)}
+.metric:first-child{border-left:0;padding-left:2px}
+.metric .l{color:var(--muted);font-size:11px;margin-bottom:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.metric .v{font-weight:700;font-size:26px;line-height:1}
+.metric .n{color:var(--muted);font-size:11px;margin-top:5px}
+
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:30px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:26px}
+.panel-title{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);
+  font-size:12px;font-weight:700;margin:2px 0 12px;text-transform:uppercase;letter-spacing:.08em}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.panel-cap{font-size:11.5px;line-height:1.5;color:var(--muted);margin:-6px 0 12px;max-width:52ch}
+.legend i{width:9px;height:9px;border-radius:2px}
+
+/* Bar rows (single series) */
+.bars{display:flex;flex-direction:column;gap:7px}
+.bar{display:grid;grid-template-columns:minmax(96px,150px) 1fr auto;gap:12px;align-items:center;font-size:13px;
+}
+.bar .k{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.bar .track{height:14px;background:var(--paper);border-radius:3px;overflow:hidden}
+.bar .fillbar{height:100%;border-radius:3px;background:var(--a0)}
+.bar .val{font-weight:700;text-align:right;font-variant-numeric:tabular-nums;min-width:110px}
+.bar .val small{color:var(--muted);font-weight:400;margin-left:6px;min-width:56px;display:inline-block;text-align:right}
+.detail .bar .val{min-width:150px}
+.detail .bar .val small{min-width:64px}
+@keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+@keyframes rise{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
+
+/* Paired / grouped comparison rows */
+.cmp{display:flex;flex-direction:column;gap:9px}
+.cmp-row{display:grid;grid-template-columns:minmax(120px,200px) 1fr;gap:14px;align-items:center}
+.cmp-row .k{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cmp-bars{display:flex;flex-direction:column;gap:4px}
+.cmp-line{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
+.cmp-track{height:11px;background:var(--paper);border-radius:3px;overflow:hidden}
+.cmp-fill{height:100%;border-radius:3px}
+.cmp-val{font-size:12px;font-weight:700;font-variant-numeric:tabular-nums;min-width:112px;text-align:right}
+.cmp-val small{color:var(--muted);font-weight:400}
+
+/* Divergence chart (centered 0% axis, source-0 left / source-1 right) */
+.div-row{display:grid;grid-template-columns:minmax(170px,230px) 1fr minmax(210px,auto);gap:14px;align-items:center}
+.div-row .k{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.div-track{position:relative;height:22px;background:var(--paper);border-radius:3px;overflow:hidden}
+.div-track::before{content:"";position:absolute;left:50%;top:0;bottom:0;width:1px;background:var(--rule-2)}
+.div-l{position:absolute;right:50%;top:0;bottom:0;border-radius:3px 0 0 3px}
+.div-r{position:absolute;left:50%;top:0;bottom:0;border-radius:0 3px 3px 0}
+.div-v{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;font-weight:700;
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.div-v i{font-style:normal;color:var(--muted);font-weight:400;margin-left:4px}
+.dv0{color:#26332c}.dv1{color:#5d6b64}
+
+/* Two-column exposure table */
+.exp-2col{display:grid;grid-template-columns:1fr 1fr;gap:18px;align-items:start}
+.exp-2col .tbl-wrap{overflow:hidden}
+.exp-2col table{table-layout:fixed;width:100%;font-size:12px}
+.exp-2col th,.exp-2col td{padding:4px 7px}
+.exp-2col th{letter-spacing:.02em;font-size:10.5px}
+.exp-2col td:first-child,.exp-2col th:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.exp-2col th:nth-child(1){width:42%}
+.exp-2col th:nth-child(n+2){width:14.5%}
+/* Protocol band inside a grouped comparison table. */
+tr.secrow>td{background:var(--paper);color:var(--muted);font-size:10px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.12em;padding:5px 7px 4px;border-bottom:1px solid var(--rule-2)}
+tr.secrow:hover>td{background:var(--paper)}
+tr.secrow+tr>td{border-top:0}
+
+/* Progressive stacked bar (credential recovery) */
+.sb{display:flex;flex-direction:column;gap:14px}
+.sb-bar{position:relative;height:44px;border-radius:8px;overflow:hidden;border:1px solid var(--rule-2);background:var(--paper)}
+.sb-seg{position:absolute;left:0;top:0;bottom:0;transition:width .5s cubic-bezier(.2,.8,.2,1)}
+.sb-leg{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.sb-it{display:flex;gap:9px;align-items:flex-start}
+.sb-it i{width:12px;height:12px;border-radius:3px;margin-top:2px;flex:none}
+.sb-it b{display:block;font-size:13px;font-variant-numeric:tabular-nums}
+.sb-it small{color:var(--muted);font-size:11px;line-height:1.3}
+
+/* Recovered-password chips */
+.pwcell{white-space:normal;max-width:520px;line-height:2}
+.pwchip{display:inline-block;background:var(--paper);border:1px solid var(--rule);border-radius:4px;
+  padding:1px 7px;margin:2px 4px 2px 0;font-size:11px;font-weight:600;font-variant-numeric:tabular-nums}
+
+/* Detected password patterns (generated-credential families) */
+.pat{display:flex;flex-direction:column;gap:8px}
+.pat-row{border:1px solid var(--rule);border-radius:8px;padding:9px 12px;background:var(--surface);
+  display:grid;grid-template-columns:minmax(140px,190px) 1fr minmax(74px,auto);gap:14px;align-items:start}
+.pat-rx{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;font-weight:700;
+  word-break:break-all}
+.pat-mask{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;
+  color:var(--muted);letter-spacing:.06em;margin-top:2px}
+.pat-facets{display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--muted);min-width:0}
+.pat-facets span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pat-facets b{color:var(--ink);font-weight:600}
+.pat-facets i{font-style:normal;color:var(--faint)}
+.pat-miss{color:var(--high);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-weight:700}
+.pat-n{text-align:right;font-variant-numeric:tabular-nums}
+.pat-n b{font-size:17px;font-weight:800;display:block;line-height:1.1}
+.pat-n small{color:var(--muted);font-size:10.5px}
+.pat-note{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.45}
+
+/* Population bar (relative size) */
+.pop{display:flex;flex-direction:column;gap:12px}
+.pop-row{display:grid;grid-template-columns:minmax(90px,150px) 1fr auto;gap:14px;align-items:center}
+.pop-track{height:26px;background:var(--paper);border-radius:4px;overflow:hidden}
+.pop-fill{height:100%;border-radius:4px;
+  display:flex;align-items:center;padding-left:10px;color:#fff;font-weight:700;font-size:13px}
+.pop-abs{font-weight:700;font-size:18px;font-variant-numeric:tabular-nums}
+
+/* KPI hero: a big headline number with supporting context */
+.kpis{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:16px;margin-bottom:6px}
+.kpi{border:1px solid var(--rule);border-radius:12px;padding:16px 18px;background:var(--surface);
+  display:flex;flex-direction:column;gap:4px;position:relative;overflow:hidden;animation:rise .4s both}
+.kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--a0)}
+.kpi .kv{font-size:40px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.kpi .kl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+.kpi .kn{font-size:11.5px;color:var(--muted);line-height:1.4}
+.kpi.big .kv{font-size:52px}
+
+/* Funnel: descending segmented stages */
+.funnel{display:flex;flex-direction:column;gap:6px}
+.fn-row{display:grid;grid-template-columns:minmax(150px,220px) 1fr auto;gap:14px;align-items:center;
+  animation:rise .4s both}
+.fn-row .k{font-size:13px;font-weight:600}
+.fn-row .k small{display:block;color:var(--muted);font-weight:400;font-size:11px}
+.fn-track{height:30px;background:var(--paper);border-radius:5px;overflow:hidden;position:relative}
+.fn-fill{height:100%;border-radius:5px;transform-origin:left;animation:grow .5s both;
+  display:flex;align-items:center;padding-left:10px;color:#fff;font-weight:700;font-size:13px}
+.fn-abs{font-weight:800;font-size:20px;font-variant-numeric:tabular-nums;min-width:78px;text-align:right}
+.fn-abs small{display:block;color:var(--muted);font-weight:400;font-size:11px}
+
+/* Stat chips grid: dense pre-auth intel */
+.chips-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.chip-stat{border:1px solid var(--rule);border-radius:10px;padding:12px 14px;background:var(--surface);animation:rise .35s both}
+.chip-stat .cv{font-size:26px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1}
+.chip-stat .cl{font-size:11px;color:var(--muted);margin-top:5px;line-height:1.3}
+
+/* Coverage indicator: measured vs absent */
+.cov{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}
+.cov-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--rule);border-radius:999px;
+  padding:5px 12px;font-size:12px;font-weight:600}
+.cov-pill i{width:8px;height:8px;border-radius:999px;background:var(--muted)}
+.cov-pill.on{border-color:var(--a0)}.cov-pill.on i{background:var(--a0)}
+.cov-pill.off{color:var(--muted);border-style:dashed;opacity:.7}
+.cov-pill b{font-variant-numeric:tabular-nums}
+
+/* Briefing story slides */
+.story-title{position:relative;background:#111a16;color:#f4f7f5;border-color:#111a16;padding:46px 52px;isolation:isolate}
+.story-title::before{content:"";position:absolute;inset:0;z-index:-2;opacity:.18;
+  background-image:linear-gradient(rgba(255,255,255,.16) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.16) 1px,transparent 1px);
+  background-size:46px 46px}
+.story-title::after{content:"623";position:absolute;right:28px;top:-34px;z-index:-1;color:rgba(255,255,255,.055);
+  font-size:260px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.hero-kicker{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.16em;color:#8fd9bd;margin-bottom:26px}
+.hero-title{font-size:58px;line-height:.98;font-weight:800;max-width:15ch;margin:0;letter-spacing:0}
+.hero-title em{display:block;color:#f08a52;font-style:normal}
+.hero-subtitle{font-size:18px;line-height:1.35;max-width:56ch;color:#c9d4ce;margin-top:22px}
+.hero-byline{font-size:13px;font-weight:700;margin-top:18px;color:#f4f7f5}
+.hero-meta{display:grid;grid-template-columns:repeat(3,1fr);gap:0;margin-top:auto;border-top:1px solid rgba(255,255,255,.18)}
+.hero-stat{padding:18px 24px 0 0;border-right:1px solid rgba(255,255,255,.18);min-height:82px}
+.hero-stat:last-child{border-right:0;padding-left:24px}.hero-stat:nth-child(2){padding-left:24px}
+.hero-stat b{display:block;font-size:30px;line-height:1;font-variant-numeric:tabular-nums;color:#fff}
+.hero-stat span{display:block;font-size:11px;color:#9fb0a7;margin-top:6px;max-width:24ch}
+
+.proof-lead{font-size:38px;font-weight:800;line-height:1.02;max-width:16ch;margin:4px 0 18px}
+.proof-lead span{color:var(--danger)}
+.proof-stack{border-top:1px solid var(--rule)}
+.proof-row{display:grid;grid-template-columns:145px 1fr 120px;gap:18px;align-items:center;padding:16px 0;border-bottom:1px solid var(--rule)}
+.proof-class{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase}
+.proof-desc{font-size:13px;line-height:1.35}.proof-desc b{display:block;font-size:14px;margin-bottom:2px}.proof-desc small{color:var(--muted)}
+.proof-number{text-align:right;font-size:28px;font-weight:800;font-variant-numeric:tabular-nums}.proof-number small{display:block;font-size:10px;font-weight:600;color:var(--muted)}
+.proof-rule{margin-top:14px;padding:12px 14px;border-left:4px solid var(--ink);background:var(--paper);font-size:12px;font-weight:700}
+
+.surface-takeaway{border-left:4px solid var(--a1);padding:10px 14px;margin-bottom:16px;background:var(--paper);font-size:13px;line-height:1.4}
+.surface-takeaway b{font-size:17px;display:block;margin-bottom:2px}
+
+.adv-grid{display:grid;grid-template-columns:.82fr 1.18fr;gap:32px;margin-top:18px}
+.adv-states{margin-top:18px}.adv-list{border-top:1px solid var(--rule)}
+.adv-item{display:grid;grid-template-columns:92px 1fr auto;gap:12px;align-items:start;padding:10px 0;border-bottom:1px solid var(--rule)}
+.adv-id{font-size:11px;font-weight:800;color:var(--muted);padding-top:2px}.adv-title{font-size:12.5px;line-height:1.25;font-weight:650}
+.adv-meta{font-size:10px;color:var(--muted);margin-top:3px;text-transform:uppercase;letter-spacing:.05em}
+.risk-tag{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.05em;border-radius:4px;padding:3px 6px;white-space:nowrap}
+.risk-tag.critical{background:#fbe2e6;color:var(--crit)}.risk-tag.high{background:#f9e6da;color:var(--high)}
+.risk-tag.medium{background:#faf0d3;color:#8a6a09}.risk-tag.low{background:#eaf2df;color:#4e6f2a}
+
+.attack-chain{display:grid;grid-template-columns:1fr 34px 1fr 34px 1fr 34px 1fr 34px 1fr;align-items:center;margin:28px 0 34px}
+.chain-node{text-align:center;min-width:0}.chain-node i{display:grid;place-items:center;width:54px;height:54px;margin:0 auto 8px;border:2px solid var(--ink);border-radius:50%;font-style:normal;font-size:20px;font-weight:800;background:var(--surface)}
+.chain-node b{display:block;font-size:12px}.chain-node small{display:block;color:var(--muted);font-size:10px;margin-top:2px}
+.chain-arrow{height:2px;background:var(--rule-2);position:relative}.chain-arrow::after{content:"";position:absolute;right:-1px;top:-4px;border-left:7px solid var(--rule-2);border-top:5px solid transparent;border-bottom:5px solid transparent}
+.action-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:24px;border-top:1px solid var(--rule)}
+.action{padding-top:16px}.action .an{font-size:11px;font-weight:800;color:var(--a0);margin-bottom:8px}.action b{display:block;font-size:15px;line-height:1.2;margin-bottom:6px}.action p{font-size:11.5px;line-height:1.4;color:var(--muted);margin:0}
+.closing-line{font-size:24px;font-weight:800;margin-top:24px;color:var(--ink)}
+
+@media(max-width:800px){
+  body{overflow-x:hidden}.topbar{height:54px;padding:0 8px;gap:6px}
+  .nav{flex:1;min-width:0;margin-left:0}.tab{padding:0 8px}.spacer,.topbar .dropdown,.topbar .act{display:none}
+  .stage{width:100vw;max-width:100vw;padding:12px 12px 50px;overflow:hidden}.slide{width:100%;max-width:100%;padding:24px 20px}.grid2,.grid3,.adv-grid,.action-grid{grid-template-columns:1fr}
+  .kpis{grid-auto-flow:row;grid-template-columns:1fr}.chips-grid{grid-template-columns:repeat(2,1fr)}
+  .metrics.cols{grid-auto-flow:row;grid-template-columns:1fr}.metric{border-left:0;border-top:1px solid var(--rule);padding-left:2px}
+  .story-title{width:100%;min-width:0;padding:32px 26px;min-height:calc(100vh - 78px)}.hero-kicker{max-width:25em}.hero-title{font-size:34px;max-width:9.5em;overflow-wrap:normal}.hero-subtitle{font-size:16px;max-width:19em}.hero-meta{grid-template-columns:1fr}.hero-stat,.hero-stat:nth-child(2),.hero-stat:last-child{padding:13px 0;border-right:0;border-bottom:1px solid rgba(255,255,255,.18)}
+  .proof-row{grid-template-columns:1fr}.proof-number{text-align:left}.attack-chain{grid-template-columns:1fr;gap:10px}.chain-arrow{height:24px;width:2px;margin:auto}.chain-arrow::after{right:-4px;top:auto;bottom:-1px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:7px solid var(--rule-2);border-bottom:0}
+}
+
+/* Big-number comparison grid (Internal vs External headline) */
+.bignum{display:grid;gap:0;border-top:1px solid var(--rule)}
+/* In a bounded 16:9 slide the grid takes the leftover height and its auto rows
+   share it, so the table fills the frame instead of stacking at the top with a
+   void underneath. Ignored when the parent is not a flex column. */
+.bignum-fill{flex:1}
+.bignum-head{display:contents}
+.bignum-head .bn-h{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;
+  color:var(--muted);text-align:right;padding:7px 14px;border-bottom:2px solid var(--rule-2)}
+.bignum-head .bn-l,.bignum-head .bn-m{border-bottom:2px solid var(--rule-2)}
+.bignum-row{display:contents}
+.bignum-row .bn-l{display:flex;align-items:center;font-size:13.5px;font-weight:600;padding:3px 14px 3px 2px;
+  border-bottom:1px solid var(--rule);line-height:1.25}
+.bignum-row .bn-c{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;
+  padding:3px 14px;border-bottom:1px solid var(--rule)}
+.bn-v{font-size:22px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+.bn-p{font-size:11px;color:var(--muted);margin-top:2px;font-variant-numeric:tabular-nums}
+/* Meter column: one thin bar per source, scaled 0-100% of that source's own
+   population, so the shape of a row is legible without reading the numbers. */
+.bignum-row .bn-m{display:flex;flex-direction:column;justify-content:center;gap:4px;
+  padding:3px 22px 3px 6px;border-bottom:1px solid var(--rule)}
+.bn-track{height:7px;background:var(--paper);border-radius:2px;overflow:hidden}
+.bn-fill{height:100%;border-radius:2px;transform-origin:left;animation:grow .5s both}
+/* Section band: groups the metrics so the column reads as three claims, not
+   nine loose rows. */
+.bignum-sec{display:contents}
+.bignum-sec .bn-s{grid-column:1/-1;font-size:10px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--faint);padding:9px 2px 3px;border-bottom:1px solid var(--rule)}
+/* Denominator row: the population every percentage below is measured against. */
+.bignum-row.denom .bn-l,.bignum-row.denom .bn-c,.bignum-row.denom .bn-m{
+  background:var(--paper);border-bottom:2px solid var(--rule-2)}
+.bignum-row.denom .bn-l{padding-left:14px;text-transform:uppercase;letter-spacing:.06em;font-size:11.5px;
+  font-weight:700;color:var(--muted)}
+.bignum-row.denom .bn-v{font-size:26px}
+.cmp-table td:first-child,.cmp-table th:first-child{white-space:nowrap}
+
+/* Advisory / CVE identifier above a compromise-path label. */
+.path-id{font-size:9.5px;font-weight:700;letter-spacing:.06em;color:var(--a0);
+  font-variant-numeric:tabular-nums;margin-bottom:2px}
+.path-id.muted{color:var(--faint);font-weight:600}
+
+/* Overview: one column per source, sized so two columns of chips, a class chart
+   and a severity chart share one 16:9 frame. */
+.ov-grid{display:grid;gap:20px;align-items:start}
+.ov-col{display:flex;flex-direction:column;gap:10px;min-width:0}
+.ov-head{border-top:3px solid var(--a0);padding-top:9px}
+.ov-name{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
+.ov-tot{font-size:31px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.05;margin-top:3px}
+.ov-sub{font-size:10.5px;color:var(--faint);margin-top:2px}
+.ov-chips{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.ov-chip{border:1px solid var(--rule);border-radius:9px;padding:8px 10px}
+.ov-chip .ovv{font-size:18px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1.05}
+.ov-chip .ovl{font-size:10px;color:var(--muted);margin-top:3px;line-height:1.3}
+
+/* Tables */
+.tbl-wrap{overflow:auto;border:1px solid var(--rule);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--rule);white-space:nowrap}
+th{position:sticky;top:0;background:var(--surface);color:var(--muted);font-size:11px;font-weight:700;
+  text-transform:uppercase;letter-spacing:.05em;z-index:1;cursor:pointer;user-select:none}
+th.n,td.n{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr:hover{background:var(--paper)}
+td .minibar{display:inline-block;height:8px;border-radius:2px;background:var(--a0);vertical-align:middle;margin-right:7px}
+.chip{display:inline-block;padding:1px 7px;border-radius:20px;font-size:11px;font-weight:700}
+.chip.crit{background:#fbe2e6;color:var(--crit)}
+.chip.high{background:#f9e6da;color:var(--high)}
+.chip.med{background:#faf0d3;color:#8a6a09}
+.chip.low{background:#eaf2df;color:#4e6f2a}
+.chip.info{background:#eceff0;color:var(--info)}
+
+td.muted,.muted{color:var(--muted)}
+
+/* Exposure pills in the explorer */
+.xcell{white-space:normal;max-width:420px}
+.xpill{display:inline-block;color:#fff;font-size:10px;font-weight:700;border-radius:3px;padding:1px 5px;margin:1px 3px 1px 0;line-height:1.5}
+tr.sysrow{cursor:pointer}
+tr.sysrow .caret{display:inline-block;width:14px;color:var(--faint);transition:transform .15s}
+tr.sysrow.open .caret{transform:rotate(90deg)}
+tr.sysrow.open{background:var(--paper)}
+tr.sysdetail>td{padding:0;background:#fbfcfb;border-bottom:2px solid var(--rule-2)}
+
+/* Per-host detail panel */
+.host-detail{padding:16px 18px}
+.hd-head{display:flex;gap:12px;align-items:baseline;margin-bottom:12px}
+.hd-head b{font-size:15px}
+.hd-head span{color:var(--muted);font-size:12px}
+.hd-cols{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+@media(max-width:800px){.hd-cols{grid-template-columns:1fr}}
+.hd-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 8px}
+.hd-find{padding:6px 0;border-bottom:1px solid var(--rule);font-size:12px}
+.hd-find code{background:var(--paper);padding:1px 5px;border-radius:3px;font-size:11px}
+.hd-proof{color:var(--muted);margin-top:3px;word-break:break-word;font-size:11px}
+.hd-svc{padding:6px 0;border-bottom:1px solid var(--rule)}
+.hd-port{font-weight:700;font-size:12px}
+.hd-port small{color:var(--muted);font-weight:400}
+.hd-attr{display:grid;grid-template-columns:150px 1fr;gap:8px;font-size:11px;color:var(--ink);padding:1px 0}
+.hd-attr span{color:var(--muted)}
+.hd-ports{margin-top:12px;font-size:11px;color:var(--ink);word-break:break-word}
+.hd-ports span{color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-right:8px}
+
+/* Heatmap */
+table.heatmap{font-size:12px}
+table.heatmap th.heatcol{writing-mode:vertical-rl;transform:rotate(180deg);height:70px;padding:6px 0;text-align:left;font-size:11px}
+table.heatmap td.heatcell,table.heatmap th.heatcol{text-align:center;padding:2px;min-width:34px}
+table.heatmap .vhead-v{position:sticky;left:0;background:var(--surface);z-index:2;text-align:left;font-weight:700}
+table.heatmap tbody tr:hover .vhead-v{background:var(--paper)}
+.heat{display:inline-block;min-width:30px;text-align:center;border-radius:4px;padding:4px 2px;font-size:11px;font-weight:700;color:var(--ink)}
+
+/* Detail layout */
+.detail-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;
+  padding:6px 2px 18px;border-bottom:1px solid var(--rule);margin-bottom:20px}
+.detail-head h2{font-size:24px}
+.detail-head .eyebrow{margin-bottom:5px}
+.section{margin:0 0 30px}
+.section>.panel-title{font-size:13px}
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:14px}
+.field{display:flex;flex-direction:column;gap:4px}
+.field label{font-size:11px;color:var(--muted);font-weight:700}
+.ctl{height:32px;border:1px solid var(--rule-2);border-radius:6px;padding:0 9px;background:var(--surface);min-width:120px}
+.count-line{display:flex;align-items:baseline;gap:8px;margin-bottom:10px;color:var(--muted);font-size:12px}
+.count-line b{color:var(--ink);font-size:18px;font-variant-numeric:tabular-nums}
+
+.redacted-tag{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;color:var(--low);
+  background:#eaf2df;border-radius:20px;padding:2px 9px;letter-spacing:.04em}
+
+/* Present mode */
+.rail{display:none;position:fixed;z-index:90;right:16px;bottom:14px;gap:7px}
+.rail button{height:36px;border:1px solid rgba(0,0,0,.16);background:rgba(255,255,255,.95);border-radius:6px;
+  padding:0 13px;font-weight:700;cursor:pointer;box-shadow:0 5px 20px rgba(0,0,0,.12)}
+body.present{overflow:hidden}
+body.present .topbar{display:none}
+body.present .stage{max-width:none;height:100vh;padding:0;display:grid;place-items:center;background:var(--paper)}
+body.present .view{width:min(100vw,calc(100vh*16/9));height:min(100vh,calc(100vw*9/16))}
+body.present .slide{width:100%;height:100%;border-radius:0;border:0;box-shadow:none;aspect-ratio:auto;
+  display:flex;flex-direction:column}
+body.present .rail{display:flex}
+body.present .detail{display:flex;align-items:center;justify-content:center;color:var(--muted)}
+body.frame .rail{display:none}
+
+.toast{position:fixed;z-index:120;left:50%;bottom:22px;transform:translate(-50%,18px);opacity:0;
+  background:var(--ink);color:#fff;border-radius:6px;padding:9px 14px;font-size:12px;pointer-events:none;
+  transition:opacity .25s,transform .25s}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+.hide{display:none!important}
+.empty{color:var(--faint);font-size:13px;padding:20px 0}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><span>oobscan</span></div>
+  <nav class="nav" id="nav"></nav>
+  <span class="spacer"></span>
+  <div class="dropdown" id="detailDropdown">
+    <button id="detailBtn">Detail views ▾</button>
+    <div class="menu" id="detailMenu"></div>
+  </div>
+  <button class="act" id="captureBtn" title="Download this view as a 1920×1080 PNG (P)">Capture</button>
+  <button class="act primary" id="presentBtn" title="Enter 16:9 present mode">Present</button>
+</div>
+
+<div class="stage" id="stage"></div>
+
+<div class="rail" id="rail">
+  <button id="railPrev">‹</button>
+  <button id="railNext">Next ›</button>
+  <button id="railCapture">Capture</button>
+  <button id="railExit">Exit</button>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script id="report-data" type="application/octet-stream">__REPORT_DATA__</script>
+<script>
+"use strict";
+var DATA, SRC, KEYS;
+var ACCENTS = ["a0","a1","a2","a3","a4","a5"];
+// Monochrome per-source shades: the deck distinguishes sources by column
+// position (Internal left, External right) and shade, never by hue.
+var MONO = ["#26332c","#93a09a","#c3ccc7"];
+function srcColor(i){return MONO[i%MONO.length]}
+// Display-case labels for management-plane protocol tokens (tokens are folded
+// canonically in Go; this only cleans up presentation).
+var PROTO_NAMES={https:"HTTPS",http:"HTTP",ssh:"SSH",telnet:"Telnet",snmp:"SNMP",
+  ipmi:"IPMI",redfish:"Redfish",vnc:"VNC",rdp:"RDP","raw-serial":"Raw serial",
+  serial:"Serial",ftp:"FTP",smb:"SMB",ntp:"NTP",ssdp:"SSDP",upnp:"UPnP",
+  ssl3:"SSLv3","aten-vmedia":"ATEN vMedia",kvm:"KVM",modbus:"Modbus"};
+function protoName(k){var s=String(k||"");return PROTO_NAMES[s.toLowerCase()]||s.toUpperCase()}
+// Compromise-path rows carry their own entry/gain/new attributes from Go (see
+// paths.go), so nothing about the taxonomy is re-encoded here.
+function isNewPath(row){return !!(row&&row.new)}
+// Precondition wording for the path tables. A row needing a credential first is
+// an escalation leg, not remote access, and must never read as one.
+// Kept terse: two of these tables sit side by side inside one 16:9 frame, and
+// the long forms pushed the slide over. The full wording is on the Q&A slides.
+var ENTRY_LABEL={none:"pre-auth",lowpriv:"any low-priv acct"};
+var GAIN_LABEL={admin:"Administrator",host:"managed host",session:"session (priv unproven)"};
+// Inferred affected-host counts for the new-research weaknesses, looked up from
+// each source's compromise rollup (the Go side projects these onto hosts whose
+// scan never ran the active check). Maps an exposure/finding key to its
+// compromise key, so the prevalence tables can show an inferred count instead
+// of a bare "not tested".
+var INFER_KEY={
+  ipmi_smcrakp_bypass:"smcrakp_bypass",
+  ipmi_ilo_auth_bypass:"ilo_ipmi_bypass",
+  ipmi_openbmc_bypass:"openbmc_rakp_bypass",
+  ami_redfish_bypass:"ami_redfish_bypass",
+  ami_mtls_bypass:"ami_mtls_bypass",
+  ssh_ilo_overflow:"ssh_ilo_overflow",
+  smc_kvm_bypass:"smc_kvm_bypass",
+  ipmi_role_escalation:"smc_reserved_role"
+};
+function inferredCount(exposureKey, si){
+  var ck=INFER_KEY[exposureKey];
+  if(!ck)return 0;
+  var row=(SRC[si].compromise||[]).find(function(x){return x.key===ck});
+  return row?row.hosts:0;
+}
+// Exposure keys a source only reports when it ran a check the other corpus
+// never ran. In this deck Internal's lighter scan profile has no SSH or web
+// credential-audit check (External does), so Internal's 0 for these is "not
+// tested", not a clean zero. ssh_shared_key and ilo_known_cve are NOT here: both
+// are inferred from the host-key fingerprint / iLO generation+firmware the scan
+// captured. Keyed by exposure key → the zero-based source index that did NOT run
+// the check.
+var EXP_NOT_TESTED={ssh_default_creds:[0],web_default_creds:[0]};
+
+// The payload is gzip+base64 (highly repetitive scan detail compresses ~10x).
+// Decode it with the browser's native base64 + DecompressionStream.
+async function loadPayload(){
+  var b64=document.getElementById("report-data").textContent.trim();
+  if(typeof DecompressionStream!=="function"){
+    throw new Error("this browser lacks DecompressionStream; use a current Chrome/Firefox/Safari");
+  }
+  var resp=await fetch("data:application/octet-stream;base64,"+b64);
+  var stream=resp.body.pipeThrough(new DecompressionStream("gzip"));
+  var text=await new Response(stream).text();
+  return JSON.parse(text);
+}
+
+function el(t,c,h){var e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e}
+function byId(id){return document.getElementById(id)}
+function fmt(n){return Number(n||0).toLocaleString("en-US")}
+function pct(n){return (Math.round(Number(n||0)*10)/10).toFixed(1)+"%"}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]})}
+function accent(i){return "var(--"+ACCENTS[i%ACCENTS.length]+")"}
+function accentSoft(i){return "var(--"+ACCENTS[i%ACCENTS.length]+"soft)"}
+function riskClass(r){return {critical:"crit",high:"high",medium:"med",low:"low",info:"info"}[r]||"info"}
+function riskColor(r){return {critical:"var(--crit)",high:"var(--high)",medium:"var(--med)",low:"var(--low)",info:"var(--info)"}[r]||"var(--info)"}
+// A distinct hue per exposure category so a chart is not one wall of one colour.
+var CAT_COLORS={ipmi:"#b0243a",snmp:"#7c4bc0",kvm:"#2f6bc4",vnc:"#2f6bc4",tls:"#0f8a5f",ssh:"#0f9a9a",web:"#c98a0e",serial:"#d5602c",telnet:"#d5602c",redfish:"#c0398a",ilo:"#d13b6a"};
+function exposureColor(key){var c=String(key).split("_")[0];return CAT_COLORS[c]||"#67736c"}
+
+// Exposure importance tier. The capped "top exposures" panels rank by this
+// first, then by prevalence, so a headline weakness (a cracked hash, a default
+// login, an auth-bypass) is never crowded out of the list by a high-volume but
+// benign signal such as "IPMI reachable" or "SNMP v3". A key not listed here
+// falls to the medium default, so a newly added taxonomy column still ranks
+// sensibly without a code change.
+var EXP_TIER={
+  ipmi_rakp_cracked:6,ipmi_default_creds:6,ssh_default_creds:6,web_default_creds:6,
+  ipmi_cipher_zero:6,ipmi_smcrakp_bypass:6,ipmi_ilo_auth_bypass:6,ipmi_openbmc_bypass:6,
+  ipmi_integrity_bypass:6,ipmi_cleartext_creds:6,amt_auth_bypass:6,smc_kvm_bypass:6,
+  kvm_no_auth:6,
+  ipmi_null_auth:5,ipmi_anon_auth:5,ssh_ilo_overflow:5,ilo_known_cve:5,
+  tls_shared_key:5,ssh_shared_key:5,snmp_default_cred:5,
+  ipmi_role_escalation:5,ipmi_oem_preauth:5,host_debug_exposed:5,
+  ipmi_rakp_hash:4,ipmi_sid_weak:4,ipmi_state_machine:4,preauth_leak:4,
+  kvm_exposed:3,vnc_exposed:3,redfish_exposed:3,serial_exposed:3,telnet_banner:3,
+  tls_weak:2,ssh_weak:2,
+  ipmi:1,ipmi_1_5:1,ipmi_2_0:1,snmp_v3:1
+};
+function expTier(k){return EXP_TIER[k]!=null?EXP_TIER[k]:2}
+// Every taxonomy label is "PROTOCOL: weakness" (see taxonomy.go), so the
+// management protocol a row belongs to is read off the label prefix, with the
+// key prefix as the fallback for an unlabelled row.
+function expGroup(r){
+  var l=String(r.label||""),i=l.indexOf(":");
+  if(i>0)return l.slice(0,i).trim();
+  var k=String(r.key||"").split("_")[0];
+  return k?protoName(k):"Other";
+}
+// expShortLabel drops the protocol prefix, for a table that already groups by
+// protocol (the band carries it, the row need not repeat it).
+function expShortLabel(r){
+  var l=String(r.label||""),i=l.indexOf(":");
+  return i>0?l.slice(i+1).trim():l;
+}
+// IPMI is most of the taxonomy, so it gets its own bands: what an attacker can
+// do with it, worst first, and bare reachability last. A key not listed here
+// falls into the trailing band, so a new taxonomy row is never dropped.
+var IPMI_BANDS=[
+  {t:"Authentication bypass",keys:["ipmi_integrity_bypass","ipmi_smcrakp_bypass","ipmi_ilo_auth_bypass",
+    "ipmi_openbmc_bypass","ipmi_smc_integrity_bypass","ipmi_cipher_zero","ipmi_null_auth","ipmi_anon_auth"]},
+  {t:"Credential exposure",keys:["ipmi_default_creds","ipmi_rakp_cracked","ipmi_rakp_hash"]},
+  {t:"Session integrity",keys:["ipmi_sid_weak"]},
+  {t:"Reachability and version",keys:["ipmi","ipmi_2_0","ipmi_1_5"]}
+];
+// ipmiBanded bands the IPMI rows, keeping each band internally ranked by
+// importance tier then by the given metric.
+function ipmiBanded(rows,metric){
+  var placed={},out=[];
+  IPMI_BANDS.forEach(function(b){
+    var mine=rows.filter(function(r){return b.keys.indexOf(r.key)>=0});
+    mine.forEach(function(r){placed[r.key]=1});
+    if(!mine.length)return;
+    out.push({sec:b.t});
+    expRank(mine,metric).forEach(function(r){out.push(r)});
+  });
+  var rest=rows.filter(function(r){return !placed[r.key]});
+  if(rest.length){
+    out.push({sec:"Other IPMI"});
+    expRank(rest,metric).forEach(function(r){out.push(r)});
+  }
+  return out;
+}
+// Presentation order for the non-IPMI protocol bands; anything unlisted sorts
+// after these, alphabetically, so a new taxonomy row still lands somewhere sane.
+var GROUP_ORDER=["SNMP","TLS","SSH","HTTP","Redfish","KVM","VNC","Serial","Telnet"];
+function groupRank(g){var i=GROUP_ORDER.indexOf(g);return i<0?GROUP_ORDER.length:i}
+// expGrouped returns the rows banded by protocol: [{sec},row,row,{sec},row...],
+// each band internally ranked by importance tier then by the given metric.
+function expGrouped(rows,metric){
+  var byGroup={},order=[];
+  rows.forEach(function(r){
+    var g=expGroup(r);
+    if(!byGroup[g]){byGroup[g]=[];order.push(g)}
+    byGroup[g].push(r);
+  });
+  order.sort(function(a,b){
+    var ra=groupRank(a),rb=groupRank(b);
+    return ra!==rb?ra-rb:a.localeCompare(b);
+  });
+  var out=[];
+  order.forEach(function(g){
+    out.push({sec:g});
+    expRank(byGroup[g],metric).forEach(function(r){out.push(r)});
+  });
+  return out;
+}
+// Rank exposures by importance tier, then by the given metric (prevalence or
+// spread), so the security-relevant rows lead the capped panels.
+function expRank(rows,metric){
+  return rows.slice().sort(function(a,b){
+    var ta=expTier(a.key),tb=expTier(b.key);
+    if(ta!==tb)return tb-ta;
+    return (b[metric]||0)-(a[metric]||0);
+  });
+}
+
+/* ---------- chart builders (return DOM) ---------- */
+function barRows(rows, opts){
+  opts=opts||{};
+  var max=0; rows.forEach(function(r){if(r.value>max)max=r.value});
+  if(opts.max)max=opts.max;
+  var wrap=el("div","bars");
+  rows.forEach(function(r,i){
+    var row=el("div","bar");row.style.animationDelay=(i*22)+"ms";
+    row.appendChild(el("span","k",esc(r.label)));
+    var track=el("div","track");
+    var fill=el("div","fillbar");
+    fill.style.width=(max?Math.max(2,100*r.value/max):0)+"%";
+    if(r.color)fill.style.background=r.color;else if(opts.color)fill.style.background=opts.color;
+    track.appendChild(fill);row.appendChild(track);
+    var val=el("div","val",(opts.percent?pct(r.value):fmt(r.value))+(r.note?" <small>"+esc(r.note)+"</small>":""));
+    row.appendChild(val);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+/* comparison rows: per axis value, one mini-bar per source, driven by % of that source */
+function compareRows(rows, opts){
+  opts=opts||{};
+  var wrap=el("div","cmp");
+  rows.forEach(function(r,i){
+    var row=el("div","cmp-row");row.style.animationDelay=(i*22)+"ms";
+    row.appendChild(el("div","k",esc(r.label)));
+    var bars=el("div","cmp-bars");
+    for(var si=0;si<SRC.length;si++){
+      var p=r.pct[si]||0, h=r.hosts[si]||0;
+      var line=el("div","cmp-line");
+      var track=el("div","cmp-track");
+      var fill=el("div","cmp-fill");
+      fill.style.width=Math.max(p>0?2:0,Math.min(100,p))+"%";
+      fill.style.background=srcColor(si);
+      track.appendChild(fill);line.appendChild(track);
+      line.appendChild(el("div","cmp-val",pct(p)+" <small>("+fmt(h)+")</small>"));
+      bars.appendChild(line);
+    }
+    row.appendChild(bars);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+function legend(){
+  var l=el("div","legend");
+  SRC.forEach(function(s,i){
+    var span=el("span");span.appendChild(Object.assign(el("i"),{style:"background:"+srcColor(i)}));
+    span.appendChild(document.createTextNode(s.name));l.appendChild(span);
+  });
+  return l;
+}
+
+function panelTitle(text, withLegend){
+  var t=el("div","panel-title");t.appendChild(el("span",null,esc(text)));
+  if(withLegend)t.appendChild(legend());
+  return t;
+}
+
+function metricStrip(items,cols){
+  var m=el("div","metrics"+(cols?" cols":""));
+  items.forEach(function(it){
+    var box=el("div","metric");
+    box.appendChild(el("div","l",esc(it.label)));
+    var v=el("div","v",esc(it.value));if(it.color)v.style.color=it.color;box.appendChild(v);
+    if(it.note)box.appendChild(el("div","n",esc(it.note)));
+    m.appendChild(box);
+  });
+  return m;
+}
+
+/* ---------- view registry ---------- */
+var VIEWS=[]; // {id,label,kind:'slide'|'detail',src:idx|null,dot:color,build:fn}
+function addView(v){VIEWS.push(v);return v}
+
+function buildViews(){
+  // --title / --advisories are documented to add their slides; register them so
+  // the flags actually produce a view.
+  if(DATA.title)addView({id:"title",label:"Title",kind:"slide",build:buildTitleSlide});
+  addView({id:"overview",label:"Overview",kind:"slide",build:buildOverviewSlide});
+  if(DATA.compare){
+    addView({id:"snapshot",label:"Compare",kind:"slide",build:buildCmpHeadline});
+    addView({id:"cmp-exposure-ipmi",label:"Exposures · IPMI",kind:"slide",build:buildCmpExposureIPMI});
+    addView({id:"cmp-exposure-other",label:"Exposures · other",kind:"slide",build:buildCmpExposureOther});
+    // Surface is the listening-port comparison (the port divergence chart).
+    addView({id:"cmp-surface",label:"Surface",kind:"slide",build:buildCmpSurface});
+  }else{
+    addView({id:"snapshot",label:"Snapshot",kind:"slide",build:buildSnapshot});
+  }
+  if(DATA.newFindings&&DATA.newFindings.length){
+    addView({id:"new-findings",label:"New findings",kind:"slide",build:buildNewFindingsSlide});
+  }
+  // Combined password analysis across every source, immediately after the new
+  // findings and before the per-source decks.
+  if(DATA.passwords){
+    addView({id:"passwords",label:"Passwords",kind:"slide",build:buildPasswordsSlide});
+    if((DATA.passwords.patterns||[]).length){
+      addView({id:"password-patterns",label:"Password patterns",kind:"slide",build:buildPasswordPatternsSlide});
+    }
+  }
+  if(DATA.advisories){
+    addView({id:"advisories",label:"Root cause",kind:"slide",build:buildAdvisorySlide});
+  }
+  SRC.forEach(function(s,i){
+    addView({id:"risk-"+i,label:s.name+" · risk",kind:"slide",src:i,dot:srcColor(i),build:function(){return buildRiskSlide(i)}});
+    if(s.cracks&&s.cracks.hashHosts>0){
+      addView({id:"crack-"+i,label:s.name+" · hashes",kind:"slide",src:i,dot:srcColor(i),build:function(){return buildCrackFunnel(i)}});
+    }
+    if(s.guid&&s.guid.decoded>0){
+      addView({id:"guid-"+i,label:s.name+" · GUID intel",kind:"slide",src:i,dot:srcColor(i),build:function(){return buildGuidSlide(i)}});
+    }
+  });
+  // detail views (dropdown only)
+  SRC.forEach(function(s,i){
+    addView({id:"d-"+i+"-exposure",label:"Exposure detail",kind:"detail",src:i,build:function(){return buildDetailExposure(i)}});
+    addView({id:"d-"+i+"-vendors",label:"Vendor detail",kind:"detail",src:i,build:function(){return buildDetailVendors(i)}});
+    addView({id:"d-"+i+"-services",label:"Services & ports",kind:"detail",src:i,build:function(){return buildDetailServices(i)}});
+    addView({id:"d-"+i+"-findings",label:"Findings",kind:"detail",src:i,build:function(){return buildDetailFindings(i)}});
+    addView({id:"d-"+i+"-ipmi",label:"IPMI / RAKP / SNMP",kind:"detail",src:i,build:function(){return buildDetailIPMI(i)}});
+    if(s.guid&&s.guid.decoded>0){
+      addView({id:"d-"+i+"-guid",label:"GUIDs",kind:"detail",src:i,build:function(){return buildDetailGuid(i)}});
+    }
+  });
+}
+function slides(){return VIEWS.filter(function(v){return v.kind==="slide"})}
+
+/* ---------- SLIDES ---------- */
+function slideShell(eyebrow,title,subRight){
+  var s=el("div","slide view");
+  var head=el("div","slide-head");
+  var left=el("div");left.appendChild(el("div","eyebrow",esc(eyebrow)));
+  left.appendChild(el(title.big?"h1":"h2",null,esc(title.text)));
+  head.appendChild(left);
+  if(subRight)head.appendChild(subRight);
+  s.appendChild(head);
+  var fill=el("div","fill");s.appendChild(fill);
+  s._fill=fill;
+  return s;
+}
+
+function pairCount(rows,value){
+  var row=(rows||[]).find(function(x){return String(x.v).toUpperCase()===String(value).toUpperCase()});
+  return row?row.n:0;
+}
+
+/* cmpTable renders a copy-pastable comparison table: one label column, then a
+   %-of-source and host-count column per source. Monochrome; sources are told
+   apart by column position (Internal left, External right). */
+function cmpTable(rows,labelHead,opts){
+  opts=opts||{};
+  var wrap=el("div","tbl-wrap");
+  var t=el("table");t.className="cmp-table";
+  var thead=el("thead");var hr=el("tr");
+  hr.appendChild(el("th",null,labelHead||"Metric"));
+  SRC.forEach(function(sc){
+    hr.appendChild(el("th","n",esc(sc.name)+" %"));
+    hr.appendChild(el("th","n",esc(sc.name)+" n"));
+  });
+  thead.appendChild(hr);t.appendChild(thead);
+  var tb=el("tbody");
+  rows.forEach(function(r){
+    var tr=el("tr");
+    // A {sec:"..."} entry is a protocol band, not a measured row.
+    if(r.sec){
+      tr.className="secrow";
+      var std=el("td",null,esc(r.sec));std.colSpan=1+2*SRC.length;
+      tr.appendChild(std);tb.appendChild(tr);return;
+    }
+    if(opts.strip)r=Object.assign({},r,{label:expShortLabel(r)});
+    tr.appendChild(el("td",null,esc(r.label)));
+    SRC.forEach(function(sc,i){
+      var tested=r.tested?r.tested[i]:true;
+      var p=(r.pct&&r.pct[i])||0, h=(r.hosts&&r.hosts[i])||0;
+      var tdp=el("td","n"),tdh=el("td","n");
+      if(!tested){
+        // A source that never ran the active check still gets an inferred
+        // affected-host count for the new-research weaknesses, shown as *.
+        var inf=inferredCount(r.key,i);
+        if(inf>0){
+          var ip=100*inf/(sc.total||1);
+          tdp.textContent=pct(ip)+"*";tdh.textContent=fmt(inf)+"*";
+          tdp.title="inferred affected hosts (scan did not actively probe)";
+        }else{
+          tdp.textContent="N/A";tdh.textContent="N/A";tdp.className="n muted";tdh.className="n muted";tdp.title="not tested in this scan";
+        }
+      }
+      else{tdp.textContent=pct(p);tdh.textContent=fmt(h);if(h===0){tdp.className="n muted";tdh.className="n muted";}}
+      tr.appendChild(tdp);tr.appendChild(tdh);
+    });
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);wrap.appendChild(t);
+  return wrap;
+}
+
+/* Comparative headline: the big referenceable numbers, Internal vs External.
+   The scanned population leads as an explicit denominator row (it is a count,
+   not a prevalence, so it is banded rather than left with an empty % slot), then
+   the metrics follow in three labelled sections, each row carrying its own
+   percentage of its own source and a 0-100% meter of the same value. */
+function buildCmpHeadline(){
+  var sub=el("div","slide-sub");sub.innerHTML="<b>prevalence</b>% of each source's own population";
+  var s=slideShell("Out-of-band exposure",{text:"Internal vs External"},sub);
+  s._fill.style.display="flex";s._fill.style.flexDirection="column";
+  // per-source exposure lookup by key
+  var xmap=SRC.map(function(sc){var m={};(sc.exposures||[]).forEach(function(x){m[x.key]=x});return m});
+  function expRow(label,key){
+    return {label:label,
+      hosts:SRC.map(function(sc,i){return xmap[i][key]?xmap[i][key].hosts:0}),
+      pct:SRC.map(function(sc,i){return xmap[i][key]?xmap[i][key].pct:0})};
+  }
+  function srcRow(label,fn){
+    return {label:label,hosts:SRC.map(fn),pct:SRC.map(function(sc,i){return 100*fn(sc,i)/(sc.total||1)})};
+  }
+  var maxTotal=Math.max.apply(null,SRC.map(function(sc){return sc.total||0}))||1;
+  var rows=[
+    {label:"Hosts scanned",denom:true,hosts:SRC.map(function(sc){return sc.total}),
+     pct:SRC.map(function(){return null}),note:"100% · population",
+     meter:SRC.map(function(sc){return 100*(sc.total||0)/maxTotal})},
+    {sec:"Reachable management plane"},
+    expRow("IPMI reachable","ipmi"),
+    {sec:"Credential and authentication exposure"},
+    expRow("RAKP hash disclosure","ipmi_rakp_hash"),
+    expRow("IPMI default credentials","ipmi_default_creds"),
+    expRow("Cipher-zero session","ipmi_cipher_zero"),
+    srcRow("Weak credentials (live)",function(sc){return sc.autoCracked||0}),
+    srcRow("Weak credentials (cracked)",function(sc){var c=sc.cracks||{};return c.total||sc.potCracked||0}),
+    {sec:"Immediate compromise"},
+    srcRow("Immediate compromise (known)",function(sc){return sc.immediatePre||0}),
+    srcRow("Extended with our findings",function(sc){return sc.immediateExt||0})
+  ];
+  // Render as a large-number grid: label, meter, then one big cell per source.
+  var g=el("div","bignum bignum-fill");
+  g.style.gridTemplateColumns="minmax(210px,1.15fr) minmax(120px,1fr) repeat("+SRC.length+",minmax(140px,.72fr))";
+  var hr=el("div","bignum-head");hr.appendChild(el("div","bn-l",""));hr.appendChild(el("div","bn-m",""));
+  SRC.forEach(function(sc){hr.appendChild(el("div","bn-h",esc(sc.name)))});
+  g.appendChild(hr);
+  rows.forEach(function(r){
+    if(r.sec){
+      var band=el("div","bignum-sec");band.appendChild(el("div","bn-s",esc(r.sec)));g.appendChild(band);return;
+    }
+    var row=el("div","bignum-row"+(r.denom?" denom":""));
+    row.appendChild(el("div","bn-l",esc(r.label)));
+    // Meter: the same percentage the cell states, on a fixed 0-100% scale, so a
+    // small share reads as a small share instead of filling the track.
+    var m=el("div","bn-m");
+    SRC.forEach(function(sc,i){
+      var p=r.meter?r.meter[i]:r.pct[i];
+      var track=el("div","bn-track");
+      if(p!=null){
+        var fill=el("div","bn-fill");
+        fill.style.width=Math.max(p>0?1.5:0,Math.min(100,p))+"%";
+        fill.style.background=srcColor(i);
+        track.appendChild(fill);
+      }
+      track.title=esc(sc.name)+(r.meter?" · relative population size":" · "+pct(p||0)+" of "+esc(sc.name));
+      m.appendChild(track);
+    });
+    row.appendChild(m);
+    SRC.forEach(function(sc,i){
+      var cell=el("div","bn-c");
+      cell.appendChild(el("div","bn-v",fmt(r.hosts[i])));
+      cell.appendChild(el("div","bn-p",r.pct[i]!=null?pct(r.pct[i]):esc(r.note||"100%")));
+      row.appendChild(cell);
+    });
+    g.appendChild(row);
+  });
+  s._fill.appendChild(g);
+  return s;
+}
+
+/* Per-source risk: known (pre-research) vs extended (with our findings),
+   then the compromise-path breakdown split known / new-research. */
+function buildRiskSlide(i){
+  var src=SRC[i];
+  var s=slideShell(src.name,{text:"Immediate compromise: known vs extended"});
+  var pre=src.immediatePre||0, ext=src.immediateExt||0, added=Math.max(0,ext-pre), tot=src.total||1;
+  var g=el("div","bignum");g.style.gridTemplateColumns="repeat(3,1fr)";
+  [["Known paths (pre-research)",pre],["Extended with our findings",ext],["Added by our research",added]].forEach(function(p){
+    var row=el("div","bignum-row");row.style.display="block";row.style.textAlign="left";
+    var cell=el("div","bn-c");cell.style.alignItems="flex-start";
+    cell.appendChild(el("div","bn-v",fmt(p[1])));
+    cell.appendChild(el("div","bn-p",pct(100*p[1]/tot)+" of hosts"));
+    row.appendChild(cell);row.appendChild(el("div","bn-l",p[0]));
+    g.appendChild(row);
+  });
+  s._fill.appendChild(g);
+  var paths=(src.compromise||[]).slice();
+  var known=paths.filter(function(x){return !isNewPath(x)&&x.hosts>0}).sort(function(a,b){return b.hosts-a.hosts});
+  var neu=paths.filter(function(x){return isNewPath(x)&&x.hosts>0}).sort(function(a,b){return b.hosts-a.hosts});
+  var grid=el("div","grid2");grid.style.marginTop="22px";
+  var left=el("div");left.appendChild(panelTitle("Known paths · hosts"));
+  left.appendChild(pathTable(known,src));
+  var right=el("div");right.appendChild(panelTitle("New-research paths · affected hosts"));
+  if(neu.length){right.appendChild(pathTable(neu,src));}
+  else{var nt=el("div","panel-cap");nt.style.marginTop="0";nt.textContent="None observed or inferred for this source.";right.appendChild(nt);}
+  grid.appendChild(left);grid.appendChild(right);
+  s._fill.appendChild(grid);
+  return s;
+}
+
+/* pathNote: a caption for a qualification that changes how a number reads. */
+function pathNote(text){
+  var d=el("div","panel-cap");d.style.marginTop="10px";d.innerHTML=text;return d;
+}
+
+/* pathTable: compromise-path breakdown as a copy-pastable table. Precondition
+   and reach are columns, not footnotes: "needs any low-priv account" and
+   "pre-auth" are the difference between an escalation leg and remote access. */
+function pathTable(rows,src){
+  var wrap=el("div","tbl-wrap");var t=el("table");
+  var thead=el("thead");var hr=el("tr");
+  ["Path","Needs","Reaches","Hosts","%"].forEach(function(h,idx){hr.appendChild(el("th",idx>2?"n":null,h))});
+  thead.appendChild(hr);t.appendChild(thead);
+  var tb=el("tbody");
+  if(!rows.length){var tr=el("tr");var td=el("td","muted");td.colSpan=5;td.textContent="none observed";tr.appendChild(td);tb.appendChild(tr);}
+  rows.forEach(function(r){
+    var tr=el("tr");
+    // The advisory ID rides above the label rather than in its own column: two
+    // of these tables sit side by side, and a sixth column pushed the slide past
+    // 16:9. For a new-research path this is our advisory number, for an
+    // already-public one the CVE. A generic weakness class (a default credential)
+    // has no identifier and is not waiting for one, so it shows none; a
+    // new-research path without one yet says "pending", which is a real gap.
+    var td=el("td");
+    var idText=r.advisory||(isNewPath(r)?"pending":"");
+    if(idText)td.appendChild(el("div","path-id"+(r.advisory?"":" muted"),esc(idText)));
+    td.appendChild(el("div",null,esc(r.label)));
+    tr.appendChild(td);
+    tr.appendChild(el("td",r.entry==="lowpriv"?"muted":null,esc(ENTRY_LABEL[r.entry]||r.entry||"")));
+    tr.appendChild(el("td",null,esc(GAIN_LABEL[r.gain]||r.gain||"")));
+    tr.appendChild(el("td","n",fmt(r.hosts)));
+    tr.appendChild(el("td","n",pct(100*r.hosts/(src.total||1))));
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);wrap.appendChild(t);return wrap;
+}
+
+/* Overview: what each population actually is, before any finding is quoted. One
+   column per source, each carrying the responder/BMC/honeypot split, the device
+   class mix, and the BMC-scoped severity distribution. Severity is deliberately
+   drawn from bmcSeverity rather than the all-responder counters so its bands sum
+   to the BMC population shown directly above them. */
+function buildOverviewSlide(){
+  var sub=el("div","slide-sub");
+  var tot=SRC.reduce(function(n,x){return n+x.total},0);
+  sub.innerHTML="<b>"+fmt(tot)+"</b>host observations"+(DATA.generated?" · "+esc(DATA.generated):"");
+  var s=slideShell("Overview",{text:"Populations and device classes",big:true},sub);
+  var g=el("div","ov-grid");
+  g.style.gridTemplateColumns="repeat("+SRC.length+",1fr)";
+  SRC.forEach(function(sc,i){
+    var col=el("div","ov-col");
+    var head=el("div","ov-head");
+    head.style.borderTopColor=srcColor(i);
+    head.appendChild(el("div","ov-name",esc(sc.name)+(sc.redacted?" · redacted":"")));
+    head.appendChild(el("div","ov-tot",fmt(sc.total)));
+    head.appendChild(el("div","ov-sub","hosts answered an out-of-band probe"));
+    col.appendChild(head);
+
+    var bmc=sc.bmcHosts||0, hp=sc.honeypot||0;
+    var chips=el("div","ov-chips");
+    [[bmc,"classified as a BMC",bmc?pct(100*bmc/(sc.total||1)):""],
+     [hp,"honeypots (findings withheld)",hp?pct(100*hp/(sc.total||1)):""],
+     [sc.resolved||0,"vendor resolved",""],
+     [sc.unknown||0,"unattributed",""]].forEach(function(c){
+      var b=el("div","ov-chip");
+      b.appendChild(el("div","ovv",fmt(c[0])));
+      b.appendChild(el("div","ovl",esc(c[1])+(c[2]?" · "+c[2]:"")));
+      chips.appendChild(b);
+    });
+    col.appendChild(chips);
+
+    col.appendChild(panelTitle("Device class"));
+    var cls=(sc.classes||[]).slice(0,6).map(function(p){
+      return {label:p.v,value:p.n,note:pct(100*p.n/(sc.total||1))};
+    });
+    col.appendChild(barRows(cls,{color:srcColor(i)}));
+
+    // Severity by host, highest finding wins. Quoted against the BMC population
+    // so the four bands add to 100%; a source with no BMCs says so rather than
+    // rendering an empty chart.
+    col.appendChild(panelTitle("BMC severity · highest finding per host"));
+    if(bmc>0){
+      var sev=sc.bmcSeverity||{};
+      var bands=[["critical","Critical"],["high","High"],["medium","Medium"]].map(function(b){
+        return {label:b[1],value:sev[b[0]]||0,note:pct(100*(sev[b[0]]||0)/bmc)};
+      });
+      bands.push({label:"Low or none",value:(sev.low||0)+(sev.none||0),
+        note:pct(100*((sev.low||0)+(sev.none||0))/bmc)});
+      col.appendChild(barRows(bands,{color:srcColor(i)}));
+    }else{
+      var none=el("div","panel-cap");none.style.marginTop="0";
+      none.textContent="No BMC-classified hosts in this source.";
+      col.appendChild(none);
+    }
+    g.appendChild(col);
+  });
+  s._fill.appendChild(g);
+  return s;
+}
+
+function buildTitleSlide(){
+  var s=el("div","slide view story-title");
+  s.appendChild(el("div","hero-kicker","Research briefing · scan telemetry + protocol proof + firmware audit"));
+  s.appendChild(el("h1","hero-title",esc(DATA.title)));
+  var rule=el("div");rule.style.cssText="width:86px;height:6px;background:#f08a52;margin-top:22px";s.appendChild(rule);
+  if(DATA.subtitle)s.appendChild(el("div","hero-subtitle",esc(DATA.subtitle)));
+  if(DATA.byline)s.appendChild(el("div","hero-byline",esc(DATA.byline)));
+
+  var total=SRC.reduce(function(n,x){return n+x.total},0);
+  var live=SRC.reduce(function(n,x){return n+(x.immediateExt||0)},0);
+  var meta=el("div","hero-meta");
+  function stat(value,label){var d=el("div","hero-stat");d.appendChild(el("b",null,esc(value)));d.appendChild(el("span",null,esc(label)));return d}
+  meta.appendChild(stat(fmt(total),"host observations in this report corpus"));
+  meta.appendChild(stat(fmt(live),"unique hosts with an immediate compromise path"));
+  if(DATA.advisories){
+    meta.appendChild(stat(fmt(DATA.advisories.total),"draft advisories across "+fmt(DATA.advisories.vendors)+" vendors"));
+  }else{
+    meta.appendChild(stat(fmt(SRC.length),"populations compared on prevalence"));
+  }
+  s.appendChild(meta);
+  return s;
+}
+
+function buildEvidenceSlide(){
+  var sub=el("div","slide-sub");sub.innerHTML="<b>claim discipline</b>every number keeps its denominator";
+  var s=slideShell("Method",{text:"Three proofs. Three different claims.",big:true},sub);
+  var total=SRC.reduce(function(n,x){return n+x.total},0);
+  var live=SRC.reduce(function(n,x){return n+(x.immediateExt||0)},0);
+  var findingsPop=SRC.reduce(function(n,x){return n+((x.coverage&&x.coverage.findings)||0)},0);
+  s._fill.appendChild(el("div","proof-lead","Observed <span>≠</span> exploitable <span>≠</span> affected"));
+  var stack=el("div","proof-stack");
+  var rows=[
+    {cls:"Live-confirmed",title:"A session opened or a credential authenticated",note:"De-duplicated host count; strongest operational claim.",value:fmt(live),denom:"of "+fmt(findingsPop)+" findings-covered hosts",color:"var(--crit)"},
+    {cls:"Scan-observed",title:"A service, protocol behavior, GUID, banner, or configuration was observed",note:"Exposure and prevalence only; advertisement is not exploitability.",value:fmt(total),denom:"host observations",color:"var(--a0)"},
+    {cls:"Firmware / source",title:"An affected code path or shipped artifact was confirmed",note:"Explains root cause and affected versions; it is not a scan-prevalence denominator.",value:DATA.advisories?fmt(DATA.advisories.total):"—",denom:DATA.advisories?"draft advisories · "+fmt(DATA.advisories.vendors)+" vendors":"separate research corpus",color:"var(--a2)"}
+  ];
+  rows.forEach(function(r){
+    var row=el("div","proof-row");
+    var cls=el("div","proof-class",esc(r.cls));cls.style.color=r.color;row.appendChild(cls);
+    var desc=el("div","proof-desc");desc.appendChild(el("b",null,esc(r.title)));desc.appendChild(el("small",null,esc(r.note)));row.appendChild(desc);
+    var num=el("div","proof-number");num.innerHTML=esc(r.value)+"<small>"+esc(r.denom)+"</small>";row.appendChild(num);
+    stack.appendChild(row);
+  });
+  s._fill.appendChild(stack);
+  s._fill.appendChild(el("div","proof-rule","This deck never turns an advertised cipher, a version match, or a firmware finding into a live-compromise count."));
+  return s;
+}
+
+/* Divergence chart: a centered 0% axis; source-0 pulls left, source-1 pulls
+   right. Each row carries both percentages and the raw host counts so the chart
+   is quotable on its own. */
+function divergeChart(rows){
+  var wrap=el("div","cmp");
+  rows.forEach(function(r,i){
+    var row=el("div","div-row");row.style.animationDelay=(i*20)+"ms";
+    row.appendChild(el("div","k",esc(r.label)));
+    var track=el("div","div-track");
+    var p0=r.pct[0]||0, p1=r.pct[1]||0, h0=r.hosts[0]||0, h1=r.hosts[1]||0;
+    var left=el("div","div-l");left.style.width=Math.min(50,p0/2)+"%";left.style.background=srcColor(0);
+    var right=el("div","div-r");right.style.width=Math.min(50,p1/2)+"%";right.style.background=srcColor(1);
+    track.appendChild(left);track.appendChild(right);
+    row.appendChild(track);
+    var v=el("div","div-v");
+    // A source with no hosts at all on a port did not scan it: the port is not in
+    // that profile, so the row is "not tested", not "measured none". Printing 0%
+    // invites the reader to compare a real rate against an absence.
+    function side(cls,p,h){
+      if(h>0)return "<span class='"+cls+"'>"+pct(p)+" <i>"+fmt(h)+"</i></span>";
+      return "<span class='"+cls+" muted'>N/A</span>";
+    }
+    v.innerHTML=side("dv0",p0,h0)+side("dv1",p1,h1);
+    row.appendChild(v);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+/* Service surface = the listening-port comparison: a full-width centered
+   divergence chart (the deck's clearest comparison), each row carrying both
+   percentages and raw counts. */
+function buildCmpSurface(){
+  var sub=el("div","slide-sub");
+  var rows=portCompareRows();
+  var top=rows[0];
+  if(top){var si=top.pct[0]>=top.pct[1]?0:1;sub.innerHTML="<b>"+esc(top.label)+"</b>biggest gap "+pct(top.pct[si])+" on "+esc(SRC[si].name)}
+  var s=slideShell("Service surface",{text:"Listening ports · divergence"},sub);
+  s._fill.style.display="flex";s._fill.style.flexDirection="column";
+  s._fill.appendChild(panelTitle("Divergence · "+esc(SRC[0].name)+" left · "+esc(SRC[1].name)+" right",true));
+  // The chart takes the leftover height so the rows spread over the whole frame
+  // instead of bunching at the top of a 16:9 slide.
+  var chart=divergeChart(rows.slice(0,14));
+  chart.style.flex="1";chart.style.justifyContent="space-between";
+  s._fill.appendChild(chart);
+  return s;
+}
+
+/* portCompareRows folds the TCP and UDP comparison rows into one labelled,
+   gap-sorted list. */
+function portCompareRows(){
+  var rows=[];
+  function add(list,proto){
+    (list||[]).forEach(function(r){
+      var n=PORT_NAMES[parseInt(r.label,10)];
+      rows.push({label:r.label+"/"+proto+(n?" · "+n:""),hosts:r.hosts,pct:r.pct,spread:r.spread});
+    });
+  }
+  add(DATA.compare.portsTcp,"tcp");
+  add(DATA.compare.portsUdp,"udp");
+  rows=rows.filter(function(r){return r.hosts.some(function(h){return h>0})});
+  rows.sort(function(a,b){return (b.spread||0)-(a.spread||0)});
+  return rows;
+}
+
+function buildSnapshot(){
+  var s=slideShell("Out-of-band exposure report",{text:"Population snapshot",big:true},null);
+  var items=SRC.map(function(src,i){
+    return {label:src.name,value:fmt(src.total),color:accent(i),
+      note:pct(100*src.resolved/(src.total||1))+" attributed"+(src.redacted?" · redacted":"")};
+  });
+  s._fill.appendChild(metricStrip(items,true));
+  // population bars + headline exposure counts
+  var g=el("div","grid2");g.style.marginTop="24px";
+  var left=el("div");
+  left.appendChild(panelTitle("Population (hosts)"));
+  var maxTotal=Math.max.apply(null,SRC.map(function(x){return x.total})||[1]);
+  var pop=el("div","pop");
+  SRC.forEach(function(src,i){
+    var row=el("div","pop-row");
+    row.appendChild(el("div","k",esc(src.name)));
+    var track=el("div","pop-track");var fill=el("div","pop-fill");
+    fill.style.width=Math.max(6,100*src.total/(maxTotal||1))+"%";fill.style.background=accent(i);
+    track.appendChild(fill);row.appendChild(track);
+    row.appendChild(el("div","pop-abs",fmt(src.total)));
+    pop.appendChild(row);
+  });
+  left.appendChild(pop);
+  var right=el("div");
+  right.appendChild(panelTitle("Risk level · share of hosts"));
+  var rows=[];
+  SRC.forEach(function(src,i){
+    rows.push({label:src.name+" · critical risk",value:100*src.withCritical/(src.total||1),note:fmt(src.withCritical),color:"var(--crit)"});
+    rows.push({label:src.name+" · high risk",value:100*src.withHigh/(src.total||1),note:fmt(src.withHigh),color:"var(--high)"});
+  });
+  right.appendChild(barRows(rows,{percent:true,max:100}));
+  g.appendChild(left);g.appendChild(right);
+  s._fill.appendChild(g);
+  // Evidence-coverage strip: what each source actually carried.
+  var cvsec=el("div");cvsec.style.marginTop="20px";
+  cvsec.appendChild(panelTitle("Evidence coverage · dashed = not present in this source (not a clean zero)"));
+  SRC.forEach(function(src){
+    var label=el("div");label.style.cssText="font-size:12px;font-weight:700;color:var(--muted);margin:6px 0 2px";label.textContent=src.name;
+    cvsec.appendChild(label);cvsec.appendChild(coverageStrip(src));
+  });
+  s._fill.appendChild(cvsec);
+  return s;
+}
+
+/* exposureCompareRows is the shared, tested-flagged exposure row set behind both
+   prevalence slides. The taxonomy is too tall for one 16:9 frame, so it is split
+   by protocol across two slides rather than scrolled inside one. */
+function exposureCompareRows(){
+  // Reuse the per-source tested flags computed for the new-research findings so
+  // an exposure a source never probed reads as "N/A", not a misleading 0.
+  var nfTested={};(DATA.newFindings||[]).forEach(function(f){if(f.key)nfTested[f.key]=f.tested});
+  var rows=DATA.compare.exposures.slice().filter(function(r){return r.hosts.some(function(h){return h>0})});
+  rows.forEach(function(r){
+    if(nfTested[r.key])r.tested=nfTested[r.key];
+    else if(EXP_NOT_TESTED[r.key]){r.tested=r.hosts.map(function(_,i){return EXP_NOT_TESTED[r.key].indexOf(i)<0})}
+  });
+  return rows;
+}
+
+/* splitBanded divides a banded row list into two balanced columns, cutting only
+   at a band header so a band is never orphaned from its rows. One protocol's
+   taxonomy is still taller than a 16:9 frame, so each prevalence slide runs two
+   columns rather than scrolling. */
+function splitBanded(rows){
+  if(rows.length<8)return [rows,[]];
+  var cuts=[];
+  rows.forEach(function(r,i){if(r.sec&&i>0)cuts.push(i)});
+  if(!cuts.length)return [rows,[]];
+  var mid=rows.length/2, best=cuts[0];
+  cuts.forEach(function(c){if(Math.abs(c-mid)<Math.abs(best-mid))best=c});
+  return [rows.slice(0,best),rows.slice(best)];
+}
+
+function exposureSlide(title, subHTML, rows, head){
+  var sub=el("div","slide-sub");sub.innerHTML=subHTML;
+  var s=slideShell("Prevalence · % of each source",{text:title},sub);
+  var halves=splitBanded(rows);
+  var g=el("div","exp-2col");
+  g.appendChild(cmpTable(halves[0],head,{strip:true}));
+  if(halves[1].length)g.appendChild(cmpTable(halves[1],head+" (cont.)",{strip:true}));
+  s._fill.appendChild(g);
+  return s;
+}
+
+function buildCmpExposureIPMI(){
+  var ipmi=exposureCompareRows().filter(function(r){return expGroup(r)==="IPMI"});
+  return exposureSlide("Exposure prevalence · IPMI",
+    "<b>IPMI</b>ranked by severity, then by the gap",
+    ipmiBanded(ipmi,"spread"),"IPMI exposure");
+}
+
+function buildCmpExposureOther(){
+  var rest=exposureCompareRows().filter(function(r){return expGroup(r)!=="IPMI"});
+  return exposureSlide("Exposure prevalence · other protocols",
+    "<b>everything else</b>HTTP, Redfish, KVM, SSH, TLS, SNMP, serial",
+    expGrouped(rest,"spread"),"Other management protocols");
+}
+
+function buildCmpPopulation(){
+  var s=slideShell("Comparison",{text:"Population & device class"},null);
+  var g=el("div","grid2");
+  var left=el("div");
+  left.appendChild(panelTitle("Device class · % of each source",true));
+  var rows=DATA.compare.classes.slice().filter(function(r){return r.hosts.some(function(h){return h>0})}).slice(0,10);
+  left.appendChild(compareRows(rows,{}));
+  var right=el("div");
+  right.appendChild(panelTitle("Vendor attribution · % of hosts"));
+  var cap=el("div","panel-cap");
+  cap.innerHTML="Share of each source whose <b>vendor</b> was resolved from identity or a side-channel tell (TLS cert, Server header, IPMI GUID). <b>Unknown</b> is a real device we could not attribute; <b>Honeypot</b> is a classified decoy (no real vendor), counted apart from Unknown.";
+  right.appendChild(cap);
+  var arows=[];
+  SRC.forEach(function(src,i){
+    arows.push({label:src.name+" · attributed",value:100*src.resolved/(src.total||1),note:fmt(src.resolved),color:accent(i)});
+    arows.push({label:src.name+" · unknown",value:100*src.unknown/(src.total||1),note:fmt(src.unknown),color:accentSoft(i)});
+    if(src.honeypot>0)arows.push({label:src.name+" · honeypot",value:100*src.honeypot/(src.total||1),note:fmt(src.honeypot),color:"var(--info)"});
+  });
+  right.appendChild(barRows(arows,{percent:true,max:100}));
+  g.appendChild(left);g.appendChild(right);
+  s._fill.appendChild(g);
+  return s;
+}
+
+function buildCmpVendors(){
+  var s=slideShell("Comparison",{text:"Vendor prevalence"},null);
+  s._fill.appendChild(panelTitle("Vendor · % of each source · sorted by spread",true));
+  var rows=DATA.compare.vendors.slice().filter(function(r){return r.hosts.some(function(h){return h>0})}).slice(0,12);
+  s._fill.appendChild(compareRows(rows,{}));
+  return s;
+}
+
+function buildSourceOverview(i){
+  var src=SRC[i];
+  var sub=el("div","slide-sub");
+  sub.innerHTML="<b>"+fmt(src.total)+"</b>hosts"+(src.redacted?" · <span class='redacted-tag'>● redacted</span>":"");
+  var s=slideShell(src.name,{text:src.name+" overview"},sub);
+  var items=[
+    {label:"Hosts",value:fmt(src.total),color:accent(i)},
+    {label:"Attributed",value:pct(100*src.resolved/(src.total||1))},
+    {label:"Critical risk",value:fmt(src.withCritical),color:"var(--crit)",note:pct(100*src.withCritical/(src.total||1))},
+    {label:"High risk",value:fmt(src.withHigh),color:"var(--high)",note:pct(100*src.withHigh/(src.total||1))},
+    {label:"RAKP leak",value:fmt(src.rakpHosts)},
+    {label:src.hasPot?"Cracked (pot)":"Cracked (scan)",value:fmt(src.hasPot?src.potCracked:src.autoCracked),color:"var(--crit)"}
+  ];
+  s._fill.appendChild(metricStrip(items,true));
+  var g=el("div","grid2");g.style.marginTop="22px";
+  var left=el("div");
+  left.appendChild(panelTitle("Top exposures · severity, then % of hosts"));
+  var exp=expRank(src.exposures.filter(function(x){return x.hosts>0}),"pct").slice(0,12);
+  left.appendChild(barRows(exp.map(function(x){return {label:x.label,value:x.pct,note:fmt(x.hosts),color:exposureColor(x.key)}}),{percent:true,max:100}));
+  var right=el("div");
+  right.appendChild(panelTitle("Top vendors"));
+  right.appendChild(barRows(src.vendors.slice(0,8).map(function(v){return {label:v.vendor,value:v.count,note:pct(v.pct)}}),{color:accent(i)}));
+  var ct=el("div","panel-title");ct.style.marginTop="16px";ct.appendChild(el("span",null,"Device class"));right.appendChild(ct);
+  right.appendChild(barRows(src.classes.slice(0,6).map(function(c){return {label:c.v,value:c.n,note:pct(100*c.n/(src.total||1))}}),{color:accent(i)}));
+  g.appendChild(left);g.appendChild(right);
+  s._fill.appendChild(g);
+  return s;
+}
+
+/* coverageStrip renders which evidence families a source actually carried, so a
+   missing family reads as "not in this source" rather than a clean zero. */
+var COV_FIELDS=[["services","Service scan"],["findings","Findings"],["identity","Identity"],["versions","Versions"],["rakp","RAKP hashes"],["guid","System GUIDs"]];
+function coverageStrip(src){
+  var cov=src.coverage||{};var wrap=el("div","cov");
+  COV_FIELDS.forEach(function(f){
+    var n=cov[f[0]]||0;var on=n>0;
+    var pill=el("div","cov-pill "+(on?"on":"off"));
+    pill.appendChild(el("i"));
+    pill.appendChild(el("span",null,esc(f[1])+(on?" <b>"+fmt(n)+"</b>":" <b>—</b>")));
+    wrap.appendChild(pill);
+  });
+  return wrap;
+}
+
+/* Immediate-compromise headline: unique hosts with a confirmed access path, then
+   the breakdown by path. These are observed paths, not version-gated CVEs. */
+function buildCompromiseSlide(i){
+  var src=SRC[i];
+  var sub=el("div","slide-sub");sub.innerHTML="<b>observed paths</b>not version-gated";
+  var s=slideShell(src.name,{text:"Immediate compromise paths",big:true},sub);
+  var rows=(src.compromise||[]).filter(function(x){return x.hosts>0});
+  rows.sort(function(a,b){return b.hosts-a.hosts});
+  var ext=src.immediateExt||0;
+  var pathTotal=rows.reduce(function(a,x){return a+x.hosts},0);
+  var kpis=el("div","kpis");
+  function kpi(v,l,n,cls,color){var k=el("div","kpi"+(cls?" "+cls:""));if(color)k.style.setProperty("--a0",color);
+    k.appendChild(el("div","kv",fmt(v)));k.appendChild(el("div","kl",l));if(n)k.appendChild(el("div","kn",n));return k}
+  kpis.appendChild(kpi(ext,"Unique hosts owned",pct(100*ext/(src.total||1))+" of population · de-duplicated across paths","big","var(--crit)"));
+  if(rows[0])kpis.appendChild(kpi(rows[0].hosts,rows[0].label,"largest single path","","var(--high)"));
+  kpis.appendChild(kpi(rows.length,"Distinct paths",fmt(pathTotal)+" total path hits (hosts may match several)",""));
+  s._fill.appendChild(kpis);
+  var body=el("div");body.style.marginTop="18px";
+  body.appendChild(panelTitle("Compromise path · hosts (a pre-auth path, or an escalation leg that needs any low-privilege account)"));
+  var max=rows.length?rows[0].hosts:1;
+  var fn=el("div","funnel");
+  rows.forEach(function(r,idx){
+    var row=el("div","fn-row");row.style.animationDelay=(idx*30)+"ms";
+    row.appendChild(el("div","k",esc(r.label)));
+    var track=el("div","fn-track");var fill=el("div","fn-fill");
+    fill.style.width=Math.max(3,100*r.hosts/(max||1))+"%";fill.style.background=exposureColor(r.key);
+    track.appendChild(fill);row.appendChild(track);
+    var abs=el("div","fn-abs");abs.innerHTML=fmt(r.hosts)+"<small>"+pct(100*r.hosts/(src.total||1))+"</small>";
+    row.appendChild(abs);
+    fn.appendChild(row);
+  });
+  body.appendChild(fn);
+  s._fill.appendChild(body);
+  return s;
+}
+
+/* Credential recovery as a single progressive stacked bar over the captured
+   RAKP hash rows: hashes leaked -> recovered live in the scan window -> total
+   recovered after the offline pot-run. Then the account-shape breakout and the
+   recovered-password tail split out by vendor. */
+function buildCrackFunnel(i){
+  var src=SRC[i];var cr=src.cracks||{};
+  var hashRows=cr.hashRows||cr.hashHosts||0;
+  var live=cr.scanRowCracks||cr.scanAny||0;
+  var potTotal=cr.potRowCracks||0;
+  var potLbl=cr.potLabel?esc(cr.potLabel):"offline pot-run growth";
+  var sub=el("div","slide-sub");sub.innerHTML="<b>"+fmt(cr.total||0)+"</b>hosts with a recovered credential";
+  var s=slideShell(src.name,{text:"Hashes"},sub);
+  // Single progressive stacked bar.
+  var stages=[
+    {k:"RAKP hashes leaked",n:hashRows,sub:"HMAC exchanges disclosed pre-auth",c:"#c3ccc7"},
+    {k:"Recovered live (scan)",n:live,sub:"common/default cracked in the scan window",c:"#5d6b64"},
+    {k:"Recovered after offline crack",n:potTotal,sub:potLbl,c:"#26332c"}
+  ].filter(function(x){return x.n>0});
+  s._fill.appendChild(stackedBar(stages, hashRows));
+  /* Account-shape breakout of the recovered credentials (host-scoped): a named
+     login is a full takeover, an empty/callback secret is a weaker foothold. */
+  var shape=[
+    {k:"Named accounts",n:cr.scanNamed,sub:"real login, full takeover"},
+    {k:"Empty / callback",n:cr.scanEmpty,sub:"blank or vendor-callback secret"},
+    {k:"Potfile total (hosts)",n:cr.total,sub:"scan + later offline growth"}
+  ].filter(function(x){return x.n>0});
+  var g=el("div","grid2");g.style.marginTop="18px";
+  var left=el("div");
+  if(shape.length){
+    left.appendChild(panelTitle("Recovered account shape (hosts)"));
+    left.appendChild(barRows(shape.map(function(p){return {label:p.k,value:p.n,note:p.sub}}),{color:srcColor(i)}));
+  }
+  // Long tail: recovered passwords after the vendor-default head.
+  if(cr.tailPasswords&&cr.tailPasswords.length){
+    left.appendChild(panelTitle("Recovered password long tail (non-default)"));
+    left.appendChild(barRows(cr.tailPasswords.map(function(p){return {label:p.v,value:p.n}}),{color:srcColor(i)}));
+  }
+  var right=el("div");
+  // Which vendors the recovered credentials came from -- host counts only. The
+  // per-vendor password values themselves are on the combined Passwords slides;
+  // repeating them here overflowed the frame and said nothing new.
+  if(cr.vendorPasswords&&cr.vendorPasswords.length){
+    right.appendChild(panelTitle("Recovered credentials by vendor (hosts)"));
+    right.appendChild(barRows(cr.vendorPasswords.slice(0,8).map(function(v){
+      return {label:v.vendor,value:v.count}}),{color:srcColor(i)}));
+  }else if(cr.topPasswords&&cr.topPasswords.length){
+    right.appendChild(panelTitle("Top recovered passwords"));
+    right.appendChild(barRows(cr.topPasswords.slice(0,8).map(function(p){return {label:p.v,value:p.n}}),{color:srcColor(i)}));
+  }
+  g.appendChild(left);g.appendChild(right);
+  s._fill.appendChild(g);
+  return s;
+}
+
+/* stackedBar renders the crack stages as one progressive horizontal bar: the
+   leaked base fills the track, the live-recovered count fills over it, and the
+   larger after-offline total fills over both, so the bar reads as a progressive
+   cumulative reveal. A legend carries each stage's count and % of the base. */
+function stackedBar(stages, base){
+  // stages[0]=leaked base, [1]=live (subset), [2]=offline total (superset of live)
+  var wrap=el("div","sb");
+  var bar=el("div","sb-bar");
+  var baseN=stages[0]?stages[0].n:1;
+  // Layer from largest to smallest so each inner count overlays the base.
+  var layers=stages.slice().sort(function(a,b){return b.n-a.n});
+  layers.forEach(function(st){
+    var w=Math.max(1.5,100*st.n/(baseN||1));
+    var seg=el("div","sb-seg");seg.style.width=Math.min(100,w)+"%";seg.style.background=st.c;
+    seg.title=st.k+": "+fmt(st.n);
+    bar.appendChild(seg);
+  });
+  wrap.appendChild(bar);
+  var leg=el("div","sb-leg");
+  stages.forEach(function(st){
+    var it=el("div","sb-it");
+    var sw=el("i");sw.style.background=st.c;it.appendChild(sw);
+    var tx=el("div");
+    tx.appendChild(el("b",null,esc(st.k)+" · "+fmt(st.n)));
+    tx.appendChild(el("small",null,esc(st.sub)+" · "+pct(100*st.n/(base||1))+" of leaked"));
+    it.appendChild(tx);
+    leg.appendChild(it);
+  });
+  wrap.appendChild(leg);
+  return wrap;
+}
+
+/* patternTable renders the detected generated-password families: the regex over
+   the alphabet actually observed, the dominant per-position shape, which
+   vendors/products carried it, and any network prefix the hosts concentrate in.
+   Characters the family's classes allow but that never occur are called out
+   separately -- an excluded character is the most actionable thing here, since
+   it shrinks the mask a future crack run has to sweep. */
+function patternTable(rows){
+  var wrap=el("div","pat");
+  rows.forEach(function(r){
+    var row=el("div","pat-row");
+    var head=el("div");
+    head.appendChild(el("div","pat-rx",esc(r.regex||"")));
+    if(r.mask)head.appendChild(el("div","pat-mask",esc(r.mask)+
+      ((r.shapes&&r.shapes.length>1)?" +"+(r.shapes.length-1)+" shapes":"")));
+    // A collapsed family says which narrower patterns it swallowed, so the merge
+    // is auditable rather than a silently different number.
+    if(r.absorbed&&r.absorbed.length){
+      var ab=el("div","pat-mask","+ "+esc(r.absorbed.join(", ")));
+      ab.title="collapsed into this pattern: "+r.absorbed.join(", ");
+      head.appendChild(ab);
+    }
+    row.appendChild(head);
+
+    var f=el("div","pat-facets");
+    function facet(label,pairs,fmtv){
+      if(!pairs||!pairs.length)return;
+      var txt=pairs.map(function(p){return esc(p.v)+" "+(fmtv?fmtv(p.n):"("+fmt(p.n)+")")}).join(", ");
+      var s=el("span",null,"<i>"+label+"</i> "+txt);s.title=txt.replace(/<[^>]*>/g,"");
+      f.appendChild(s);
+    }
+    // The dominant vendor is why this family is credible as a generator at all,
+    // so it leads, with its concentration alongside.
+    if(r.vendor){
+      f.appendChild(el("span",null,"<i>vendor</i> <b>"+esc(r.vendor)+"</b> "+
+        pct(100*(r.concentration||0))+" of sightings"+
+        ((r.vendors&&r.vendors.length>1)?" <i>(+"+(r.vendors.length-1)+" other)</i>":"")));
+    }else{
+      facet("vendor",r.vendors);
+    }
+    facet("product",r.products);
+    if(r.prefixes&&r.prefixes.length){
+      var nets=r.prefixes.map(function(p){return esc(p.v)+" ("+fmt(p.n)+")"}).join(", ");
+      var extra=r.nets>r.prefixes.length?" <i>of "+fmt(r.nets)+" networks</i>":"";
+      f.appendChild(el("span",null,"<i>network</i> "+nets+extra));
+    }else if(r.nets){
+      f.appendChild(el("span",null,"<i>network</i> <i>"+fmt(r.nets)+
+        " networks, none shared by 2+ hosts</i>"));
+    }
+    if(r.missing){
+      f.appendChild(el("span",null,"<i>never uses</i> <span class='pat-miss'>"+
+        esc(r.missing.split("").join(" "))+"</span>"));
+    }else{
+      f.appendChild(el("span",null,"<i>uses its full alphabet</i>"));
+    }
+    row.appendChild(f);
+
+    var n=el("div","pat-n");
+    n.appendChild(el("b",null,fmt(r.hosts)));
+    n.appendChild(el("small",null,fmt(r.distinct)+" distinct"));
+    row.appendChild(n);
+    wrap.appendChild(row);
+  });
+  return wrap;
+}
+
+
+
+/* Passwords: every source's recovered credentials pooled into one view. The
+   split that organises it is per-unit vs shared -- a value on many hosts is a
+   vendor default, a value on one host is a factory-generated secret -- because
+   only the second kind carries a generator shape worth attacking. */
+function buildPasswordsSlide(){
+  var pv=DATA.passwords||{};
+  var sub=el("div","slide-sub");
+  sub.innerHTML="<b>"+fmt(pv.hosts||0)+"</b>hosts with a recovered credential";
+  var s=slideShell("All sources",{text:"Passwords · recovered"},sub);
+  var chips=[
+    {v:pv.hosts,l:"Hosts with a credential"},
+    {v:pv.distinct,l:"Distinct plaintexts"},
+    {v:pv.perUnit,l:"Per-unit (generated)"},
+    {v:pv.shared,l:"Shared defaults"},
+    {v:(pv.patterns||[]).length,l:"Patterns detected"}
+  ].filter(function(x){return x.v>0});
+  var cg=el("div","chips-grid");
+  chips.forEach(function(c,idx){var b=el("div","chip-stat");b.style.animationDelay=(idx*30)+"ms";
+    b.appendChild(el("div","cv",fmt(c.v)));b.appendChild(el("div","cl",esc(c.l)));cg.appendChild(b)});
+  s._fill.appendChild(cg);
+  var g=el("div","grid2");g.style.marginTop="18px";
+  var left=el("div");
+  if(pv.sharedTop&&pv.sharedTop.length){
+    left.appendChild(panelTitle("Shared credentials (hosts)"));
+    left.appendChild(barRows(pv.sharedTop.slice(0,8).map(function(p){
+      return {label:p.v===""?"(empty)":p.v,value:p.n}}),{color:srcColor(0)}));
+  }
+  var right=el("div");
+  if(pv.vendors&&pv.vendors.length){
+    right.appendChild(panelTitle("Recovered credentials by vendor"));
+    right.appendChild(barRows(pv.vendors.slice(0,8).map(function(p){
+      return {label:p.v,value:p.n}}),{color:srcColor(1)}));
+  }
+  g.appendChild(left);g.appendChild(right);
+  s._fill.appendChild(g);
+  return s;
+}
+
+/* Second passwords slide: the generator families on their own frame. The pattern
+   table plus its per-family breakdowns cannot share a 16:9 slide with the
+   top-line counts, and the families are the analytical result worth the space. */
+function buildPasswordPatternsSlide(){
+  var pv=DATA.passwords||{};
+  var pats=pv.patterns||[];
+  var sub=el("div","slide-sub");
+  sub.innerHTML="<b>"+fmt(pats.length)+"</b>generator families detected";
+  var s=slideShell("All sources",{text:"Passwords · detected patterns"},sub);
+  s._fill.appendChild(panelTitle("Factory generator families, by distinct plaintexts recovered"));
+  s._fill.appendChild(patternTable(pats));
+  return s;
+}
+
+/* Pre-auth GUID intelligence: data recovered from System GUIDs before login. */
+function buildGuidSlide(i){
+  var src=SRC[i];var gd=src.guid||{};
+  var sub=el("div","slide-sub");sub.innerHTML="<b>pre-auth</b>from System GUID";
+  var s=slideShell(src.name,{text:"GUID analysis"},sub);
+  var chips=[
+    {v:gd.decoded,l:"GUIDs decoded"},
+    {v:gd.serviceTags,l:"Dell service tags recovered"},
+    {v:gd.serials,l:"HPE serials recovered"},
+    {v:gd.countries,l:"HPE plant codes recovered"},
+    {v:gd.nodeMacs,l:"UUIDv1 node MACs leaked"},
+    {v:gd.modelPrefixes,l:"Model prefixes"},
+    {v:gd.vendorResolved,l:"Vendor resolved from GUID"},
+    {v:gd.hosts,l:"Hosts with a GUID"}
+  ].filter(function(x){return x.v>0});
+  var cg=el("div","chips-grid");
+  chips.forEach(function(c,idx){var b=el("div","chip-stat");b.style.animationDelay=(idx*30)+"ms";
+    b.appendChild(el("div","cv",fmt(c.v)));b.appendChild(el("div","cl",esc(c.l)));cg.appendChild(b)});
+  s._fill.appendChild(cg);
+  var g=el("div","grid2");g.style.marginTop="18px";
+  var c1=el("div");c1.appendChild(panelTitle("GUID family / version"));
+  c1.appendChild(barRows((gd.families||[]).slice(0,6).map(function(p){return {label:guidFamilyLabel(p.v),value:p.n,note:pct(100*p.n/(gd.decoded||1))}}),{color:srcColor(i)}));
+  var c2=el("div");c2.appendChild(panelTitle("HPE Plant Code"));
+  c2.appendChild(barRows((gd.countryCodes||[]).slice(0,6).map(function(p){return {label:p.v,value:p.n}}),{color:srcColor(i)}));
+  g.appendChild(c1);g.appendChild(c2);
+  s._fill.appendChild(g);
+  return s;
+}
+
+/* New-findings table: every newly researched BMC weakness in name order (the Go
+   side sorts it), with the vendor and per-source prevalence (host count and % of
+   that source's population). Prevalence stays anchored to each source's own
+   denominator. */
+function buildNewFindingsSlide(){
+  var nf=DATA.newFindings||[];
+  var s=slideShell("New findings",{text:"Prevalence by source, sorted by name"});
+  var wrap=el("div","tbl-wrap");wrap.style.overflow="auto";
+  var t=el("table");
+  var thead=el("thead");var hr=el("tr");
+  ["ID","Finding","Vendor","Risk"].forEach(function(h){hr.appendChild(el("th",null,h))});
+  SRC.forEach(function(sc){hr.appendChild(el("th","n",esc(sc.name)))});
+  thead.appendChild(hr);t.appendChild(thead);
+  var tb=el("tbody");
+  nf.forEach(function(f){
+    var tr=el("tr");
+    tr.appendChild(el("td",null,esc(f.id)));
+    var tdT=el("td",null,esc(f.title));tr.appendChild(tdT);
+    tr.appendChild(el("td",null,esc(f.vendor)));
+    tr.appendChild(el("td",null,"<span class='chip "+riskClass(f.risk)+"'>"+esc((f.risk||"info").toUpperCase())+"</span>"));
+    SRC.forEach(function(sc,i){
+      var td=el("td","n");
+      var tested=f.tested&&f.tested[i];
+      if(!tested){
+        var inf=inferredCount(f.key,i);
+        if(inf>0){
+          td.textContent=fmt(inf)+"* ("+pct(100*inf/(sc.total||1))+")";
+          td.title="inferred affected hosts (scan did not actively probe)";
+        }else{td.textContent="N/A";td.className="n muted";td.title="not tested in this scan";}
+      }
+      else{var n=(f.hosts&&f.hosts[i])||0;td.textContent=n>0?fmt(n)+" ("+pct(f.pct[i])+")":"0";if(n===0)td.className="n muted";}
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);wrap.appendChild(t);s._fill.appendChild(wrap);
+  var note=el("div","panel-cap");note.style.marginTop="12px";
+  note.textContent="* inferred affected hosts (the scan did not actively probe). N/A = not tested, not a zero.";
+  s._fill.appendChild(note);
+  return s;
+}
+
+function buildAdvisorySlide(){
+  var adv=DATA.advisories;
+  var sub=el("div","slide-sub");sub.innerHTML="<b>firmware / source evidence</b>not a scan-prevalence denominator";
+  var s=slideShell("Root cause research",{text:"The protocol problem survives in shipping code",big:true},sub);
+  var severe=pairCount(adv.risks,"CRITICAL")+pairCount(adv.risks,"HIGH");
+  var unauth=pairCount(adv.surfaces,"UNAUTH");
+  s._fill.appendChild(metricStrip([
+    {label:"Draft advisories",value:fmt(adv.total),color:"var(--a2)",note:"standalone findings"},
+    {label:"Vendors",value:fmt(adv.vendors),note:"BMC and OOB ecosystems"},
+    {label:"Critical / high",value:fmt(severe),color:"var(--crit)",note:"research inventory"},
+    {label:"Unauthenticated surface",value:fmt(unauth),color:"var(--high)",note:"network reachable"}
+  ],true));
+
+  var g=el("div","adv-grid");
+  var left=el("div");
+  left.appendChild(panelTitle("Coordination state · kept separate from technical proof"));
+  left.appendChild(barRows((adv.states||[]).map(function(p,idx){return {label:p.v,value:p.n,color:accent(idx)}}),{}));
+  var riskTitle=panelTitle("Risk distribution");riskTitle.style.marginTop="20px";left.appendChild(riskTitle);
+  var riskOrder=["CRITICAL","HIGH","MEDIUM","LOW","INFO"];
+  var risks=riskOrder.map(function(name){return {label:name.toLowerCase(),value:pairCount(adv.risks,name),color:riskColor(name.toLowerCase())}}).filter(function(r){return r.value>0});
+  left.appendChild(barRows(risks,{}));
+
+  var right=el("div");right.appendChild(panelTitle("Protocol-relevant findings · affected code, not population"));
+  var list=el("div","adv-list");
+  (adv.highlights||[]).slice(0,6).forEach(function(item){
+    var row=el("div","adv-item");row.appendChild(el("div","adv-id",esc(item.id)));
+    var text=el("div");text.appendChild(el("div","adv-title",esc(item.title)));
+    text.appendChild(el("div","adv-meta",esc(item.vendor+" · "+item.surface+" · "+item.component)));row.appendChild(text);
+    row.appendChild(el("div","risk-tag "+String(item.risk).toLowerCase(),esc(item.risk)));
+    list.appendChild(row);
+  });
+  right.appendChild(list);
+  right.appendChild(el("div","proof-rule","Affected versions and coordination state travel with every advisory. No firmware-static result is presented here as live exploitation."));
+  g.appendChild(left);g.appendChild(right);s._fill.appendChild(g);
+  return s;
+}
+
+function buildActionSlide(){
+  var sub=el("div","slide-sub");sub.innerHTML="<b>defender outcome</b>break reachability, identity, and trust";
+  var s=slideShell("Call to action",{text:"Break the management-plane attack chain",big:true},sub);
+  var chain=el("div","attack-chain");
+  var nodes=[
+    {n:"1",t:"Host foothold",d:"production network"},
+    {n:"2",t:"Local BMC",d:"shared hardware buses"},
+    {n:"3",t:"OOB network",d:"trusted management plane"},
+    {n:"4",t:"Peer BMCs",d:"reused credentials"},
+    {n:"5",t:"Peer hosts",d:"console / virtual media"}
+  ];
+  nodes.forEach(function(node,idx){
+    var d=el("div","chain-node");d.appendChild(el("i",null,node.n));d.appendChild(el("b",null,node.t));d.appendChild(el("small",null,node.d));chain.appendChild(d);
+    if(idx<nodes.length-1)chain.appendChild(el("div","chain-arrow"));
+  });
+  s._fill.appendChild(chain);
+
+  var actions=el("div","action-grid");
+  [
+    {n:"01 / KNOW",t:"Inventory every management controller",d:"Scan UDP/623 and the web plane; retain firmware versions; decode GUIDs without treating unknown as absent."},
+    {n:"02 / ISOLATE",t:"Remove ambient reachability",d:"No internet exposure, no production-network access, and explicit jump paths into the out-of-band segment."},
+    {n:"03 / INDIVIDUALIZE",t:"Eliminate universal secrets",d:"Unique credentials per device, key rotation, cipher-zero removal, and IPMI disabled wherever the workflow permits."},
+    {n:"04 / OPERATE",t:"Treat BMC firmware as production code",d:"Patch it, validate enforcement rather than advertisements, and monitor RMCP, RAKP, SOL, KVM, and Redfish activity."}
+  ].forEach(function(a){var d=el("div","action");d.appendChild(el("div","an",a.n));d.appendChild(el("b",null,a.t));d.appendChild(el("p",null,a.d));actions.appendChild(d)});
+  s._fill.appendChild(actions);
+  s._fill.appendChild(el("div","closing-line","The server is not rebuilt until its management plane is trusted again."));
+  return s;
+}
+
+function buildDetailGuid(i){
+  var src=SRC[i];var gd=src.guid||{};var v=detailShell(i,"GUID intelligence");
+  var items=[
+    {label:"Decoded",value:fmt(gd.decoded)},
+    {label:"Service tags",value:fmt(gd.serviceTags)},
+    {label:"Serials",value:fmt(gd.serials)},
+    {label:"Node MACs",value:fmt(gd.nodeMacs),color:"var(--high)"},
+    {label:"Countries",value:fmt(gd.countries)},
+    {label:"Model prefixes",value:fmt(gd.modelPrefixes)}
+  ];
+  v.appendChild(metricStrip(items,true));
+  var g=el("div","grid2");g.style.marginTop="18px";
+  var c1=el("div");c1.appendChild(panelTitle("GUID families · share"));c1.appendChild(pairTable((gd.families||[]).map(function(p){return {v:guidFamilyLabel(p.v),n:p.n}}),"Family","share",{color:accent(i)}));
+  var c2=el("div");c2.appendChild(panelTitle("Vendor resolved from GUID · share"));c2.appendChild(pairTable(gd.vendors||[],"Vendor","share",{color:accent(i)}));
+  g.appendChild(c1);g.appendChild(c2);v.appendChild(g);
+  var g2=el("div","grid2");g2.style.marginTop="14px";
+  var c3=el("div");c3.appendChild(panelTitle("Plant Code · share"));c3.appendChild(pairTable(gd.countryCodes||[],"Plant","share",{color:srcColor(i)}));
+  g2.appendChild(c3);v.appendChild(g2);
+  return v;
+}
+
+
+function detailShell(i,title){
+  var v=el("div","detail view");
+  var head=el("div","detail-head");
+  var left=el("div");left.appendChild(el("div","eyebrow",esc(SRC[i].name)));
+  left.appendChild(el("h2",null,esc(title)));
+  head.appendChild(left);
+  var right=el("div","slide-sub");right.innerHTML="<b>"+fmt(SRC[i].total)+"</b>hosts"+(SRC[i].redacted?" · <span class='redacted-tag'>● redacted</span>":"");
+  head.appendChild(right);
+  v.appendChild(head);
+  return v;
+}
+function section(v,title){var sec=el("div","section");sec.appendChild(panelTitle(title));v.appendChild(sec);return sec}
+
+function buildDetailExposure(i){
+  var src=SRC[i];var v=detailShell(i,"Exposure detail");
+  var sec=section(v,"Exposure taxonomy · severity, then % of hosts");
+  var rows=expRank(src.exposures.filter(function(x){return x.hosts>0}),"pct");
+  sec.appendChild(barRows(rows.map(function(x){return {label:x.label,value:x.pct,note:fmt(x.hosts),color:exposureColor(x.key)}}),{percent:true,max:100}));
+  return v;
+}
+
+function buildDetailVendors(i){
+  var src=SRC[i];var v=detailShell(i,"Vendor detail");
+  // Population bars first: an immediate read of who dominates the fleet.
+  var psec=section(v,"Vendor population · % of hosts");
+  psec.appendChild(barRows(src.vendors.slice(0,15).map(function(x){return {label:x.vendor,value:x.pct,note:fmt(x.count)}}),{percent:true,max:100,color:accent(i)}));
+
+  var sec=section(v,"Exposure by vendor · cell = % of that vendor's hosts · coloured by category");
+  var live=KEYS.filter(function(k){return src.vendors.some(function(vr){return vr.exp&&vr.exp[k.key]})});
+  var head="<tr><th class='vhead-v'>Vendor</th><th class='n'>Hosts</th>";
+  live.forEach(function(k){head+="<th class='n heatcol' title='"+esc(k.label)+"' style='color:"+exposureColor(k.key)+"'>"+esc(k.short||k.label)+"</th>"});
+  head+="</tr>";
+  var body="";
+  src.vendors.forEach(function(vr){
+    body+="<tr><td class='vhead-v'>"+esc(vr.vendor)+"</td><td class='n muted'>"+fmt(vr.count)+"</td>";
+    live.forEach(function(k){
+      var c=(vr.exp&&vr.exp[k.key])||0;var p=vr.count?100*c/vr.count:0;
+      if(!c){body+="<td class='heatcell'></td>";return}
+      // Category hue, opacity scaled by prevalence; dark text stays readable.
+      var op=(0.14+0.66*p/100).toFixed(2);
+      body+="<td class='heatcell' title='"+fmt(c)+" of "+fmt(vr.count)+"'><span class='heat' style='background:"+hexA(exposureColor(k.key),op)+"'>"+Math.round(p)+"</span></td>";
+    });
+    body+="</tr>";
+  });
+  var wrap=el("div","tbl-wrap");wrap.appendChild(el("table","heatmap","<thead>"+head+"</thead><tbody>"+body+"</tbody>"));
+  sec.appendChild(wrap);
+  return v;
+}
+// hexA turns "#rrggbb" + opacity into an rgba() string.
+function hexA(hex,a){var n=parseInt(hex.slice(1),16);return "rgba("+((n>>16)&255)+","+((n>>8)&255)+","+(n&255)+","+a+")"}
+
+// pairTable renders a value/count table with a bar. denom controls the %:
+//  - a positive number: % of that denominator (host count), for per-host axes;
+//  - "share": % of the column's own total (for occurrence axes like RAKP
+//    usernames or the check histogram, where a host contributes many rows and
+//    "% of hosts" would exceed 100).
+function pairTable(pairs,label,denom,opts){
+  opts=opts||{};
+  if(!pairs.length)return el("div","empty","No data");
+  var total=denom, head="% of hosts";
+  if(denom==="share"){total=0;pairs.forEach(function(p){total+=p.n});head="share";}
+  var max=0;pairs.forEach(function(p){if(p.n>max)max=p.n});
+  var color=opts.color||"var(--a0)";
+  var body="";pairs.forEach(function(p){
+    var w=max?Math.max(2,100*p.n/max):0;
+    body+="<tr><td><span class='minibar' style='width:"+(w*0.5)+"px;background:"+color+"'></span>"+esc(p.v)+"</td>"+
+      "<td class='n'>"+fmt(p.n)+"</td><td class='n muted'>"+pct(100*p.n/(total||1))+"</td></tr>";
+  });
+  var wrap=el("div","tbl-wrap");
+  wrap.appendChild(el("table",null,"<thead><tr><th>"+esc(label)+"</th><th class='n'>Count</th><th class='n'>"+head+"</th></tr></thead><tbody>"+body+"</tbody>"));
+  return wrap;
+}
+
+// portLabel names the well-known OOB ports so the ports chart reads at a glance.
+var PORT_NAMES={22:"SSH",23:"Telnet",80:"HTTP",161:"SNMP",443:"HTTPS",623:"IPMI",5900:"VNC",5901:"VNC",
+  2068:"iLO IRC",3900:"KVM",7578:"MegaRAC KVM",16992:"AMT",16993:"AMT-TLS",17988:"iLO vMedia",5985:"WinRM",
+  49152:"UPnP",9999:"Serial",2069:"iLO",427:"SLP",5988:"CIM",5989:"CIM-TLS",1900:"SSDP",17990:"iLO console"};
+var GUID_FAMILY_NAMES={"hpe-printable":"HPE iLO printable serial","dell-service-tag":"Dell service tag",
+  "smc-board-serial":"Supermicro board serial","uuidv1":"UUIDv1 (node MAC + time)","uuidv4":"UUIDv4 (random)",
+  "uuidv1-mac":"UUIDv1 (node MAC + time)","node-mac":"Embedded node MAC","model-prefix":"Vendor model prefix",
+  "ami-guid":"AMI MegaRAC GUID","zeros":"All-zero / unset","nonstd":"Non-standard layout"};
+function guidFamilyLabel(slug){return GUID_FAMILY_NAMES[String(slug||"").toLowerCase()]||slug}
+function portRow(p,proto){var n=PORT_NAMES[parseInt(p.v,10)];return {label:p.v+(n?" · "+n:""),value:p.n,note:proto}}
+
+function buildDetailServices(i){
+  var src=SRC[i];var v=detailShell(i,"Services & ports");
+  // Headline: the reachable-surface protocols, as a coloured bar chart.
+  var top=section(v,"Reachable protocols · % of hosts");
+  top.appendChild(barRows(src.protocols.slice(0,12).map(function(p){return {label:protoName(p.v),value:100*p.n/(src.total||1),note:fmt(p.n),color:protoColor(p.v)}}),{percent:true,max:100}));
+
+  var g=el("div","grid2");g.style.marginTop="4px";
+  var c1=el("div");c1.appendChild(panelTitle("Top TCP ports · % of hosts"));
+  c1.appendChild(barRows(src.portsTcp.slice(0,12).map(function(p){var n=PORT_NAMES[parseInt(p.v,10)];return {label:p.v+(n?" · "+n:""),value:100*p.n/(src.total||1),note:fmt(p.n),color:accent(i)}}),{percent:true,max:100}));
+  var c2=el("div");c2.appendChild(panelTitle("Top UDP ports · % of hosts"));
+  c2.appendChild(barRows(src.portsUdp.slice(0,12).map(function(p){var n=PORT_NAMES[parseInt(p.v,10)];return {label:p.v+(n?" · "+n:""),value:100*p.n/(src.total||1),note:fmt(p.n),color:accentSoft(i)}}),{percent:true,max:100}));
+  g.appendChild(c1);g.appendChild(c2);v.appendChild(g);
+
+  var g2=el("div","grid2");g2.style.marginTop="14px";
+  var c4=el("div");c4.appendChild(panelTitle("Products"));c4.appendChild(pairTable(src.products,"Product",src.total,{color:accent(i)}));
+  var c5=el("div");c5.appendChild(panelTitle("HTTP servers"));c5.appendChild(pairTable(src.httpServers,"Server",src.total,{color:accent(i)}));
+  g2.appendChild(c4);g2.appendChild(c5);v.appendChild(g2);
+  return v;
+}
+// protoColor buckets a protocol into a category hue.
+function protoColor(p){p=String(p).toLowerCase();
+  if(p.indexOf("ipmi")>=0)return "#b0243a";
+  if(p.indexOf("ssh")>=0)return "#0f9a9a";
+  if(p.indexOf("tls")>=0||p==="https")return "#0f8a5f";
+  if(p.indexOf("http")>=0||p.indexOf("redfish")>=0)return "#c98a0e";
+  if(p.indexOf("snmp")>=0)return "#7c4bc0";
+  if(p.indexOf("vnc")>=0||p.indexOf("kvm")>=0)return "#2f6bc4";
+  if(p.indexOf("telnet")>=0||p.indexOf("serial")>=0)return "#d5602c";
+  return "#67736c"}
+
+function buildDetailFindings(i){
+  var src=SRC[i];var v=detailShell(i,"Findings");
+  var sec=section(v,"Risk distribution");
+  var order=["critical","high","medium","low","info"];
+  var rows=order.filter(function(r){return src.risks[r]}).map(function(r){return {label:r,value:src.risks[r],color:riskColor(r)}});
+  sec.appendChild(barRows(rows,{}));
+  var sec2=section(v,"Check histogram");
+  sec2.appendChild(pairTable(src.checks,"Check","share",{color:accent(i)}));
+  return v;
+}
+
+function buildDetailIPMI(i){
+  var src=SRC[i];var v=detailShell(i,"IPMI / RAKP / SNMP");
+  var items=[
+    {label:"IPMI reachable",value:fmt(expHosts(src,"ipmi"))},
+    {label:"RAKP hash leak",value:fmt(src.rakpHosts),color:"var(--high)"},
+    {label:"Cracked live (scan)",value:fmt(src.autoCracked),color:"var(--crit)"},
+    {label:"Cracked (potfile)",value:src.hasPot?fmt(src.potCracked):"N/A",color:"var(--crit)"},
+    {label:"Cipher-zero",value:fmt(expHosts(src,"ipmi_cipher_zero")),color:"var(--crit)"},
+    {label:"Default creds",value:fmt(expHosts(src,"ipmi_default_creds")),color:"var(--crit)"}
+  ];
+  v.appendChild(metricStrip(items,true));
+  var g=el("div","grid2");g.style.marginTop="18px";
+  var c1=el("div");c1.appendChild(panelTitle("RAKP usernames (leaked hash) · share of hashes"));c1.appendChild(pairTable(src.rakpUsers,"Username","share",{color:accent(i)}));
+  var c2=el("div");c2.appendChild(panelTitle("SNMP communities · share"));c2.appendChild(pairTable(src.snmpCommunities,"Community","share",{color:accent(i)}));
+  g.appendChild(c1);g.appendChild(c2);v.appendChild(g);
+  return v;
+}
+function expHosts(src,key){var r=src.exposures.find(function(x){return x.key===key});return r?r.hosts:0}
+
+/* ---------- system explorer ---------- */
+var sysState={};
+
+// systemDetail renders one host's full carried detail: findings (with proof)
+// and services (with the curated attributes).
+function systemDetail(sy){
+  var box=el("div","host-detail");
+  var head=el("div","hd-head");
+  head.innerHTML="<b>"+esc(sy.a)+"</b> <span>"+esc(sy.v||"")+(sy.p?" · "+esc(sy.p):"")+(sy.ver?" · "+esc(sy.ver):"")+" · "+esc(sy.c||"")+"</span>";
+  box.appendChild(head);
+  var cols=el("div","hd-cols");
+
+  var fcol=el("div");fcol.appendChild(el("div","hd-title","Findings ("+((sy.f||[]).length)+")"));
+  if(sy.f&&sy.f.length){
+    sy.f.forEach(function(f){
+      var row=el("div","hd-find");
+      row.innerHTML="<span class='chip "+riskClass(f.r)+"'>"+esc(f.r||"info")+"</span> <code>"+esc(f.c)+"</code>"+(f.p?"<div class='hd-proof'>"+esc(f.p)+"</div>":"");
+      fcol.appendChild(row);
+    });
+  }else fcol.appendChild(el("div","empty","No findings"));
+
+  var scol=el("div");scol.appendChild(el("div","hd-title","Services ("+((sy.s||[]).length)+")"));
+  if(sy.s&&sy.s.length){
+    sy.s.forEach(function(sv){
+      var row=el("div","hd-svc");
+      var attrs="";for(var k in (sv.a||{})){attrs+="<div class='hd-attr'><span>"+esc(k)+"</span>"+esc(sv.a[k])+"</div>"}
+      row.innerHTML="<div class='hd-port'>"+esc(sv.p+"/"+(sv.t||"tcp"))+(sv.r&&sv.r.length?" <small>"+esc(sv.r.join(","))+"</small>":"")+"</div>"+attrs;
+      scol.appendChild(row);
+    });
+  }else scol.appendChild(el("div","empty","No service detail carried"));
+
+  cols.appendChild(fcol);cols.appendChild(scol);box.appendChild(cols);
+  if(sy.o&&sy.o.length){var p=el("div","hd-ports");p.innerHTML="<span>Ports</span> "+sy.o.map(esc).join("  ");box.appendChild(p)}
+  return box;
+}
+
+/* ---------- shell wiring ---------- */
+var current="snapshot";
+var rendered={};
+function render(id){
+  var view=VIEWS.find(function(v){return v.id===id});if(!view)return;
+  current=id;
+  var stage=byId("stage");stage.innerHTML="";
+  var node=view.build();node.classList.add("on");stage.appendChild(node);
+  if(node._apply)node._apply();
+  // nav highlight
+  Array.prototype.forEach.call(document.querySelectorAll(".tab"),function(t){t.classList.toggle("on",t.getAttribute("data-id")===id)});
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+function stepSlide(dir){
+  var sl=slides();var ids=sl.map(function(v){return v.id});
+  var idx=ids.indexOf(current);if(idx<0)idx=0;
+  render(ids[(idx+dir+ids.length)%ids.length]);
+}
+
+function buildNav(){
+  var nav=byId("nav");
+  slides().forEach(function(v){
+    var t=el("button","tab");t.setAttribute("data-id",v.id);
+    if(v.dot){var d=el("span","dot");d.style.background=v.dot;t.appendChild(d)}
+    t.appendChild(document.createTextNode(v.label));
+    t.addEventListener("click",function(){render(v.id)});
+    nav.appendChild(t);
+  });
+  // detail menu grouped by source
+  var menu=byId("detailMenu");
+  SRC.forEach(function(s,i){
+    menu.appendChild(el("div","grp",esc(s.name)));
+    VIEWS.filter(function(v){return v.kind==="detail"&&v.src===i}).forEach(function(v){
+      var b=el("button");var d=el("span","dot");d.style.background=accent(i);b.appendChild(d);
+      b.appendChild(document.createTextNode(v.label));
+      b.addEventListener("click",function(){render(v.id);setMenu(false)});
+      menu.appendChild(b);
+    });
+  });
+}
+function setMenu(open){byId("detailMenu").classList.toggle("on",open)}
+
+/* present + capture */
+function setPresent(open){
+  document.body.classList.toggle("present",open);
+  if(open&&!slides().some(function(v){return v.id===current}))render(slides()[0].id);
+  if(open&&document.documentElement.requestFullscreen&&!document.fullscreenElement)document.documentElement.requestFullscreen().catch(function(){});
+  else if(!open&&document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(function(){});
+}
+function toast(msg){var t=byId("toast");t.textContent=msg;t.classList.add("on");clearTimeout(toast._t);toast._t=setTimeout(function(){t.classList.remove("on")},2400)}
+function loadCapture(){
+  if(window.html2canvas)return Promise.resolve(window.html2canvas);
+  if(loadCapture._p)return loadCapture._p;
+  loadCapture._p=new Promise(function(res,rej){
+    var done=false,finish=function(fn,arg){if(done)return;done=true;if(fn===rej)loadCapture._p=null;fn(arg)};
+    var sc=document.createElement("script");
+    sc.src="https://cdn.jsdelivr.net/npm/html2canvas-pro@2.2.4/dist/html2canvas-pro.min.js";
+    sc.onload=function(){window.html2canvas?finish(res,window.html2canvas):finish(rej,new Error("render library unavailable"))};
+    sc.onerror=function(){finish(rej,new Error("offline; use Present (F) and screenshot the slide"))};
+    // A blocked request can hang rather than error; time out so the toast never sticks.
+    setTimeout(function(){finish(rej,new Error("offline; use Present (F) and screenshot the slide"))},6000);
+    document.head.appendChild(sc);
+  });
+  return loadCapture._p;
+}
+function capture(){
+  var src=document.querySelector(".view.on");if(!src)return;
+  toast("Rendering 1920×1080 PNG…");
+  loadCapture().then(function(h2c){
+    var b=src.getBoundingClientRect();var scale=Math.max(1,1920/Math.max(1,b.width));
+    return h2c(src,{backgroundColor:"#ffffff",scale:scale,useCORS:true,logging:false,width:b.width,height:b.height,
+      onclone:function(doc){var scene=doc.querySelector(".view.on");if(scene){scene.querySelectorAll(".toolbar,input,select").forEach(function(c){c.remove()})}
+        var st=doc.createElement("style");st.textContent="*{animation:none!important;transition:none!important}";doc.head.appendChild(st)}});
+  }).then(function(canvas){
+    var out=document.createElement("canvas");out.width=1920;out.height=1080;
+    var ctx=out.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,1920,1080);
+    var s=Math.min(1920/canvas.width,1080/canvas.height);var w=canvas.width*s,hh=canvas.height*s;
+    ctx.drawImage(canvas,(1920-w)/2,(1080-hh)/2,w,hh);
+    out.toBlob(function(blob){var a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="oob-report-"+current+".png";a.click();setTimeout(function(){URL.revokeObjectURL(a.href)},1000);toast("Downloaded "+current)},"image/png");
+  }).catch(function(e){toast("Capture failed: "+e.message)});
+}
+
+function init(){
+  DATA=window.__DATA; SRC=DATA.sources||[]; KEYS=DATA.keys||[];
+  if(DATA.title)document.title=DATA.title;
+  buildViews();buildNav();
+  var params=new URLSearchParams(location.search);
+  var requested=params.get("view");
+  // Fall back to the first registered slide rather than a hardcoded id, so a
+  // deck that opens on a title slide and one that has none both land on a view
+  // that exists.
+  var initial=VIEWS.some(function(v){return v.id===requested})?requested:slides()[0].id;
+  if(params.get("frame")==="1")document.body.classList.add("present","frame");
+  render(initial);
+  byId("presentBtn").addEventListener("click",function(){setPresent(true)});
+  byId("captureBtn").addEventListener("click",capture);
+  byId("railPrev").addEventListener("click",function(){stepSlide(-1)});
+  byId("railNext").addEventListener("click",function(){stepSlide(1)});
+  byId("railCapture").addEventListener("click",capture);
+  byId("railExit").addEventListener("click",function(){setPresent(false)});
+  byId("detailBtn").addEventListener("click",function(e){e.stopPropagation();setMenu(!byId("detailMenu").classList.contains("on"))});
+  document.addEventListener("click",function(e){if(!byId("detailDropdown").contains(e.target))setMenu(false)});
+  document.addEventListener("fullscreenchange",function(){if(!document.fullscreenElement)document.body.classList.remove("present")});
+  document.addEventListener("keydown",function(e){
+    var editing=/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName);
+    if(e.key==="Escape"){if(document.body.classList.contains("present"))setPresent(false);setMenu(false);return}
+    if(editing)return;
+    if(e.key==="ArrowRight"){e.preventDefault();stepSlide(1)}
+    else if(e.key==="ArrowLeft"){e.preventDefault();stepSlide(-1)}
+    else if(e.key.toLowerCase()==="p"){e.preventDefault();capture()}
+    else if(e.key.toLowerCase()==="f"){e.preventDefault();setPresent(!document.body.classList.contains("present"))}
+  });
+}
+loadPayload().then(function(d){window.__DATA=d;init()}).catch(function(err){
+  document.getElementById("stage").innerHTML="<div style='padding:40px;color:#b0243a;font-weight:700'>Failed to load report data: "+String(err&&err.message||err)+"</div>";
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Build output
+*.exe
+*.bin
+
+# Editor / OS
+.DS_Store
+*.swp

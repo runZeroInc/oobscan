@@ -1,0 +1,102 @@
+package check
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/runZeroInc/oobscan/pkg/engine"
+)
+
+func init() {
+	Register(Check{
+		Name:        "http.vertiv.unityCardInfo",
+		Description: "Vertiv/Liebert IntelliSlot Unity pre-auth /web/cardinfo.json disclosure",
+		Category:    "exposure",
+		Applies: Applicability{
+			Vendors: []string{"vertiv"},
+			Classes: []engine.DeviceClass{engine.ClassPDU},
+		},
+		Enabled: true,
+		Run:     runVertivUnityCardInfo,
+	})
+	RegisterExplain("http.vertiv.unityCardInfo", explainVertivUnityCardInfo)
+}
+
+func runVertivUnityCardInfo(ctx context.Context, t *engine.Target) []engine.Finding {
+	port := webPort(t)
+	proto := webProto(t)
+	if !webPortMaybeOpen(t, port) {
+		return nil
+	}
+	client := insecureWebClient(min(t.Timeout, 6*time.Second))
+
+	const path = "/web/cardinfo.json"
+	st, ct, body := httpProbe(ctx, client, hostPortURL(proto, t.Host, port, path), "")
+	if st < 200 || st >= 300 {
+		return nil
+	}
+	if !strings.Contains(ct, "json") && !looksLikeJSON(body) {
+		return nil
+	}
+	var info struct {
+		Version  string `json:"version"`
+		Sysname  string `json:"sysname"`
+		State    string `json:"state"`
+		Hostname string `json:"hostname"`
+		Macaddr  string `json:"macaddr"`
+	}
+	if json.Unmarshal(body, &info) != nil {
+		return nil
+	}
+
+	if info.Macaddr == "" || info.State == "" || info.Version == "" {
+		return nil
+	}
+
+	fields := engine.Fields{
+		{Key: "url", Val: path},
+		{Key: "version", Val: cleanSnippet(info.Version)},
+		{Key: "state", Val: cleanSnippet(info.State)},
+	}
+	if info.Hostname != "" {
+		fields = append(fields, engine.Field{Key: "hostname", Val: cleanSnippet(info.Hostname)})
+	}
+	if info.Macaddr != "" {
+		fields = append(fields, engine.Field{Key: "mac", Val: cleanSnippet(info.Macaddr)})
+	}
+	fields = append(fields, engine.Field{Key: "proof", Val: proofKV(
+		"path", path,
+		"status", fmt.Sprintf("%d", st),
+		"state", info.State,
+		"version", info.Version)})
+
+	return []engine.Finding{{
+		Check: "http.vertiv.unityCardInfo", Category: "exposure", Risk: "info",
+		Port: port, Transport: "tcp", Protocol: proto,
+		Fields: fields,
+	}}
+}
+
+func explainVertivUnityCardInfo(host string, f engine.Finding) string {
+	baseURL := explainBaseURL(host, f, 443, "https")
+	state := explainField(f, "state")
+	var b strings.Builder
+	b.WriteString(explainHeading(host, f))
+	b.WriteString("\nVertiv/Liebert IntelliSlot Unity serves its discovery document without\n")
+	b.WriteString("authentication, disclosing firmware version, hostname and the eth0 MAC.\n")
+	if v := explainField(f, "version"); v != "" {
+		b.WriteString(fmt.Sprintf("\n**Firmware:** `%s`\n", v))
+	}
+	if strings.EqualFold(state, "unconfigured") {
+		b.WriteString("\n**Posture:** `state=unconfigured` -- the card reports that provisioning has\n")
+		b.WriteString("not completed. This read alone does not prove account creation or control.\n")
+	}
+	b.WriteString("\n**Read the pre-auth discovery JSON:**\n")
+	b.WriteString(explainSh(fmt.Sprintf("curl -sk %s/web/cardinfo.json", baseURL)))
+	b.WriteString("\n\n**Impact:** Informational device identity and provisioning posture. The\n")
+	b.WriteString("response does not demonstrate unauthenticated configuration writes or device control.\n")
+	return b.String()
+}
