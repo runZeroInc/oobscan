@@ -1,3 +1,6 @@
+// Package wsman performs WS-Management Identify requests. iLO, iDRAC, AMT,
+// OpenBMC, and XClarity all implement WS-Man /wsman endpoints; Identify is
+// unauthenticated and returns the product vendor + version.
 package wsman
 
 import (
@@ -27,6 +30,7 @@ const identifyBody = `<?xml version="1.0" encoding="UTF-8"?>
   <s:Body><wsmid:Identify/></s:Body>
 </s:Envelope>`
 
+// Identity is the parsed Identify response.
 type Identity struct {
 	ProtocolVersion string
 	ProductVendor   string
@@ -36,10 +40,11 @@ type Identity struct {
 	URL             string
 }
 
+// LoginResult is one authenticated Identify attempt result.
 type LoginResult struct {
 	Authenticated bool
 	URL           string
-	Auth          string
+	Auth          string // "basic" | "digest"
 	Authorization string
 	Status        int
 	Identity      *Identity
@@ -47,6 +52,8 @@ type LoginResult struct {
 	Challenge     string
 }
 
+// SystemInfo is a compact authenticated WS-Man system snapshot recovered from
+// a standard CIM_ComputerSystem enumeration.
 type SystemInfo struct {
 	Endpoint     string
 	Manufacturer string
@@ -70,6 +77,7 @@ func (s *SystemInfo) HasProof() bool {
 
 const cimComputerSystemURI = "http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ComputerSystem"
 
+// VendorSlug derives a vendor slug from ProductVendor and ProductVersion.
 func (i *Identity) VendorSlug() string {
 	low := strings.ToLower(i.ProductVendor + " " + i.ProductVersion)
 	switch {
@@ -93,6 +101,8 @@ func (i *Identity) VendorSlug() string {
 	return ""
 }
 
+// HasFingerprint reports whether the Identify response contains useful product
+// identity fields.
 func (i *Identity) HasFingerprint() bool {
 	if i == nil {
 		return false
@@ -102,10 +112,19 @@ func (i *Identity) HasFingerprint() bool {
 		strings.TrimSpace(i.ProtocolVersion) != ""
 }
 
+// Probe sends Identify to https://host:port/wsman and http://host:port/wsman.
+// Most BMCs answer on 5986/tcp (https) and occasionally 5985/tcp (http).
+// For AMT use 16993/tcp (TLS) or 16992/tcp (cleartext).
 func Probe(host string, ports []int, timeout time.Duration) (*Identity, error) {
 	return ProbeWithConnectTimeout(host, ports, timeout, timeout)
 }
 
+// ProbeWithConnectTimeout is Probe with the reachability test and the Identify request
+// budgeted separately. The candidate list is a fixed set of six ports and a filtered
+// port costs a full connect timeout each, easily more than identify's whole budget on a
+// host with no WS-Man at all. A live endpoint is a local service and answers a connect
+// promptly, so the reachability test can be short; the Identify request keeps the full
+// budget for a slow TLS handshake on 5986.
 func ProbeWithConnectTimeout(host string, ports []int, connectTimeout, requestTimeout time.Duration) (*Identity, error) {
 	ports = normalizePorts(ports)
 	client := httpx.Client(requestTimeout)
@@ -136,6 +155,8 @@ func ProbeWithConnectTimeout(host string, ports []int, connectTimeout, requestTi
 	return nil, lastErr
 }
 
+// AuthenticateIdentify tries to authenticate to /wsman using Basic, then
+// Digest (if challenged), returning the first successful Identify response.
 func AuthenticateIdentify(host string, ports []int, timeout time.Duration, user, pass string) (*LoginResult, error) {
 	if strings.TrimSpace(user) == "" {
 		return nil, fmt.Errorf("username is required")
@@ -631,6 +652,7 @@ func escapeQuote(s string) string {
 	return strings.ReplaceAll(s, `"`, `\"`)
 }
 
+// ParseURL returns (scheme, host, port) for a wsman endpoint URL.
 func ParseURL(raw string) (string, string, int) {
 	u, err := url.Parse(raw)
 	if err != nil {

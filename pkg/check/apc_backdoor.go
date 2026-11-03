@@ -10,6 +10,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// APC/Schneider NMC3 ships a hidden demo/service credential in the shared AOS
+// auth core, gated behind an uploadable marker file (kb/apc/notes/) so it is
+// not an always-on backdoor -- if planted, it is one shared secret across the
+// product line that survives password changes. Distinct from apc.defaultCreds
+// and apc.limitedStatus. With logins enabled it actively tries the login (one
+// POST that can affect login counters); with DisableLogins it only reports candidacy.
+// Also checks the PowerChute control endpoint via GET/HEAD only.
 func init() {
 	Register(Check{
 		Name:        "http.apc.demoBackdoor",
@@ -77,11 +84,14 @@ func runAPCDemoBackdoor(ctx context.Context, t *engine.Target) []engine.Finding 
 	vendor := identityVendor(t)
 	apcLike := vendor == "apc" || vendor == "schneiderpm" || present
 
+	// 1. Hidden jmm627 demo/service credential.
 	if !t.DisableLogins && apcLike {
-
+		// One login POST. A success proves the demo
+		// credential authenticates (demo/Test-Drive unit or planted
+		// testdrive522.ini). A production unit's gate rejects it -> nothing fires.
 		if ok, proof, err := cl.DemoLogin(ctx); err == nil && ok {
 			f := engine.F("user", apc.DemoUser, "pass", apc.DemoPassword)
-			if proof != "" {
+			if proof != "" { // the authenticated home-page marker the login scraped
 				f = append(f, engine.Field{Key: "proof", Val: proof})
 			}
 			out = append(out, engine.Finding{
@@ -90,9 +100,12 @@ func runAPCDemoBackdoor(ctx context.Context, t *engine.Target) []engine.Finding 
 				Fields: f,
 			})
 		}
-
+		// err != nil (not an NMC login flow) or ok==false (gate rejected it): no
+		// finding. We do not downgrade a failed online attempt to an info
+		// candidacy -- the whole point of !DisableLogins is that we tried it.
 	} else if t.DisableLogins && apcLike {
-
+		// Detection-only: report the shipped candidacy without attempting it,
+		// matching ipkvm.defaultCreds.
 		out = append(out, engine.Finding{
 			Check: "http.apc.demoBackdoor", Category: "creds", Risk: "info",
 			Port: port, Transport: "tcp", Protocol: proto,
@@ -102,6 +115,11 @@ func runAPCDemoBackdoor(ctx context.Context, t *engine.Target) []engine.Finding 
 		})
 	}
 
+	// 2. PCNS / PowerChute control endpoint reachable pre-session: an
+	// unauthenticated GET of /macontrol.htm plus an HTTP HEAD of the handler
+	// /Forms/macontrol1 -- a state-changing POST (shutdown/register/unregister) is
+	// never sent, and HEAD has no side effects. The finding is that the control
+	// channel is web-auth exempt and reachable, not that a shutdown was driven.
 	if present {
 		exempt, pst, psnip, _ := cl.MacontrolPostAuthExempt(ctx)
 		risk := "info"
@@ -176,7 +194,7 @@ func explainAPCPCNSControl(host string, f engine.Finding) string {
 	var b strings.Builder
 	b.WriteString(explainHeading(host, f))
 	b.WriteString("\nThe APC PCNS/PowerChute control endpoint `/macontrol.htm` is reachable without\n")
-	b.WriteString("authentication. oobscan also sends a safe HEAD to `/Forms/macontrol1` to\n")
+	b.WriteString("authentication. oobscan also sends a HEAD to `/Forms/macontrol1` to\n")
 	b.WriteString("confirm the handler is pre-session reachable without sending a shutdown action.\n")
 	b.WriteString("\n**Read the control page (read-only):**\n")
 	b.WriteString(explainSh(

@@ -2,6 +2,7 @@ package report
 
 import "sort"
 
+// counter is a frequency table over string values. Ported from bmc-stats.
 type counter struct {
 	counts map[string]int
 	total  int
@@ -14,6 +15,7 @@ func (c *counter) add(v string) {
 	c.total++
 }
 
+// addN records n occurrences of v at once.
 func (c *counter) addN(v string, n int) {
 	if n <= 0 {
 		return
@@ -22,6 +24,7 @@ func (c *counter) addN(v string, n int) {
 	c.total += n
 }
 
+// mergeFrom folds another counter's tallies into c.
 func (c *counter) mergeFrom(o *counter) {
 	if o == nil {
 		return
@@ -31,11 +34,14 @@ func (c *counter) mergeFrom(o *counter) {
 	}
 }
 
+// Pair is one (value, count) row.
 type Pair struct {
 	Value string `json:"v"`
 	Count int    `json:"n"`
 }
 
+// top returns the n most frequent entries, count desc then value asc. n <= 0
+// returns all.
 func (c *counter) top(n int) []Pair {
 	out := make([]Pair, 0, len(c.counts))
 	for k, v := range c.counts {

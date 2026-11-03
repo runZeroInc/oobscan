@@ -10,13 +10,19 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/wire"
 )
 
+// Vertiv Velocity/IntelliSlot discovery (multicast 225.1.1.1, UDP 5555-5556).
+// A LAN-segment enumeration/announcement channel with no observed auth. The
+// datagram layout is unknown, so this is a best-effort capture: it reports
+// every field found in any announcement, flagged as heuristic/LAN-only.
 func init() {
 	Register(Check{
 		Name:        "udp.vertiv.velocityDiscovery",
 		Description: "Vertiv Velocity/IntelliSlot discovery (UDP 5555-5556) LAN enumeration channel (heuristic framing)",
 		Category:    "exposure",
 		Applies:     Applicability{CrossVendor: true},
-
+		// Disabled: empty-probe with unmapped datagram layout would decode any
+		// reply as a "velocity" hit; multicast is LAN-only anyway. Re-enable after
+		// the discovery datagram layout is pinned.
 		Enabled: false,
 		Run:     runVertivVelocity,
 	})

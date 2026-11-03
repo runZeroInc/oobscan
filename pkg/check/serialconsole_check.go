@@ -8,6 +8,15 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// The serialConsole check covers the serial-over-IP / console-server device
+// class (Moxa NPort, Opengear CM/IM/OM, Lantronix SLC/SLB/Spider, Digi
+// PortServer/ConnectPort, Perle IOLAN, ZPE Nodegrid); identify forces
+// ClassSerialConsole for the vendors it discovers directly (Lantronix
+// UDP/30718, Moxa UDP/4800). It fingerprints the appliance from signals
+// identify already gathered (vendor slug, HTTP Server header, HTML title) and
+// surfaces vulndb console CVEs keyed off this class as candidates.
+// No login or vulnerability-triggering request is sent (e.g. the Moxa
+// auth-bypass/overflow CVEs) is ever sent; those stay separate, dedicated checks.
 func init() {
 	Register(Check{
 		Name:        "serialconsole.exposure",
@@ -23,8 +32,17 @@ func runSerialConsoleExposure(ctx context.Context, t *engine.Target) []engine.Fi
 	return oobDeviceExposure(ctx, t, "serialconsole")
 }
 
+// oobDeviceExposure is the shared body for the serialConsole and PDU exposure
+// checks. It fingerprints the device (best-effort HTTP sweep to populate the
+// Server header / title when identify did not), reports the identity, and lists
+// the vulndb candidates whose Probe matches this check's fingerprint id.
 func oobDeviceExposure(ctx context.Context, t *engine.Target, kind string) []engine.Finding {
 	_ = ctx
+	// The device identity is already resolved by the identify stage; the
+	// fingerprint finding below reads it directly. Do not run the broader HTTP
+	// endpoint sweep here: embedded PDU web servers cannot absorb many concurrent
+	// connections. APC's specific pre-auth endpoints are confirmed sequentially by
+	// pdu.confirm.
 
 	vendor := identityVendor(t)
 	product := identityProduct(t)
@@ -33,6 +51,11 @@ func oobDeviceExposure(ctx context.Context, t *engine.Target, kind string) []eng
 
 	var out []engine.Finding
 
+	// 1. Report the fingerprinted appliance as info so the class detection is
+	// captured even when nothing else fires. class/vendor/product are labels the
+	// identify step derived, so the proof carries what the device actually said
+	// to earn them: the identify signals, plus the HTTP Server header and page
+	// title when the web surface supplied them.
 	out = append(out, engine.Finding{
 		Check: kind + ".fingerprint", Category: "exposure", Risk: "info",
 		Port: port, Transport: "tcp", Protocol: proto,
@@ -49,9 +72,21 @@ func oobDeviceExposure(ctx context.Context, t *engine.Target, kind string) []eng
 			)),
 	})
 
+	// Note: fingerprint-derived CVE "candidates" are intentionally not emitted as
+	// per-CVE findings here - that was noisy and read as "potential". Confirmable
+	// issues are actively verified (pdu.confirm / the checks below).
+
 	return out
 }
 
+// signalEvidenceAttrs names the identify attributes each signal source records,
+// most specific first. A signal's Detail is the product string the collector
+// resolved, and several collectors resolve none -- a Lantronix unit that reports
+// no model, an SNMP engine-ID match, a Redfish root with no product. Those
+// signals render as "source:vendor" alone, which is the same text on every unit
+// of the family and says nothing the label did not. The attributes below are
+// what that same collector read off the device, so they stand in for the
+// missing detail.
 var signalEvidenceAttrs = map[string][]string{
 	"lantronix":        {"lantronix.setup_telnet", "device.fw", "mac"},
 	"lantronix.telnet": {"lantronix.setup_telnet", "mac"},
@@ -72,8 +107,12 @@ var signalEvidenceAttrs = map[string][]string{
 	"fingerprint":      {"http.server", "http.title"},
 }
 
+// signalEvidenceLimit caps one signal's substitute detail so a long banner
+// cannot crowd the other signals out of the summary.
 const signalEvidenceLimit = 64
 
+// signalDetailFallback returns the first attribute the signal's collector
+// recorded, for signals that carry no product detail of their own.
 func signalDetailFallback(t *engine.Target, source string) string {
 	for _, key := range signalEvidenceAttrs[source] {
 		v := identityAttr(t, key)
@@ -88,6 +127,11 @@ func signalDetailFallback(t *engine.Target, source string) string {
 	return ""
 }
 
+// identitySignalSummary renders the identify signals that produced the device
+// label as "source:vendor:detail" entries, so the fingerprint finding records
+// the observations behind the label rather than only the label. A signal with
+// no detail falls back to what its collector read off the device. Empty parts
+// are skipped and the result is capped to one readable field value.
 func identitySignalSummary(t *engine.Target) string {
 	if t == nil || t.Identity == nil {
 		return ""
@@ -111,6 +155,8 @@ func identitySignalSummary(t *engine.Target) string {
 	return cleanSnippet(strings.Join(parts, "; "))
 }
 
+// identityAttr reads one identify attribute, tolerating a target with no
+// identity.
 func identityAttr(t *engine.Target, key string) string {
 	if t == nil || t.Identity == nil || t.Identity.Attributes == nil {
 		return ""
@@ -118,6 +164,7 @@ func identityAttr(t *engine.Target, key string) string {
 	return cleanSnippet(t.Identity.Attributes[key])
 }
 
+// identityProduct returns the identify step's product label, if any.
 func identityProduct(t *engine.Target) string {
 	if t.Identity != nil {
 		return t.Identity.Product
@@ -125,6 +172,7 @@ func identityProduct(t *engine.Target) string {
 	return ""
 }
 
+// identityVendor returns the identified vendor slug, or "".
 func identityVendor(t *engine.Target) string {
 	if t.Identity != nil {
 		return t.Identity.Vendor
@@ -132,6 +180,7 @@ func identityVendor(t *engine.Target) string {
 	return ""
 }
 
+// classFor returns the identified device class, or ClassUnknown.
 func classFor(t *engine.Target) engine.DeviceClass {
 	if t.Identity != nil {
 		return t.Identity.Class
@@ -141,7 +190,7 @@ func classFor(t *engine.Target) engine.DeviceClass {
 
 func init() {
 	for _, prefix := range []string{"serialconsole", "pdu"} {
-		p := prefix
+		p := prefix // capture
 		RegisterExplain(p+".fingerprint", func(host string, f engine.Finding) string {
 			return explainDeviceFingerprint(host, f)
 		})
@@ -186,6 +235,6 @@ func explainSharedSSHHostKey(host string, f engine.Finding) string {
 	}
 	b.WriteString("\n**Capture the host key:**\n")
 	b.WriteString(explainSh(fmt.Sprintf("ssh-keyscan -t %s,%s %s 2>/dev/null", keyType, "rsa,ecdsa,ed25519", host)))
-	b.WriteString("\n\n**Impact:** Known private key allows impersonation and passive SSH decryption.\n")
+	b.WriteString("\n\n**Impact:** A known host private key permits server impersonation. It does not by itself decrypt recorded SSH sessions that used ephemeral key exchange. Replace the shared host key and verify client trust records.\n")
 	return b.String()
 }

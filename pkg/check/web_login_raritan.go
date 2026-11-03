@@ -10,6 +10,15 @@ import (
 	"strings"
 )
 
+// Raritan Xerus (PX3 / SX2 / KX3) web-login adapter. Xerus authenticates over
+// JSON-RPC 2.0: POST /session calling newSession, with the credential in a
+// custom RpcAuthorization header (not standard Authorization), so the
+// browser's native Basic dialog never appears. A minted result.token proves
+// acceptance; rejection returns 401/403 without one. HTTP 451 means the
+// credential is valid but a forced default-password change is pending;
+// jsonrpcd always sends a JSON-RPC error envelope with it, so a generic proxy
+// 451 (no envelope) is never mistaken for a Xerus forced change. See
+// kb/raritan/.
 type raritanAdapter struct{}
 
 func (raritanAdapter) mechanism() string { return "httpJsonRpc" }
@@ -33,7 +42,7 @@ func (raritanAdapter) login(ctx context.Context, client *http.Client, base, user
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-
+		// Require the JSON-RPC session token; a generic 200 is not sufficient.
 		var env struct {
 			Result struct {
 				Ret     int    `json:"_ret_"`
@@ -58,7 +67,11 @@ func (raritanAdapter) login(ctx context.Context, client *http.Client, base, user
 			"sessionId", strconv.Itoa(env.Result.Session.ID),
 			"ret", strconv.Itoa(env.Result.Ret)), nil
 	case 451:
-
+		// "Unavailable for legal reasons": credential valid, forced default-password
+		// change pending. Firmware routes this on status 451, but require the
+		// JSON-RPC error envelope (jsonrpcd always sends one) so a generic 451 is
+		// not a false positive. This turns a bare-status guess into status + the
+		// server-returned error message gathered this run.
 		var e struct {
 			Error struct {
 				Code    int    `json:"code"`
@@ -74,10 +87,10 @@ func (raritanAdapter) login(ctx context.Context, client *http.Client, base, user
 		}
 		return true, proofKV("endpoint", "/session", "status", "451", "jsonrpcError", msg), nil
 	case http.StatusUnauthorized, http.StatusForbidden:
-
+		// Rejected credentials return 401/403 without a token.
 		return false, "", nil
 	default:
-
+		// 404 / 405 / non-JSON: not the Xerus /session endpoint on this host.
 		return false, "", errNotThisDevice
 	}
 }

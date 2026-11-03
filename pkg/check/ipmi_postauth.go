@@ -37,10 +37,25 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 	if v, ok := t.Evidenced("ipmi.v15"); ok {
 		v15, _ = v.(*ipmi.V15Report)
 	}
-
+	// Candidates in privilege order, best first. The vendor-specific flows go in front
+	// because each is a confirmed path to a more capable session than a plain
+	// credential gives: the OpenBMC relabel and the iLO RAKP-none bypass both land at
+	// Administrator.
 	candidates := ipmi.SelectPostAuthFlows(auth, v15)
+	if iloFlow, iloOK := selectILORAKPNoneFlow(t); iloOK {
+		candidates = append([]ipmi.AuthFlow{iloFlow}, candidates...)
+	}
 	if setupFlow, setupOK := selectOpenBMCSetupFlow(t, auth); setupOK {
 		candidates = append([]ipmi.AuthFlow{setupFlow}, candidates...)
+	}
+	if relabelFlow, relabelOK := selectOpenBMCRelabelFlow(t, auth); relabelOK {
+		candidates = append([]ipmi.AuthFlow{relabelFlow}, candidates...)
+	}
+	// The passwordless relabel goes first of all: it needs no credential and lands at
+	// Administrator, so it is strictly the best session available on a host that has both
+	// a default-userKey bypass and a confirmed relabel target.
+	if bypassRelabel, bypassOK := selectOpenBMCBypassRelabelFlow(t, auth); bypassOK {
+		candidates = append([]ipmi.AuthFlow{bypassRelabel}, candidates...)
 	}
 	var flow ipmi.AuthFlow
 	ok := len(candidates) > 0
@@ -76,7 +91,9 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 	if strings.TrimSpace(src) == "" {
 		src = "unknown"
 	}
-
+	// Post-auth inventory touches multiple command families and can become the
+	// longest check on slow/rate-limited BMCs. Keep a bounded per-check budget so
+	// a single host does not sit at 55/56 checks for minutes.
 	budget := postAuthBudgetForFlow(t.Timeout, flow)
 	budgetCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
@@ -92,7 +109,10 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 		return ipmi.CollectPostAuthInventory(ctx, t.Host, t.IPMIPort(), next, t.Timeout)
 	}
 	flow, inv, err = walkPostAuthFallbacks(traceCtx, candidates, flow, inv, err, collect, debugf)
-
+	// A 1.5 probe is only worth running if nothing above produced a usable session and
+	// the host looks 1.5-capable; SelectPostAuthFlows already ordered any 1.5 credential
+	// we knew about alongside the other real credentials. It opens one more session, so
+	// it is subject to the same exhaustion and window gates as the fallback walk.
 	if !hasPostAuthInventory(inv) && flow.Version == "2.0" && budgetCtx.Err() == nil && !ipmi.SessionResourceExhausted(inv, err) {
 		if window, okWindow := postAuthFallbackWindow(budgetCtx); okWindow {
 			if v15 == nil && likelyV15Capable(t) {
@@ -133,7 +153,10 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 		}
 	}
 	limitedAccess := isLimitedPrivilegePostAuthFailure(inv, err)
-
+	// Keep everything the session produced, unconditionally. Gating this on inventory
+	// discards a run that opened a session and recorded set-priv probes, the cipher
+	// matrix and the command-protection mode -- none of which hasPostAuthInventory
+	// counts -- just because a later step errored.
 	if inv != nil {
 		t.SetEvidence("ipmi.postAuth", inv)
 	}
@@ -146,13 +169,16 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 			issueReported = true
 		}
 	}
-
+	// Only a run that returned nothing is a pure failure. Anything else is reported as a
+	// result with the coverage annotations below, and still emits its detail findings,
+	// SMC integrity verdict and OpenBMC RAKP-state findings -- returning early here
+	// skips all three.
 	if inv == nil {
 		debugf("no inventory returned")
 		return stampIPMI(append(smcrakpFindings,
 			postAuthAttemptFailedFinding(flow, inv, err)), t.IPMIPort())
 	}
-
+	// Detail findings and ipmiPostAuth carry the inventory.
 	fields := engine.F("flow", fmt.Sprintf("%s/%s", flow.Version, flow.Mode))
 	if flow.Source != "" {
 		fields = append(fields, engine.Field{Key: "source", Val: flow.Source})
@@ -180,9 +206,14 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 	if limitedAccess {
 		fields = append(fields, engine.Field{Key: "access", Val: "limited"})
 	}
-
+	// A run that collected some sections but not all must say so.
+	// postAuthAttemptFailedFinding above covers only the all-or-nothing case, so without
+	// this a partial run ships looking exactly like a complete one and a consumer cannot
+	// tell "nothing to find" from "we never looked".
 	if missing := postAuthMissingSections(inv); len(missing) > 0 {
-
+		// partial when something landed, none when nothing did. Both are reported: a
+		// session that authenticated and collected nothing is still a measurement, and not
+		// the same as a host that was never eligible for post-auth.
 		coverage := "partial"
 		if !hasPostAuthInventory(inv) {
 			coverage = "none"
@@ -192,7 +223,8 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 			engine.Field{Key: "missingSections", Val: strings.Join(missing, ",")},
 			engine.Field{Key: "collected", Val: postAuthInventorySummary(inv)},
 		)
-
+		// Why the sections are missing: an insufficient-privilege ceiling is a property of
+		// the credential, a deadline is a scan-budget artifact.
 		if inv.Error != "" {
 			fields = append(fields, engine.Field{Key: "coverageError", Val: inv.Error})
 		} else if err != nil {
@@ -206,12 +238,17 @@ func runIPMIPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Finding
 		out = append(out, *finding)
 	}
 	out = append(out, ipmiPostAuthDetailFindings(inv)...)
-	out = append(out, openBMCRAKPAuthBypassFindings(t, auth, inv, debugf)...)
+	out = append(out, openBMCRAKPStateFindings(t, auth, inv, debugf)...)
 	out = append(out, smcrakpFindings...)
 	debugf("done findings=%d partialError=%t", len(out), inv.Error != "")
 	return stampIPMI(out, t.IPMIPort())
 }
 
+// postAuthAttemptFailedFinding records a post-auth session that authenticated (a
+// flow was selected from verified credentials) but collected no inventory before
+// failing or running out of budget. Without it, such a host is indistinguishable
+// from one that was never eligible for post-auth. access=failed lets a report
+// separate "not vulnerable" from "not measured".
 func postAuthAttemptFailedFinding(flow ipmi.AuthFlow, inv *ipmi.PostAuthCollection, err error) engine.Finding {
 	reason := "no inventory returned"
 	if err != nil {
@@ -242,19 +279,29 @@ func smcIntegrityBypassFinding(t *engine.Target, flow ipmi.AuthFlow, inv *ipmi.P
 	if t == nil || inv == nil || flow.Version != "2.0" || inv.CommandProtection != "cleartext" || !strings.EqualFold(identityVendor(t), "supermicro") {
 		return nil
 	}
-
+	// Judge the suite the session actually negotiated, not the one the caller set
+	// out to use: the cipher walk retries other suites and records the one that
+	// opened in inv.Flow, so the caller's flow can name a suite no session used.
 	flow = postAuthNegotiatedFlow(flow, inv)
-
+	// The claim is that the session accepted a cleartext command despite having
+	// negotiated protection. A suite that negotiated neither integrity nor
+	// confidentiality has none to bypass: cipher suite 0 and the integrity-none
+	// suites reach a cleartext session by agreement, not by defect.
 	if flow.Suite.Integrity == ipmi.IntegrityNone && flow.Suite.Conf == ipmi.ConfNone {
 		return nil
 	}
-
+	// On a flow whose commands are pinned to the cleartext path, commandProtection
+	// records what the client sent, not what the BMC agreed to: it is set from the
+	// requested mode before any command goes out. Only the auto strategy latches
+	// "cleartext" from an answer. So a pinned flow needs a second witness that a
+	// command was actually served, or a session that opened and answered nothing
+	// reports as a bypass.
 	if postAuthPinnedCleartextFlow(flow) && !hasPostAuthInventory(inv) {
 		return nil
 	}
 	return &engine.Finding{
 		Check: "ipmi.smc.integrityBypass", Category: "auth", Risk: "critical",
-		CVE: []string{"CVE-2026-65216"},
+		CVE: []string{"CVE-2026-18450"},
 		Fields: engine.F(
 			"suite", fmt.Sprintf("%d", flow.Suite.Suite),
 			"username", userLabel(flow.Username),
@@ -270,27 +317,61 @@ func smcIntegrityBypassFinding(t *engine.Target, flow ipmi.AuthFlow, inv *ipmi.P
 	}
 }
 
+// postAuthPinnedCleartextFlow reports the flows whose inventory the collector sends
+// unprotected by construction. Their forged or borrowed sessions hold no usable K1/K2,
+// so cleartext is the only path they have; the protection latch reports the choice
+// rather than the BMC's behaviour.
 func postAuthPinnedCleartextFlow(flow ipmi.AuthFlow) bool {
 	switch flow.Mode {
-	case "smcrakpFixedKey", "openbmcSetup":
+	case "smcrakpFixedKey", "openbmcSetup", "iloRakpNoneBypass":
 		return true
 	}
 	return false
 }
 
-func openBMCRAKPAuthBypassFindings(t *engine.Target, auth *ipmi.AuthReport, inv *ipmi.PostAuthCollection, debugf func(string, ...any)) []engine.Finding {
+func openBMCRAKPStateFindings(t *engine.Target, auth *ipmi.AuthReport, inv *ipmi.PostAuthCollection, debugf func(string, ...any)) []engine.Finding {
 	if t == nil || inv == nil || inv.Flow.Version != "2.0" {
 		return nil
 	}
-	out := make([]engine.Finding, 0, 1)
+	out := make([]engine.Finding, 0, 2)
+	// Both relabel modes report the same defect. openbmcBypassRelabel is the stronger
+	// one: it reached Administrator with no credential, only the bmcRandomNum recovered
+	// by the default-userKey bypass.
+	// Selecting a relabel flow only records the intent to try it. The claim is that
+	// the relabel reached Administrator, so it needs a session that actually opened;
+	// a handshake that was rejected leaves the flow set and would otherwise be
+	// reported as a completed escalation.
+	if (inv.Flow.Mode == "openbmcRelabel" || inv.Flow.Mode == "openbmcBypassRelabel") && postAuthSessionOpened(inv) {
+		fields := engine.F(
+			"username", userLabel(inv.Flow.Username),
+			"relabelUser", inv.Flow.RelabelUser,
+			"suite", fmt.Sprintf("%d", inv.Flow.Suite.Suite),
+		)
+		if inv.Flow.Mode == "openbmcBypassRelabel" {
+			fields = append(fields,
+				engine.Field{Key: "credentialRequired", Val: "false"},
+				engine.Field{Key: "lowPrivSource", Val: "ipmi.openbmc.defaultUserKeyAuthBypass"},
+				engine.Field{Key: "staleBmcRandom", Val: fmt.Sprintf("%x", inv.Flow.StaleBMCRand)},
+			)
+		} else {
+			fields = append(fields, engine.Field{Key: "credentialRequired", Val: "true"})
+		}
+		if inv.CommandProtection != "" {
+			fields = append(fields, engine.Field{Key: "commandProtection", Val: inv.CommandProtection})
+		}
+		if len(inv.SetPrivAttempts) > 0 {
+			fields = append(fields, openBMCSetPrivEvidenceFields(inv.SetPrivAttempts)...)
+		}
+		out = append(out, engine.Finding{Check: "ipmi.rakp.state.activeRelabelLowToAdmin", Category: "auth", Risk: "high", Fields: fields})
+	}
 	if disabledUser, ok := selectDisabledOpenBMCUser(inv); ok {
 		adminUser := selectOpenBMCRelabelAdminUser(t, auth, inv)
 		if strings.TrimSpace(adminUser) != "" && auth != nil && auth.Suite != nil && !t.DisableLogins {
 			probe, _ := ipmi.ProbeOpenBMCDisabledSetupOverwrite(t.Host, t.IPMIPort(), disabledUser, adminUser, *auth.Suite, t.Timeout)
 			if probe != nil {
-				t.SetEvidence("ipmi.openBmcSetupIdentity", probe)
+				t.SetEvidence("ipmi.openBmcDisabledSetupOverwrite", probe)
 				if probe.SetupOverwriteCommandsWork {
-					out = append(out, openBMCSetupIdentityFinding(probe))
+					out = append(out, openBMCDisabledSetupOverwriteFinding(probe))
 				}
 			} else {
 				debugf("openbmc disabled-overwrite probe skipped: no probe result")
@@ -349,7 +430,7 @@ func selectOpenBMCRelabelAdminUser(t *engine.Target, auth *ipmi.AuthReport, inv 
 	return ""
 }
 
-func openBMCSetupIdentityFinding(probe *ipmi.OpenBMCDisabledSetupOverwriteProbe) engine.Finding {
+func openBMCDisabledSetupOverwriteFinding(probe *ipmi.OpenBMCDisabledSetupOverwriteProbe) engine.Finding {
 	fields := engine.F(
 		"disabledUsername", userLabel(probe.DisabledUsername),
 		"adminUsername", userLabel(probe.AdminUsername),
@@ -372,8 +453,7 @@ func openBMCSetupIdentityFinding(probe *ipmi.OpenBMCDisabledSetupOverwriteProbe)
 	if probe.CloseSetupError != "" {
 		fields = append(fields, engine.Field{Key: "closeSetupError", Val: probe.CloseSetupError})
 	}
-	return engine.Finding{Check: "ipmi.rakp.state.setupIdentity", Category: "auth", Risk: "high",
-		CVE: []string{"CVE-2026-16140"}, Fields: fields}
+	return engine.Finding{Check: "ipmi.rakp.state.disabledSetupOverwrite", Category: "auth", Risk: "high", Fields: fields}
 }
 
 func runPostAuthSMCRAKPPasswordEnum(ctx context.Context, t *engine.Target, auth *ipmi.AuthReport, debugf func(string, ...any)) ([]engine.Finding, *ipmi.CrackResult) {
@@ -463,6 +543,12 @@ func runPostAuthSMCRAKPPasswordEnum(ctx context.Context, t *engine.Target, auth 
 	return []engine.Finding{{Check: "ipmi.postAuth.smcrakpOnlinePasswordTest", Category: "creds", Risk: "info", Fields: fields}}, nil
 }
 
+// postAuthBudget is the wall-clock budget for one host's whole post-auth run.
+//
+// Deliberately generous: post-auth only runs where a credential already worked, a few
+// percent of hosts, so the room costs little scan-wide. A tighter budget is spent by
+// the session open and the first collection steps, leaving nothing for FRU, which is
+// last and the most command-hungry.
 func postAuthBudget(perProbe time.Duration) time.Duration {
 	if perProbe <= 0 {
 		return 45 * time.Second
@@ -472,7 +558,8 @@ func postAuthBudget(perProbe time.Duration) time.Duration {
 
 func postAuthBudgetForFlow(perProbe time.Duration, flow ipmi.AuthFlow) time.Duration {
 	b := postAuthBudget(perProbe)
-
+	// A SMCRAKP-forged session runs its inventory forced-cleartext with retries, so it
+	// needs the high end of the range regardless of the probe timeout.
 	if flow.Mode == "smcrakpFixedKey" {
 		b = min(max(b, 60*time.Second), 90*time.Second)
 	}
@@ -496,10 +583,13 @@ func ipmiPostAuthDetailFindings(inv *ipmi.PostAuthCollection) []engine.Finding {
 		)
 		if inv.MCInfo.ManufacturerName != "" {
 			f = append(f, engine.Field{Key: "manufacturer", Val: inv.MCInfo.ManufacturerName})
-
+			// Authenticated read, so this manufacturer string cannot come from a decoy.
 			f = append(f, vendorSlugField(inv.MCInfo.ManufacturerName)...)
 		}
-
+		// Auxiliary revision carries the version components the two revision
+		// bytes leave out, so it is what makes the reported firmware matchable
+		// against a vendor advisory. Report the reconstructed version when the
+		// vendor's encoding is confirmed, and the raw bytes either way.
 		if inv.MCInfo.FirmwareRevisionFull != "" {
 			f = append(f, engine.Field{Key: "firmwareVersionFull", Val: inv.MCInfo.FirmwareRevisionFull})
 		}
@@ -579,7 +669,12 @@ func ipmiPostAuthDetailFindings(inv *ipmi.PostAuthCollection) []engine.Finding {
 		if len(areaList) > 0 {
 			f = append(f, engine.Field{Key: "areas", Val: strings.Join(areaList, ",")})
 		}
-
+		// Surface the board/product SKU as discrete fields. For Supermicro the FRU
+		// "Board Product" is the motherboard model (e.g. X13SEED-SF, X11DPH-T),
+		// which id.final maps to an EXACT generation (X13/X11/H13/...) - the single
+		// most reliable post-auth generation signal. The board/product manufacturer
+		// authoritatively names the hardware vendor (id.final uses it to reclaim an
+		// X14/OpenBMC box that identify labeled vendor "openbmc" from the SPA title).
 		if bp := fruFieldValue(inv.FRU, "Board Product"); bp != "" {
 			f = append(f, engine.Field{Key: "boardProduct", Val: bp})
 		}
@@ -592,7 +687,8 @@ func ipmiPostAuthDetailFindings(inv *ipmi.PostAuthCollection) []engine.Finding {
 		if pm := fruFieldValue(inv.FRU, "Product Manufacturer"); pm != "" {
 			f = append(f, engine.Field{Key: "productMfg", Val: pm})
 		}
-
+		// FRU is an authenticated read, so its manufacturer strings cannot come from a
+		// decoy. Board Mfg is the more specific of the two, so it wins.
 		if slug := vendorSlugField(fruFieldValue(inv.FRU, "Board Mfg")); len(slug) > 0 {
 			f = append(f, slug...)
 		} else {
@@ -707,7 +803,9 @@ func postAuthInventorySummary(inv *ipmi.PostAuthCollection) string {
 		}
 	}
 	summary := fmt.Sprintf("completed=%s missing=%s", strings.Join(completed, ","), strings.Join(missing, ","))
-
+	// A section that was read and answered with nothing is missing data but not
+	// missing a measurement. Naming it separates a board with no FRU EEPROM from one
+	// whose FRU read never ran.
 	if inv != nil && len(inv.Empty) > 0 {
 		summary += " empty=" + strings.Join(inv.Empty, ",")
 	}
@@ -717,8 +815,13 @@ func postAuthInventorySummary(inv *ipmi.PostAuthCollection) string {
 	return summary
 }
 
+// postAuthSections are the inventory sections a complete post-auth run collects,
+// in the order the collector attempts them.
 var postAuthSections = []string{"mcInfo", "chassis", "users", "lan", "lan6", "fru"}
 
+// postAuthCoverageScore counts how many inventory sections a run landed. It is the
+// comparison key when walking the candidate flows, so a later low-privilege attempt
+// cannot overwrite a richer result from a credentialed one.
 func postAuthCoverageScore(inv *ipmi.PostAuthCollection) int {
 	if inv == nil {
 		return 0
@@ -727,13 +830,23 @@ func postAuthCoverageScore(inv *ipmi.PostAuthCollection) int {
 }
 
 const (
+	// postAuthMaxFallbackFlows caps the candidates tried after the primary flow. Each
+	// attempt opens a fresh RMCP+ session, so walking the whole list fills a small BMC
+	// session table: the extra opens come back as status 0x01 and the host ends up less
+	// measurable than a single attempt would have left it.
 	postAuthMaxFallbackFlows = 2
-
+	// postAuthFallbackMinWindow is the least time a speculative flow can use for a
+	// session open plus the first inventory reads. Below it the attempt only consumes a
+	// session slot and reports a deadline it never had room to meet.
 	postAuthFallbackMinWindow = 8 * time.Second
-
+	// postAuthFallbackMaxWindow keeps one fallback from claiming a long remaining budget
+	// that the smcrakp password test and the OpenBMC probes still need.
 	postAuthFallbackMaxWindow = 20 * time.Second
 )
 
+// postAuthFallbackWindow carves a sub-budget for one speculative flow out of whatever the
+// primary flow left, holding back half the remainder for the steps that follow. The second
+// result is false when too little is left for the attempt to reach any inventory.
 func postAuthFallbackWindow(ctx context.Context) (time.Duration, bool) {
 	dl, ok := ctx.Deadline()
 	if !ok {
@@ -746,8 +859,16 @@ func postAuthFallbackWindow(ctx context.Context) (time.Duration, bool) {
 	return min(window, postAuthFallbackMaxWindow), true
 }
 
+// postAuthCandidateMinWindow is the least remaining budget a session attempt may be
+// started with. The RMCP+ handshake is not context-aware, so an attempt begun below
+// this floor still completes an Open Session -- taking a slot in the BMC's session
+// table -- and then trips the collector's first clock check before mcInfo. That
+// reports a reachable, credentialed host as if nothing had been read from it.
 const postAuthCandidateMinWindow = 3 * time.Second
 
+// postAuthBudgetSpent gives the reason a further session attempt cannot pay for
+// itself: the budget is already gone, or too little of it is left to reach the first
+// inventory read. A context with no deadline is never spent.
 func postAuthBudgetSpent(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -762,8 +883,19 @@ func postAuthBudgetSpent(ctx context.Context) error {
 	return nil
 }
 
+// postAuthCollectFunc collects inventory for one candidate flow. The walk takes it as an
+// argument so the escalation bounds can be exercised without a BMC.
 type postAuthCollectFunc func(ctx context.Context, flow ipmi.AuthFlow) (*ipmi.PostAuthCollection, error)
 
+// walkPostAuthFallbacks tries candidates after the primary while the result is still
+// incomplete, keeping the most complete inventory seen rather than the last one tried. A
+// no-auth session that only reached lan/lan6 does not overwrite a credentialed session
+// that reached mcInfo/chassis/users, and a later escalation that reads more wins.
+//
+// The walk is bounded three ways, because every attempt costs a fresh session: it stops as
+// soon as the BMC reports no session resources, it tries at most
+// postAuthMaxFallbackFlows candidates, and each attempt runs in its own sub-budget so one
+// speculative flow cannot spend what the next step needs.
 func walkPostAuthFallbacks(ctx context.Context, candidates []ipmi.AuthFlow, flow ipmi.AuthFlow, inv *ipmi.PostAuthCollection, err error, collect postAuthCollectFunc, debugf func(string, ...any)) (ipmi.AuthFlow, *ipmi.PostAuthCollection, error) {
 	if collect == nil || len(candidates) < 2 {
 		return flow, inv, err
@@ -775,7 +907,7 @@ func walkPostAuthFallbacks(ctx context.Context, candidates []ipmi.AuthFlow, flow
 	tried := 0
 	for i := 1; i < len(candidates) && ctx.Err() == nil; i++ {
 		if postAuthCoverageScore(inv) >= len(postAuthSections) {
-			break
+			break // nothing left to gain
 		}
 		if tried >= postAuthMaxFallbackFlows {
 			debugf("stop fallback flows: attempt limit %d reached", postAuthMaxFallbackFlows)
@@ -808,6 +940,7 @@ func walkPostAuthFallbacks(ctx context.Context, candidates []ipmi.AuthFlow, flow
 	return flow, inv, err
 }
 
+// userOrNull labels the null/anonymous account for logging.
 func userOrNull(user string) string {
 	if strings.TrimSpace(user) == "" {
 		return "(null)"
@@ -815,6 +948,8 @@ func userOrNull(user string) string {
 	return user
 }
 
+// postAuthMissingSections returns the sections a run did not collect. A non-empty
+// result means the host was only partially measured, whatever the top-level error.
 func postAuthMissingSections(inv *ipmi.PostAuthCollection) []string {
 	if inv == nil {
 		return postAuthSections
@@ -894,6 +1029,8 @@ func setPrivProbeSuccesses(attempts []ipmi.SetPrivAttempt) []string {
 	return out
 }
 
+// fruFieldValue returns the first non-empty value of the FRU field with the
+// given parsed name (e.g. "Board Product", "Product Name"), or "".
 func fruFieldValue(fields []ipmi.FRUField, name string) string {
 	for _, ff := range fields {
 		if strings.EqualFold(strings.TrimSpace(ff.Name), name) {
@@ -933,6 +1070,39 @@ func summarizeFRU(fields []ipmi.FRUField, maxPreview int) (int, []string, []stri
 	return len(devices), areaList, preview
 }
 
+// selectILORAKPNoneFlow reuses the passwordless session established by the
+// ipmi.ilo.rakpNoneBypass check (payload-type confusion) for inventory enum.
+func selectILORAKPNoneFlow(t *engine.Target) (ipmi.AuthFlow, bool) {
+	if t == nil || t.DisableLogins {
+		return ipmi.AuthFlow{}, false
+	}
+	for _, f := range t.Findings {
+		if f.Check != "ipmi.ilo.rakpNoneBypass" {
+			continue
+		}
+		var username string
+		bypassed := false
+		for _, fld := range f.Fields {
+			switch fld.Key {
+			case "username":
+				username = fld.Val
+			case "authBypassed":
+				bypassed = fld.Val == "true"
+			}
+		}
+		if !bypassed || strings.TrimSpace(username) == "" {
+			continue
+		}
+		return ipmi.AuthFlow{
+			Version:  "2.0",
+			Mode:     "iloRakpNoneBypass",
+			Username: username,
+			Source:   "ipmi.ilo.rakpNoneBypass",
+		}, true
+	}
+	return ipmi.AuthFlow{}, false
+}
+
 func selectOpenBMCSetupFlow(t *engine.Target, auth *ipmi.AuthReport) (ipmi.AuthFlow, bool) {
 	if t == nil || auth == nil || auth.Suite == nil || t.DisableLogins {
 		return ipmi.AuthFlow{}, false
@@ -954,8 +1124,87 @@ func selectOpenBMCSetupFlow(t *engine.Target, auth *ipmi.AuthReport) (ipmi.AuthF
 	}, true
 }
 
-func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.AuthFlow, debugf func(string, ...any)) (*ipmi.PostAuthCollection, error) {
+// selectOpenBMCBypassRelabelFlow builds the relabel chain that needs no password: a
+// default-userKey bypass session, reopened from the recovered bmcRandomNum, with the
+// RAKP1 active relabel applied to it.
+//
+// The password-based sibling below requires a cracked credential. The bypass IS the
+// low-privilege session, so it does not need one to stand in.
+func selectOpenBMCBypassRelabelFlow(t *engine.Target, auth *ipmi.AuthReport) (ipmi.AuthFlow, bool) {
+	if t == nil || auth == nil || auth.Suite == nil || t.DisableLogins {
+		return ipmi.AuthFlow{}, false
+	}
+	// Cipher-zero cannot carry the bypass: it needs a real auth algorithm for the HMAC.
+	if auth.Suite.Auth == ipmi.RAKPNone {
+		return ipmi.AuthFlow{}, false
+	}
+	kv, ok := t.Evidenced("ipmi.openBmcDefaultUserKey")
+	if !ok {
+		return ipmi.AuthFlow{}, false
+	}
+	bypass, _ := kv.(*DefaultUserKeyBypassProbe)
+	if bypass == nil || !bypass.AuthBypassed || len(bypass.WinBMCRand) != 16 {
+		return ipmi.AuthFlow{}, false
+	}
+	sv, ok := t.Evidenced("ipmi.openBmcSetupState")
+	if !ok {
+		return ipmi.AuthFlow{}, false
+	}
+	setup, _ := sv.(*ipmi.OpenBMCSetupProbe)
+	if setup == nil || !setup.AdminPrivAccepted || strings.TrimSpace(setup.Username) == "" {
+		return ipmi.AuthFlow{}, false
+	}
+	return ipmi.AuthFlow{
+		Version:      "2.0",
+		Mode:         "openbmcBypassRelabel",
+		Username:     bypass.UsernameUsed,
+		RelabelUser:  setup.Username,
+		StaleBMCRand: append([]byte(nil), bypass.WinBMCRand...),
+		Suite:        *auth.Suite,
+		Source:       "ipmi.openbmc.defaultUserKeyAuthBypass",
+	}, true
+}
 
+func selectOpenBMCRelabelFlow(t *engine.Target, auth *ipmi.AuthReport) (ipmi.AuthFlow, bool) {
+	if t == nil || auth == nil || auth.Suite == nil || t.DisableLogins {
+		return ipmi.AuthFlow{}, false
+	}
+	v, ok := t.Evidenced("ipmi.openBmcSetupState")
+	if !ok {
+		return ipmi.AuthFlow{}, false
+	}
+	setup, _ := v.(*ipmi.OpenBMCSetupProbe)
+	if setup == nil || !setup.AdminPrivAccepted || strings.TrimSpace(setup.Username) == "" {
+		return ipmi.AuthFlow{}, false
+	}
+	for _, cr := range auth.Cracked {
+		if !cr.Verified || cr.PasswordType == "smcrakp-fixed-key" {
+			continue
+		}
+		if strings.TrimSpace(cr.Username) == "" || strings.TrimSpace(cr.Password) == "" {
+			continue
+		}
+		if cr.Username == setup.Username {
+			continue
+		}
+		return ipmi.AuthFlow{
+			Version:     "2.0",
+			Mode:        "openbmcRelabel",
+			Username:    cr.Username,
+			Password:    cr.Password,
+			RelabelUser: setup.Username,
+			Suite:       *auth.Suite,
+			Source:      "ipmi.rakp.state.setupLocalPreRakp3",
+		}, true
+	}
+	return ipmi.AuthFlow{}, false
+}
+
+func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.AuthFlow, debugf func(string, ...any)) (*ipmi.PostAuthCollection, error) {
+	// The per-host budget is capped by whatever the target deadline still holds, so a
+	// host that spent it before post-auth started arrives here with nothing left. Every
+	// path below opens at least one session, so say so instead of buying a session slot
+	// for a collection that can only carry the deadline.
 	if budgetErr := postAuthBudgetSpent(ctx); budgetErr != nil {
 		debugf("skip collect: budget spent before the first session open")
 		err := fmt.Errorf("post-auth budget spent before the first session open: %w", budgetErr)
@@ -966,7 +1215,9 @@ func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.
 		return ipmi.CollectPostAuthInventory(ctx, t.Host, t.IPMIPort(), flow, t.Timeout)
 	}
 	if flow.Mode == "cipherZero" {
-
+		// Suite 0 is the whole flow: it authenticates by asking for no authentication.
+		// The cipher matrix skips suite 0, so routing this through it would retry an
+		// empty credential against authenticated suites and lose the session entirely.
 		debugf("single-flow collect mode=cipherZero suite=0")
 		return ipmi.CollectPostAuthInventory(ctx, t.Host, t.IPMIPort(), flow, t.Timeout)
 	}
@@ -979,11 +1230,14 @@ func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.
 		attempts := make([]ipmi.CipherAttempt, 0, len(cands))
 		var lastErr error
 		var bestAuthOnly *ipmi.PostAuthCollection
-
+		// The last collection a failed candidate still returned. It carries where the run
+		// stopped, the set-privilege probes and the protection latch, none of which the
+		// synthetic collection below can reconstruct.
 		var lastFailed *ipmi.PostAuthCollection
 		var lastFailedFlow ipmi.AuthFlow
 		for _, ca := range cands {
-
+			// Opening a session costs a full handshake before anything checks the clock,
+			// so a candidate started on a spent budget can only ever return the deadline.
 			if budgetErr := postAuthBudgetSpent(ctx); budgetErr != nil {
 				debugf("stop smcrakp suites: budget spent before suite=%d", ca.Suite)
 				if lastErr == nil {
@@ -1046,14 +1300,21 @@ func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.
 	debugf("cipher-matrix start candidates=%d preferredSuite=%d", len(cands), flow.Suite.Suite)
 	attempts := make([]ipmi.CipherAttempt, 0, len(cands))
 	var lastErr error
-
+	// A candidate whose session opened is kept even when every section failed. What the
+	// session negotiated and which wire protection the BMC then accepted are measurements
+	// in their own right -- the cleartext latch is the whole of the SMC integrity-bypass
+	// verdict -- and none of them survive into the synthetic collection built below.
 	var bestOpened *ipmi.PostAuthCollection
 	var bestOpenedFlow ipmi.AuthFlow
-
+	// The last collection a failed candidate returned, used when no candidate ever got a
+	// session open. It still names the step the run stopped at, which the synthetic
+	// collection built below cannot.
 	var lastFailed *ipmi.PostAuthCollection
 	var lastFailedFlow ipmi.AuthFlow
 	for _, ca := range cands {
-
+		// Opening a session is not context-aware: it spends a full operation timeout on
+		// the handshake before the first clock check inside the collector, so a candidate
+		// started after the budget is gone buys nothing but a deadline error.
 		if budgetErr := postAuthBudgetSpent(ctx); budgetErr != nil {
 			debugf("stop cipher candidates: budget spent before suite=%d", ca.Suite)
 			if lastErr == nil {
@@ -1108,12 +1369,16 @@ func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.
 				lastFailed, lastFailedFlow = inv, ff
 			}
 			debugf("cipher suite=%d failed totalElapsed=%s", ca.Suite, time.Since(suiteStart).Round(time.Millisecond))
-
+			// Session exhaustion is refused at Open Session, before the suite matters,
+			// so the remaining candidates would each spend a full timeout to be told
+			// the same thing.
 			if ipmi.SessionResourceExhausted(inv, err) {
 				debugf("stop cipher candidates: bmc reports no session resources")
 				break
 			}
-
+			// A privilege ceiling belongs to the account, not to the suite, so the
+			// remaining candidates would each open a session to be refused the same
+			// commands -- and spend the post-auth budget doing it.
 			if postAuthPrivilegeCeiling(inv) {
 				debugf("stop cipher candidates: session works, account has no command privilege")
 				break
@@ -1143,7 +1408,9 @@ func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.
 		debugf("cipher-matrix kept opened session suite=%d protection=%s", bestOpenedFlow.Suite.Suite, bestOpened.CommandProtection)
 		return bestOpened, lastErr
 	}
-
+	// No candidate reached an open session, but the last one still recorded where it
+	// stopped. Replacing it with a synthetic collection throws that away and reports the
+	// host as if nothing had been attempted.
 	if lastFailed != nil {
 		lastFailed.Flow = lastFailedFlow
 		lastFailed.CipherMatrix = attempts
@@ -1157,10 +1424,18 @@ func collectPostAuthWithMatrix(ctx context.Context, t *engine.Target, flow ipmi.
 	return inv, lastErr
 }
 
+// postAuthSessionOpened reports whether a failed collection still got as far as an
+// open session. CollectPostAuthInventory records the command protection only after
+// the runner is up, so a non-empty value is an exact witness: the RMCP+ handshake
+// completed and whatever followed failed inside the session.
 func postAuthSessionOpened(inv *ipmi.PostAuthCollection) bool {
 	return inv != nil && inv.CommandProtection != ""
 }
 
+// postAuthPrivilegeCeiling reports a session that works but yields nothing: the BMC
+// answered an in-session command -- which is what resolves the protection latch away
+// from "auto" -- yet no section produced data. That is the account's privilege, and
+// it is identical on every cipher suite.
 func postAuthPrivilegeCeiling(inv *ipmi.PostAuthCollection) bool {
 	if inv == nil {
 		return false
@@ -1209,7 +1484,8 @@ func v2CipherCandidates(t *engine.Target, preferred ipmi.CipherAlgos) []ipmi.Cip
 	if preferred.Suite != 0 {
 		add(preferred)
 	}
-
+	// Keep SHA1/SHA1-96/AES in play even when not advertised; some SMC targets
+	// accept it for command-capable sessions where other suites auth-only.
 	add(ipmi.CipherAlgos{Suite: 3, Auth: ipmi.RAKPHMACSHA1, Integrity: ipmi.IntegrityHMACSHA196, Conf: ipmi.ConfAESCBC})
 	for _, ca := range all {
 		add(ca)
@@ -1372,6 +1648,11 @@ func explainIPMIPostAuthEnum(host string, f engine.Finding) string {
 	return b.String()
 }
 
+// postAuthNegotiatedFlow returns the flow whose suite the collected session actually
+// negotiated. The cipher walk may open on a different suite than the caller selected
+// and records it on the collection, so a verdict about the negotiated protection has
+// to read that rather than the caller's intent. Falls back to the caller's flow when
+// the collection carries no suite of its own.
 func postAuthNegotiatedFlow(flow ipmi.AuthFlow, inv *ipmi.PostAuthCollection) ipmi.AuthFlow {
 	if inv == nil {
 		return flow

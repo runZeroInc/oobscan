@@ -1,5 +1,9 @@
 package cmd
 
+// runIPMIChannel implements the "ipmi <targets> channel ..." subcommand
+// (info / getaccess / setaccess / ...). Split out of ipmi.go to keep the
+// command dispatch readable.
+
 import (
 	"fmt"
 	"strconv"
@@ -206,6 +210,11 @@ func runIPMIChannel(sess *ipmi.CmdSess, args []string) (any, error) {
 	ch := byte(channelID & 0x0f)
 	uid := byte(userID)
 
+	// Set User Access carries the three flag bits in byte 1 alongside the channel,
+	// and byte 3 carries only the privilege limit. Bit 7 of byte 1 must be set or
+	// the bits in [6:4] are ignored. Packing the flags into byte 3 instead sends
+	// them where nothing reads them: the command still answers cc=0x00 and the
+	// readback correctly shows the flags unchanged.
 	b1 := byte(0x80) | ch
 	if !callinEnabled {
 		b1 |= 0x40
@@ -218,6 +227,8 @@ func runIPMIChannel(sess *ipmi.CmdSess, args []string) (any, error) {
 	}
 	privByte := priv & 0x0f
 
+	// Byte 4 (session limit) is optional. Some firmware rejects the long form and
+	// some rejects the short one, so try both rather than reporting a failure.
 	reqVariants := [][]byte{
 		{b1, uid, privByte, 0x00},
 		{b1, uid, privByte},

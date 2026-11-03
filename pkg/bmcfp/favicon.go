@@ -5,10 +5,27 @@ import (
 	"strconv"
 )
 
+// Shodan-compatible favicon hashing.
+//
+// Shodan exposes http.favicon.hash = mmh3.hash(base64.encodebytes(icon)), i.e.
+// the 32-bit MurmurHash3 (x86_32, seed 0) of the MIME-base64 encoding of the
+// raw /favicon.ico bytes, reported as a *signed* int32. Reproducing it here lets
+// oobscan attribute a live BMC from the favicon it already can fetch and match
+// favicon.mmh3 rules in bmcfp.go.
+
+// FaviconHash returns Shodan's favicon hash for the raw favicon bytes as a
+// signed int32 (directly comparable to Shodan's http.favicon.hash facet and to
+// the FaviconMMH3 rules).
 func FaviconHash(icon []byte) int32 { return murmur3x86_32(mimeBase64(icon)) }
 
+// FaviconHashString returns FaviconHash as a decimal string, ready to pass to
+// Match(FaviconMMH3, s).
 func FaviconHashString(icon []byte) string { return strconv.Itoa(int(FaviconHash(icon))) }
 
+// mimeBase64 reproduces Python's base64.encodebytes: standard base64 split into
+// 76-character lines, each (including the last) terminated by '\n'. This is the
+// exact byte sequence Shodan feeds to mmh3. Empty input yields empty output
+// (matching base64.encodebytes(b"") == b"").
 func mimeBase64(raw []byte) []byte {
 	enc := base64.StdEncoding.EncodeToString(raw)
 	if enc == "" {
@@ -23,6 +40,8 @@ func mimeBase64(raw []byte) []byte {
 	return out
 }
 
+// murmur3x86_32 is MurmurHash3 (x86_32 variant, seed 0) -- the hash mmh3.hash
+// uses. The result is returned as a signed int32 to match Shodan/mmh3 output.
 func murmur3x86_32(data []byte) int32 {
 	const (
 		c1 uint32 = 0xcc9e2d51

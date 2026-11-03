@@ -1,5 +1,16 @@
 package report
 
+// This file produces the non-HTML research artifacts `report` emits beside the
+// interactive bundle: cracker-ready RAKP hash files, the frequency CSVs, and the
+// per-vendor sub-reports, laid out under hashes/, overview/, exposure/, ipmi/,
+// snmp/ and vendors/.
+//
+// It is self-contained: an Artifacts collector keeps its own aggregates, fed one
+// record at a time via Observe, so nothing here depends on the Source layout the
+// HTML renderer owns. It does reuse the package's read-only helpers (the exposure
+// taxonomy, the vendor/class display maps, findingField) so a converted corpus and
+// a live scan produce identical artifacts.
+
 import (
 	"encoding/csv"
 	"encoding/hex"
@@ -17,12 +28,19 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/scanfile"
 )
 
+// Artifacts accumulates the cracker- and research-oriented material that the
+// HTML aggregate does not retain, so the report can write the full bmc-stats
+// artifact tree for one source. Feed it every record with Observe, then Write.
 type Artifacts struct {
 	name  string
 	total int
 
+	// potCheck, when set, returns the cracks the loaded potfile holds for a
+	// record's captured RAKP hashes, mirroring Source so the exposure CSV agrees
+	// with the HTML heatmap on the "RAKP hash cracked" column.
 	potCheck func(rec *scanfile.Record) []PotCrack
 
+	// overview frequency tables (counted once per host).
 	vendor      *counter
 	class       *counter
 	product     *counter
@@ -35,11 +53,13 @@ type Artifacts struct {
 	checks      *counter
 	risks       *counter
 
+	// exposure rollup.
 	exposureTotals map[string]int
 	byVendorExp    map[string]*expVendor
 	withCritical   int
 	withHigh       int
 
+	// IPMI detail.
 	ipmiHosts    int
 	cipherIDs    *counter
 	cipherSuites *counter
@@ -47,8 +67,9 @@ type Artifacts struct {
 	guidVendors  *counter
 	oemNames     *counter
 	rakpUsers    *counter
-	rakpCracked  *counter
+	rakpCracked  *counter // recovered password -> count
 
+	// SNMP detail.
 	snmpHosts       int
 	snmpV3Hosts     int
 	snmpVersions    *counter
@@ -57,28 +78,33 @@ type Artifacts struct {
 	snmpSysDesc     *counter
 	snmpSysOID      *counter
 
+	// RAKP hash material, one row per captured hash.
 	rakp []rakpArtifact
 
+	// per-vendor sub-reports.
 	vendors map[string]*vendorArtifact
 }
 
+// expVendor is a vendor's population plus its per-exposure host counts.
 type expVendor struct {
 	total int
 	exp   map[string]int
 }
 
+// rakpArtifact is one captured RAKP-2 hash with its crack/redaction status.
 type rakpArtifact struct {
 	vendor   string
 	product  string
 	username string
-	algo     string
-	salt     string
-	mac      string
+	algo     string // "sha1" | "md5" | "sha256" | "" (unknown/unusable)
+	salt     string // hex; empty when redacted or unreconstructable
+	mac      string // hex
 	smcFixed bool
 	redacted bool
-	cracked  string
+	cracked  string // recovered password, or ""
 }
 
+// vendorArtifact is one vendor's frequency tables for its sub-report directory.
 type vendorArtifact struct {
 	assets      int
 	osVersion   *counter
@@ -100,6 +126,7 @@ func newVendorArtifact() *vendorArtifact {
 	}
 }
 
+// NewArtifacts returns an empty collector for a named source.
 func NewArtifacts(name string) *Artifacts {
 	return &Artifacts{
 		name:            name,
@@ -132,10 +159,15 @@ func NewArtifacts(name string) *Artifacts {
 	}
 }
 
+// SetPotCheck supplies the potfile predicate so the exposure artifacts count the
+// same "RAKP hash cracked" hosts the HTML aggregate does. A nil predicate (no
+// potfile) simply leaves potfile-only cracks uncounted.
 func (a *Artifacts) SetPotCheck(fn func(rec *scanfile.Record) []PotCrack) {
 	a.potCheck = fn
 }
 
+// Observe folds one record into the artifact aggregates. It is called from the
+// loader alongside Source.Add, so the artifacts are built in the same pass.
 func (a *Artifacts) Observe(rec *scanfile.Record) {
 	a.total++
 
@@ -156,6 +188,7 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 		a.hwProduct.add(hw)
 	}
 
+	// Ports / protocols, once per host.
 	for k := range rec.Ports {
 		port, transport := splitPortKey(k)
 		if port == 0 {
@@ -182,6 +215,8 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 		a.httpServers.add(httpServer)
 	}
 
+	// Exposure scoring, mirroring the HTML Source so the CSV totals agree with
+	// the heatmap.
 	exp := map[string]bool{}
 	topRisk := ""
 	ipmiSeen := false
@@ -201,7 +236,11 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 		if strings.HasPrefix(f.Check, "ipmi.") {
 			ipmiSeen = true
 		}
-
+		// Mirror analyze.go: the ipmi.versions finding (emitted by both native
+		// scans and rz projections) carries the negotiated versions in its
+		// `versions` field, so the ipmi_1_5 / ipmi_2_0 taxonomy is set from it as
+		// well as from any version-specific check. Without this the artifact
+		// exposure totals would undercount IPMI 1.5 to zero.
 		if f.Check == "ipmi.versions" {
 			v := findingField(f, "versions")
 			if strings.Contains(v, "1.5") {
@@ -224,6 +263,7 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 		a.withHigh++
 	}
 
+	// RAKP hash material.
 	for i := range rec.RAKP {
 		a.observeRAKP(&rec.RAKP[i], vendor, product)
 	}
@@ -233,7 +273,9 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 		exp["ipmi_2_0"] = true
 		ipmiSeen = true
 	}
-
+	// A recovered password (live crack or a potfile hit) and a weak/predictable
+	// sampled session ID, mirroring Source.Add so the exposure CSV agrees with the
+	// HTML heatmap on these two critical columns.
 	for i := range rec.RAKP {
 		if isRecoveredPassword(rec.RAKP[i].Cracked) {
 			exp["ipmi_rakp_cracked"] = true
@@ -255,6 +297,7 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 	a.observeIPMIAttrs(rec)
 	a.observeSNMP(rec, exp)
 
+	// Roll exposures into the totals and the per-vendor matrix.
 	ev := a.byVendorExp[vendor]
 	if ev == nil {
 		ev = &expVendor{exp: map[string]int{}}
@@ -269,6 +312,9 @@ func (a *Artifacts) Observe(rec *scanfile.Record) {
 	a.observeVendor(rec, vendor, product, httpServer)
 }
 
+// observeIPMIFinding pulls the IPMI detail carried on the normalized findings
+// (cipher suites, negotiated versions, GUID vendor) that both a native scan and
+// a converted runZero corpus emit.
 func (a *Artifacts) observeIPMIFinding(f *engine.Finding) {
 	switch f.Check {
 	case "ipmi.ciphers":
@@ -291,12 +337,17 @@ func (a *Artifacts) observeIPMIFinding(f *engine.Finding) {
 	}
 }
 
+// observeIPMIAttrs reads the IPMI service attributes the findings do not carry
+// (OEM name, and a GUID-vendor fallback), once per host.
 func (a *Artifacts) observeIPMIAttrs(rec *scanfile.Record) {
 	if oem := firstServiceAttr(rec, "ipmi.oemName", "ipmi.manufacturerName"); oem != "" {
 		a.oemNames.add(oem)
 	}
 }
 
+// observeRAKP records one captured RAKP-2 hash, reconstructing its offline salt
+// so the hash files carry cracker-ready lines. A redacted row (no material)
+// still lands in rakp-hashes.csv but produces no crackable line.
 func (a *Artifacts) observeRAKP(r *output.RAKPRecord, vendor, product string) {
 	art := rakpArtifact{
 		vendor:   vendor,
@@ -320,6 +371,8 @@ func (a *Artifacts) observeRAKP(r *output.RAKPRecord, vendor, product string) {
 	}
 }
 
+// observeSNMP reads the SNMP surface from the service attributes and the
+// default-community findings, once per host.
 func (a *Artifacts) observeSNMP(rec *scanfile.Record, exp map[string]bool) {
 	ver := firstServiceAttr(rec, "snmp.version")
 	comm := firstServiceAttr(rec, "snmp.defaultCommunities")
@@ -327,6 +380,7 @@ func (a *Artifacts) observeSNMP(rec *scanfile.Record, exp map[string]bool) {
 	sysDesc := firstServiceAttr(rec, "snmp.sysDesc", "snmp.sysdescr")
 	sysOID := firstServiceAttr(rec, "snmp.sysObjectID")
 
+	// A default community can also arrive only as a finding field.
 	if comm == "" {
 		for i := range rec.Findings {
 			f := &rec.Findings[i]
@@ -344,7 +398,8 @@ func (a *Artifacts) observeSNMP(rec *scanfile.Record, exp map[string]bool) {
 		return
 	}
 	a.snmpHosts++
-
+	// A runZero snmp.version is a tab/comma-joined set (e.g. "1\t2c\t3"); count
+	// each negotiated version separately, as bmc-stats did, so the CSV is clean.
 	for _, v := range splitTabComma(ver) {
 		a.snmpVersions.add(v)
 	}
@@ -365,6 +420,7 @@ func (a *Artifacts) observeSNMP(rec *scanfile.Record, exp map[string]bool) {
 	}
 }
 
+// observeVendor folds a host into its vendor sub-report tables.
 func (a *Artifacts) observeVendor(rec *scanfile.Record, vendor, product, httpServer string) {
 	va := a.vendors[vendor]
 	if va == nil {
@@ -413,6 +469,8 @@ func (a *Artifacts) observeVendor(rec *scanfile.Record, vendor, product, httpSer
 	}
 }
 
+// Write emits the whole artifact tree under dir (which is the per-source
+// subdirectory, e.g. <out>/Internal).
 func (a *Artifacts) Write(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -462,6 +520,8 @@ func (a *Artifacts) writeOverview(dir string) error {
 func (a *Artifacts) writeExposure(dir string) error {
 	d := filepath.Join(dir, "exposure")
 
+	// exposure_rates.csv: one row per taxonomy column, prevalence over the whole
+	// population, in taxonomy order.
 	rates := [][]string{{"key", "label", "hosts", "percent"}}
 	for _, e := range Taxonomy {
 		n := a.exposureTotals[e.Key]
@@ -471,6 +531,7 @@ func (a *Artifacts) writeExposure(dir string) error {
 		return err
 	}
 
+	// vendor_matrix.csv: vendor, total, then one host-count column per exposure.
 	header := []string{"vendor", "total"}
 	for _, e := range Taxonomy {
 		header = append(header, e.Key)
@@ -568,7 +629,11 @@ func (a *Artifacts) writeHashes(dir string) error {
 			h.vendor, h.product, h.username, h.algo, h.salt, h.mac,
 			strconv.FormatBool(h.smcFixed), strconv.FormatBool(h.redacted), h.cracked,
 		})
-
+		// Emit only cracker-usable lines, matching `oobscan hashdump` byte for
+		// byte: a captured hash with material of the exact HMAC length, and not
+		// an SMCRAKP fixed-key HMAC (keyed by a firmware constant, not a
+		// password, so no wordlist can recover it). Redacted and malformed rows
+		// stay in the CSV above but never reach the crackable files.
 		if h.redacted || h.smcFixed || h.salt == "" || len(h.mac) != 2*macHexLen(h.algo) {
 			continue
 		}
@@ -695,6 +760,11 @@ func (a *Artifacts) writeSummary(dir string) error {
 	return writeText(filepath.Join(dir, "summary.txt"), b.String())
 }
 
+// --- helpers -------------------------------------------------------------
+
+// reconstructRAKP rebuilds an ipmi.RAKPResult from a serialized RAKP row so its
+// offline salt and SMCRAKP fixed-key status can be recomputed. It mirrors
+// cmd.rakpPotKey. ok=false for a redacted or malformed row.
 func reconstructRAKP(r *output.RAKPRecord) (*ipmi.RAKPResult, bool) {
 	if r.RAKPHash == "" {
 		return nil, false
@@ -721,6 +791,10 @@ func reconstructRAKP(r *output.RAKPRecord) (*ipmi.RAKPResult, bool) {
 	}, true
 }
 
+// macHexLen returns the exact HMAC byte length for a RAKP auth algorithm, or 0
+// for an unknown algo. It gates the crackable hash files to full digests, the
+// same check LoadScans/ipmi.Hashcat apply, so a short/long (error/truncated)
+// response never lands in a wordlist run.
 func macHexLen(algo string) int {
 	switch algo {
 	case "sha1":
@@ -733,6 +807,8 @@ func macHexLen(algo string) int {
 	return 0
 }
 
+// firstServiceAttr returns the first non-empty value found for any of keys
+// across the record's services.
 func firstServiceAttr(rec *scanfile.Record, keys ...string) string {
 	for i := range rec.Services {
 		at := rec.Services[i].Attributes
@@ -748,6 +824,7 @@ func firstServiceAttr(rec *scanfile.Record, keys ...string) string {
 	return ""
 }
 
+// splitTabComma splits a value on tabs and commas, trimming empties.
 func splitTabComma(v string) []string {
 	if v == "" {
 		return nil
@@ -761,6 +838,7 @@ func splitTabComma(v string) []string {
 	return out
 }
 
+// firstLine returns the first line of s, trimmed.
 func firstLine(s string) string {
 	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
 		s = s[:i]
@@ -768,6 +846,7 @@ func firstLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// pctString formats n/total as a 2-decimal percentage string.
 func pctString(n, total int) string {
 	if total <= 0 {
 		return "0.00"
@@ -775,6 +854,8 @@ func pctString(n, total int) string {
 	return strconv.FormatFloat(100*float64(n)/float64(total), 'f', 2, 64)
 }
 
+// vendorDirName sanitizes a display vendor into a filesystem-safe directory
+// name, so "Super Micro" and "unknown" both map to a clean slug.
 func vendorDirName(vendor string) string {
 	v := strings.ToLower(strings.TrimSpace(vendor))
 	if v == "" {
@@ -801,6 +882,8 @@ func vendorDirName(vendor string) string {
 	return name
 }
 
+// writeCounterCSV writes a frequency table as value,count,percent rows, sorted
+// count desc then value asc.
 func writeCounterCSV(path string, c *counter, valueCol string) error {
 	rows := [][]string{{valueCol, "count", "percent"}}
 	for _, e := range c.top(0) {
@@ -809,6 +892,7 @@ func writeCounterCSV(path string, c *counter, valueCol string) error {
 	return writeCSVRows(path, rows)
 }
 
+// writeCSVRows writes rows (including the header) to path, creating parents.
 func writeCSVRows(path string, rows [][]string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -826,6 +910,7 @@ func writeCSVRows(path string, rows [][]string) error {
 	return w.Error()
 }
 
+// writeLinesFile writes lines (one per line) to path, creating parents.
 func writeLinesFile(path string, lines []string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -843,6 +928,7 @@ func writeLinesFile(path string, lines []string) error {
 	return nil
 }
 
+// writeText writes s to path, creating parents.
 func writeText(path, s string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err

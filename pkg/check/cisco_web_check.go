@@ -16,6 +16,13 @@ var (
 	reHTMLTitle       = regexp.MustCompile(`(?is)<title>\s*(.{1,80}?)\s*</title>`)
 )
 
+// http.cisco.webPresence confirms a Cisco CIMC via a CIMC-specific unauth
+// surface actually answering, reported as an info fingerprint. It attaches no
+// CVEs: the headline bugs (CVE-2026-20093 password-reset bypass,
+// CVE-2020-3470 API RCE) are version-gated and unconfirmable from this
+// pre-auth surface, and a bare "vendor looks like Cisco" match also covers
+// switches, routers, and ASAs that are not CIMCs. Detection only: read-only
+// GETs, no reset/overflow/state-changing payload.
 func init() {
 	Register(Check{
 		Name:        "http.cisco.webPresence",
@@ -28,7 +35,9 @@ func init() {
 }
 
 func runCiscoWebPresence(ctx context.Context, t *engine.Target) []engine.Finding {
-
+	// Fire only on positive CIMC evidence: the /kvm port lookup, the HTML5 vKVM
+	// UI, or a genuine Redfish service root that names Cisco/CIMC/UCS. A bare
+	// vendor guess is not evidence of a CIMC.
 	client := insecureWebClient(t.Timeout)
 	var hitPath, proof string
 	for _, path := range []string{"/redfish/v1/", "/kvm/gimme_dat_port", "/kvm/kvm.html"} {
@@ -41,7 +50,9 @@ func runCiscoWebPresence(ctx context.Context, t *engine.Target) []engine.Finding
 		low := strings.ToLower(s)
 		switch path {
 		case "/redfish/v1/":
-
+			// Require a genuine Redfish document (not a switch's HTML home page that
+			// merely contains the word "cisco") AND a Cisco/CIMC/UCS name. The proof
+			// quotes the vendor token the root actually carried plus its RedfishVersion.
 			isRedfish := strings.Contains(low, "@odata") || strings.Contains(low, "redfishversion") || strings.Contains(low, "serviceroot")
 			if name := firstSubstr(low, "cisco", "cimc", "ucs"); st == http.StatusOK && isRedfish && name != "" {
 				version := ""
@@ -51,12 +62,12 @@ func runCiscoWebPresence(ctx context.Context, t *engine.Target) []engine.Finding
 				proof = proofKV("status", fmt.Sprintf("%d", st), "name", name, "redfishVersion", version)
 			}
 		case "/kvm/gimme_dat_port":
-
+			// Quote the actual vKVM port the endpoint returned.
 			if m := reCiscoKVMPort.FindStringSubmatch(s); m != nil {
 				proof = proofKV("status", fmt.Sprintf("%d", st), "kvmPort", m[1])
 			}
 		case "/kvm/kvm.html":
-
+			// Quote the served vKVM page title; fall back to the custom app element.
 			if m := reHTMLTitle.FindStringSubmatch(s); m != nil && strings.Contains(strings.ToLower(m[1]), "vkvm") {
 				proof = proofKV("status", fmt.Sprintf("%d", st), "title", cleanSnippet(m[1]))
 			} else if strings.Contains(low, "<kvm-ui") {
@@ -68,7 +79,7 @@ func runCiscoWebPresence(ctx context.Context, t *engine.Target) []engine.Finding
 			break
 		}
 	}
-
+	// Negative/closed outcome: emit nothing.
 	if proof == "" {
 		return nil
 	}
@@ -83,6 +94,7 @@ func runCiscoWebPresence(ctx context.Context, t *engine.Target) []engine.Finding
 	}}
 }
 
+// firstSubstr returns the first needle contained in s, or "".
 func firstSubstr(s string, needles ...string) string {
 	for _, n := range needles {
 		if strings.Contains(s, n) {

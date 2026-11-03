@@ -1,3 +1,4 @@
+// Package cisco implements Cisco CIMC-specific unauthenticated HTTP probes.
 package cisco
 
 import (
@@ -12,6 +13,11 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// CIMCInfo is the device identity returned by the Cisco CIMC
+// /api/cimcInfo.json endpoint. The endpoint answers without authentication,
+// but only when the browser-style request headers set in FetchCIMCInfo are
+// present (the web stack checks Origin/Referer against its own host and
+// expects the browser Accept/Content-Type/User-Agent headers).
 type CIMCInfo struct {
 	Hostname     string `json:"hostname"`
 	SerialNumber string `json:"serialNumber"`
@@ -20,11 +26,17 @@ type CIMCInfo struct {
 	SlotID       string `json:"SlotId"`
 	Error        int    `json:"Error"`
 
+	// Model is the model family derived from the hostname prefix
+	// (e.g. "C225-WZP29029BE9" gives "C225"). Empty when it cannot be derived.
 	Model string `json:"-"`
-
+	// ChassisSerial is the serial derived from the hostname suffix when the
+	// hostname follows the "MODEL-SERIAL" convention. Empty otherwise.
 	ChassisSerial string `json:"-"`
 }
 
+// FetchCIMCInfo requests /api/cimcInfo.json with the header set the CIMC web
+// server requires to answer, and returns the parsed identity plus true when the
+// endpoint responds with a well-formed cimcInfo object.
 func FetchCIMCInfo(host string, timeout time.Duration) (*CIMCInfo, bool) {
 	client := httpx.Client(timeout)
 
@@ -35,7 +47,8 @@ func FetchCIMCInfo(host string, timeout time.Duration) (*CIMCInfo, bool) {
 	if err != nil {
 		return nil, false
 	}
-
+	// The endpoint replies only when the request looks like it came from the
+	// device's own single-page app. Omitting these headers yields no usable reply.
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.6")
 	req.Header.Set("Cache-Control", "no-cache")
@@ -56,6 +69,7 @@ func FetchCIMCInfo(host string, timeout time.Duration) (*CIMCInfo, bool) {
 	return parseCIMCInfo(body)
 }
 
+// parseCIMCInfo decodes the cimcInfo.json body. Separated for testing.
 func parseCIMCInfo(body []byte) (*CIMCInfo, bool) {
 	var info CIMCInfo
 	if err := json.Unmarshal(body, &info); err != nil {
@@ -68,6 +82,8 @@ func parseCIMCInfo(body []byte) (*CIMCInfo, bool) {
 	return &info, true
 }
 
+// deriveModel splits a "MODEL-SERIAL" hostname (e.g. "C225-WZP29029BE9") into a
+// model family and chassis serial, filling only the fields it can derive safely.
 func (i *CIMCInfo) deriveModel() {
 	h := strings.TrimSpace(i.Hostname)
 	idx := strings.IndexByte(h, '-')
@@ -75,7 +91,7 @@ func (i *CIMCInfo) deriveModel() {
 		return
 	}
 	model, serial := h[:idx], h[idx+1:]
-
+	// UCS model families begin with a letter and digits (C225, B200, S3260, E160).
 	if len(model) >= 2 && strings.ContainsRune("CBSE", rune(model[0])) {
 		i.Model = model
 	}
@@ -84,6 +100,7 @@ func (i *CIMCInfo) deriveModel() {
 	}
 }
 
+// looksLikeSerial reports whether s resembles a Cisco alphanumeric serial.
 func looksLikeSerial(s string) bool {
 	if len(s) < 8 || len(s) > 16 {
 		return false

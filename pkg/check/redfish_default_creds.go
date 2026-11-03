@@ -13,17 +13,27 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/redfish"
 )
 
+// The Redfish default-credential check exercises documented vendor defaults
+// against the Redfish HTTP API (SessionService POST, with a Basic fallback),
+// pulling vendor/model/firmware from the session on success then deleting it.
+// As a state-changing login it runs only after Redfish is confirmed, tries
+// only documented defaults (never a cartesian spray), is capped by
+// maxRedfishAttempts, and requires !t.DisableLogins.
 func init() {
 	Register(Check{
 		Name:        "http.redfish.defaultCreds",
 		Description: "Active Redfish default-credential login (SessionService POST, Basic fallback) -- vendor-targeted, online only",
 		Category:    "creds",
 		Applies:     Applicability{CrossVendor: true},
-		Enabled:     true,
+		Enabled:     true, // on by default; vendor-targeted + online-gated to avoid lockout
 		Run:         runRedfishDefaultCreds,
 	})
 }
 
+// maxRedfishAttempts is a hard ceiling on login attempts per host, on top of
+// the vendor-targeting that already limits the set to a single vendor's handful
+// of documented defaults. It guarantees the check stays well under any BMC
+// account lockout threshold even for a vendor with many table entries.
 const maxRedfishAttempts = 8
 
 func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Finding {
@@ -31,19 +41,28 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 	if t != nil && t.DebugLog != nil {
 		debugf = func(format string, args ...any) { t.DebugLog(fmt.Sprintf("redfish defaultCreds "+format, args...)) }
 	}
-
+	// Runtime gate: even when explicitly selected, do not attempt a login unless
+	// online/authorized mode is on.
 	if t.DisableLogins {
 		return nil
 	}
 
+	// A short per-request timeout keeps the whole battery bounded.
 	per := redfishDefaultCredsPerRequestTimeout(t.Timeout)
 	budget := redfishDefaultCredsBudget(t.Timeout)
 	started := time.Now()
-
+	// Target the port where identify actually observed Redfish, falling back to
+	// the identified web port / 443.
 	port := redfishPort(t)
 	debugf("start host=%s port=%d timeout=%s budget=%s", t.Host, port, per, budget)
 	base := redfish.BaseURL(t.Host, port)
 
+	// Confirm a genuine Redfish service is present before spending logins on it.
+	// Reuse the service root the identify stage already fetched when available
+	// (saves a TLS handshake + round-trip on every host); only probe on demand
+	// when there is no cached result. The IsRedfish gate rejects the WAF / VPN /
+	// honeypot false positives that merely answer 200 on /redfish/v1/, so we
+	// never spend a login against a non-Redfish endpoint.
 	r := cachedRedfish(t)
 	if r == nil {
 		r, _ = redfish.ProbeAt(t.Host, port, per)
@@ -52,6 +71,11 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 		return nil
 	}
 
+	// Redfish is confirmed present. Prefer the identified vendor's documented
+	// defaults; when the vendor could not be fingerprinted we still iterate over
+	// the well-known cross-vendor defaults (never the broad cartesian spray).
+	// Either way the attempt count is capped by maxRedfishAttempts to stay under
+	// account-lockout thresholds.
 	vendor := identityVendor(t)
 	haveSuppliedCreds := len(suppliedCreds(t)) > 0
 	vendorCreds := creds.VendorCredsFor(vendor, creds.ClassRedfish)
@@ -64,6 +88,9 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 
 	client := redfish.InsecureClient(per)
 
+	// Pre-flight lockout guard: when the BMC exposes its account lockout
+	// threshold (AccountService is readable pre-auth on many BMCs), cap attempts
+	// strictly below it so this check can never trip a lockout on a live host.
 	limit := maxRedfishAttempts
 	if thr := redfish.AccountLockoutThreshold(client, base, redfishLockoutProbeTimeout(per)); thr > 0 && thr-1 < limit {
 		limit = thr - 1
@@ -83,7 +110,7 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 			debugf("budget exhausted elapsed=%s attempts=%d", time.Since(started).Round(time.Millisecond), attempts)
 			break
 		}
-		if c.Username == "" {
+		if c.Username == "" { // Redfish login requires a username
 			continue
 		}
 		if attempts >= limit {
@@ -110,7 +137,9 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 				diagTimeout := redfishAuthDiagnosticTimeout(attemptTimeout)
 				st := redfish.ProbeAuthPathStatus(client, base, c.Username, c.Password, diagTimeout)
 				if redfish.IsAuthPathErrorPattern(st) {
-
+					// When the user provided explicit credentials, defer auth-path error
+					// reporting to http.redfish.postAuthEnum so the finding reflects the
+					// credentialed path (source=cli) instead of vendor-doc defaults.
 					if haveSuppliedCreds {
 						continue
 					}
@@ -137,6 +166,9 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 			continue
 		}
 
+		// Authenticated. Build the read header (session token, or the Basic header
+		// for the fallback path), pull the fingerprint, then clean up any session
+		// we minted.
 		hdrs := readHeaderFor(res, c.Username, c.Password)
 		info := redfish.PullSystemInfo(client, base, hdrs, c.Username, attemptTimeout)
 		redfish.DeleteSession(client, base, res.SessionURI, res.Token, redfishSessionDeleteTimeout(attemptTimeout))
@@ -153,6 +185,7 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 			passField = "(blank)"
 		}
 
+		// Authenticated inventory is stored in the redfishPostAuth snapshot.
 		return []engine.Finding{{
 			Check: "http.redfish.defaultCreds", Category: "creds", Risk: "critical",
 			Port: port, Transport: "tcp", Protocol: "redfish",
@@ -169,6 +202,7 @@ func runRedfishDefaultCreds(ctx context.Context, t *engine.Target) []engine.Find
 	return nil
 }
 
+// redfishDefaultCredsProof renders server-returned authentication evidence.
 func redfishDefaultCredsProof(res redfish.SessionResult, info redfish.SystemInfo) string {
 	status := ""
 	if res.Status > 0 {
@@ -277,6 +311,8 @@ func redfishAuthPathProof(st redfish.AuthPathStatus) string {
 		"sessionStatus", strconv.Itoa(st.SessionStatus))
 }
 
+// cachedRedfish returns the *redfish.Result the identify stage stashed under the
+// "redfish" evidence key, or nil when identify did not probe Redfish on this host.
 func cachedRedfish(t *engine.Target) *redfish.Result {
 	if v, ok := t.Evidenced("redfish"); ok {
 		if r, ok := v.(*redfish.Result); ok {
@@ -286,6 +322,8 @@ func cachedRedfish(t *engine.Target) *redfish.Result {
 	return nil
 }
 
+// redfishPort returns the port where identify observed the Redfish protocol,
+// falling back to the identified web port (or 443) when no port is labelled.
 func redfishPort(t *engine.Target) int {
 	for k, v := range t.OpenSnapshot() {
 		if !strings.Contains(v, "redfish") {
@@ -300,6 +338,9 @@ func redfishPort(t *engine.Target) int {
 	return webPort(t)
 }
 
+// readHeaderFor returns the request header used to read the authenticated
+// fingerprint: the session token when one was minted, otherwise the Basic-auth
+// header for the fallback login path.
 func readHeaderFor(res redfish.SessionResult, username, password string) map[string]string {
 	if res.Token != "" {
 		return map[string]string{"X-Auth-Token": res.Token}

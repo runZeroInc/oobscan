@@ -12,21 +12,31 @@ import (
 
 var sshTryDefaults = ssh.TryDefaults
 
+// sshCredRisk grades a recovered SSH default credential by the access it actually
+// yielded. Authentication alone is not administrative access: many BMC and appliance accounts
+// authenticate and then drop the caller into a restricted CLI that denies every
+// command, or refuse the session outright.
 func sshCredRisk(output string) string {
-
+	// Only a session that returned real command output is a usable compromise. A
+	// credential that authenticates but is denied a usable session is low-signal, so
+	// it stays informational rather than being reported as a working default cred.
 	if sshAccessLevel(output) == "shell" {
 		return "critical"
 	}
 	return "info"
 }
 
+// sshAccessLevel classifies the session proof captured after a successful SSH
+// password auth: "shell" when a benign command returned real output, otherwise
+// "restricted" (authenticated but denied/no-output/refused/timed-out). The
+// sentinels mirror pkg/ssh.sessionProof.
 func sshAccessLevel(output string) string {
 	o := strings.ToLower(strings.TrimSpace(output))
 	if o == "" {
 		return "restricted"
 	}
 	if strings.HasPrefix(o, "authenticated (") {
-		return "restricted"
+		return "restricted" // session refused / no command output / timed out
 	}
 	for _, deny := range []string{
 		"no access privilege", "command not supported",
@@ -40,6 +50,9 @@ func sshAccessLevel(output string) string {
 	return "shell"
 }
 
+// RunPostChecks runs low-cost checks that depend on evidence produced by more
+// than one normal check. The scan pipeline calls this after all regular checks
+// have completed, so dependency order is deterministic.
 func RunPostChecks(ctx context.Context, t *engine.Target) []engine.Finding {
 	var out []engine.Finding
 	out = append(out, runIPMICredsFromRecoveredCreds(ctx, t)...)
@@ -49,8 +62,21 @@ func RunPostChecks(ctx context.Context, t *engine.Target) []engine.Finding {
 	return out
 }
 
+// smcWebPostCheckMaxPOSTs caps login POSTs for the quiet-phase SMC web post-check.
+// It runs after the concurrent HTTP lane drains, so it can work through the merged
+// candidate set: higher than smcMaxAttempts but still under the ATEN lockout
+// threshold. Only genuine credential rejections count, not transport errors.
 const smcWebPostCheckMaxPOSTs = 12
 
+// runSMCWebWithRecoveredIPMICreds re-tries the Supermicro ATEN web UI in the quiet
+// post-check phase, covering two gaps in the regular http.smc.webDefaultCreds check:
+// the concurrent HTTP lane saturates a fragile ATEN web server so multi-round-trip
+// logins time out, and the regular check tries only the documented defaults, missing
+// a rotated password that the IPMI RAKP crack recovered.
+//
+// IPMI-recovered credentials come first (already proven, and the ATEN account store
+// is shared with the web UI), then the documented defaults so a host with IPMI
+// filtered but 443 open is still covered. Mirrors runSSHWithRecoveredIPMICreds.
 func runSMCWebWithRecoveredIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 	if ctx.Err() != nil || t == nil || t.DisableLogins {
 		return nil
@@ -59,7 +85,7 @@ func runSMCWebWithRecoveredIPMICreds(ctx context.Context, t *engine.Target) []en
 		return nil
 	}
 	if targetHasFinding(t, httpCredCheckName("supermicro")) {
-		return nil
+		return nil // regular check already confirmed a web default cred
 	}
 	seen := map[[2]string]struct{}{}
 	var cands []smcCred
@@ -74,7 +100,7 @@ func runSMCWebWithRecoveredIPMICreds(ctx context.Context, t *engine.Target) []en
 		seen[k] = struct{}{}
 		cands = append(cands, c)
 	}
-
+	// Recovered creds first, then documented defaults.
 	if auth, ok := ipmiAuthEvidence(t); ok {
 		for _, p := range ipmiCrackedSSHPairs(auth, 8) {
 			add(smcCred{user: p[0], pass: p[1], source: "ipmi.rakpCracked"})
@@ -334,7 +360,9 @@ func ipmiCrackedSSHPairs(auth *ipmi.AuthReport, limit int) [][2]string {
 		if user != "" {
 			add(user, cr.Password)
 		}
-
+		// Accepts-any / null-user RAKP cracks often recover the device password but
+		// cannot prove the account name. Replay the password against a tiny BMC SSH
+		// username set instead of treating the probed RAKP username as real.
 		if cr.AcceptsAny || user == "" {
 			for _, candidate := range []string{"admin", "root", "ADMIN", "USERID"} {
 				add(candidate, cr.Password)

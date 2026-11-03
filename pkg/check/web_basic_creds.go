@@ -14,6 +14,11 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/httpx"
 )
 
+// The web Basic-auth default-credential check targets web-only OOB devices
+// (PDUs, serial console servers, rack KVMs) that authenticate with HTTP Basic.
+// It self-scopes on a 401 `WWW-Authenticate: Basic` challenge, so it no-ops on
+// form-login/JSON-RPC devices, and follows the standard active-login discipline
+// (identified vendor's defaults only, capped attempts, stop at first success).
 func init() {
 	Register(Check{
 		Name:        "http.web.defaultCreds",
@@ -27,22 +32,29 @@ func init() {
 	})
 }
 
+// maxWebBasicAttempts caps Basic-auth login attempts per host on top of the
+// vendor-targeting, keeping the check well under any device lockout threshold.
 const maxWebBasicAttempts = 4
 
+// webBasicSkipVendors have a bespoke active web-login check already, so the
+// generic Basic path must not double-attempt (and risk a second lockout counter)
+// against them.
 var webBasicSkipVendors = map[string]bool{
-	"apc":  true,
-	"gude": true,
+	"apc":  true, // pdu.confirm -> http.apc.defaultCreds (form login)
+	"gude": true, // http.gude.defaultCreds (Basic on /ov.html)
 }
 
 func runWebBasicDefaultCreds(ctx context.Context, t *engine.Target) []engine.Finding {
 	if t.DisableLogins {
-		return nil
+		return nil // active login; skipped under --disable-logins
 	}
 	vendor := identityVendor(t)
 	if vendor == "" || webBasicSkipVendors[vendor] {
 		return nil
 	}
-
+	// Only the identified vendor's documented defaults (never the broad spray).
+	// ClassHTTP pulls the vendor's HTTP rows plus the ClassAny rows that most
+	// account-level defaults use.
 	cands := webBasicCandidates(t, vendor)
 	if len(cands) == 0 {
 		return nil
@@ -53,10 +65,15 @@ func runWebBasicDefaultCreds(ctx context.Context, t *engine.Target) []engine.Fin
 	if port <= 0 {
 		return nil
 	}
-	base := hostPortURL(proto, t.Host, port, "")
+	base := hostPortURL(proto, t.Host, port, "") // scheme://host:port (no path)
 
+	// Retain the request/response transcript for false-positive analysis.
 	client, rec := httpx.NewRecordingClient(insecureWebClient(webBasicPerRequestTimeout(t.Timeout)))
 
+	// A vendor with a bespoke web-login flow (Moxa form / Opengear CGI / Raritan
+	// JSON-RPC) is driven by its adapter; every other vendor uses the generic,
+	// self-scoping HTTP Basic path. Both are vendor-targeted, capped, and stop at
+	// the first success.
 	var findings []engine.Finding
 	mechanism := "httpBasic"
 	if adapter, ok := webLoginAdapters[vendor]; ok {
@@ -69,6 +86,10 @@ func runWebBasicDefaultCreds(ctx context.Context, t *engine.Target) []engine.Fin
 	return findings
 }
 
+// stashWebLoginTranscript records the captured login exchanges on the target so
+// resultFrom can emit them in the scan record. It only stores when a
+// credentialed request was actually sent (the self-scoping Basic gate that
+// no-ops before any login yields no useful transcript).
 func stashWebLoginTranscript(t *engine.Target, rec *httpx.Recorder, vendor string, port int, proto, mechanism string, findings []engine.Finding) {
 	ex := rec.Exchanges()
 	if len(ex) == 0 {
@@ -90,17 +111,21 @@ func stashWebLoginTranscript(t *engine.Target, rec *httpx.Recorder, vendor strin
 	})
 }
 
+// runWebBasicLogin is the self-scoping HTTP Basic path: it proceeds only against
+// a genuine `WWW-Authenticate: Basic` challenge whose Server/title also confirm
+// the identified vendor, so it cleanly no-ops on form-login / JSON-RPC devices
+// and never sprays a wrong-vendor default at a UDP-discovery false positive.
 func runWebBasicLogin(ctx context.Context, t *engine.Target, cands []webBasicCred, base string, port int, proto, vendor string, client *http.Client) []engine.Finding {
 	root := base + "/"
 	p := probeWebRoot(ctx, client, root)
 	if !p.ok {
 		return nil
 	}
-
+	// Vendor-fingerprint gate: the live Server/title must corroborate the vendor.
 	if !confirmVendorWeb(p.server, p.title, vendor) {
 		return nil
 	}
-
+	// Basic gate: proceed only against a real Basic challenge.
 	if !p.basicChallenge() {
 		return nil
 	}
@@ -123,6 +148,12 @@ func runWebBasicLogin(ctx context.Context, t *engine.Target, cands []webBasicCre
 	return nil
 }
 
+// runWebAdapterLogin drives a vendor-specific adapter (form / JSON-RPC) over the
+// candidate list, capped and stopping at the first success; a transport error
+// aborts the loop (login flow unavailable / not this device). It applies the
+// same vendor-fingerprint gate as the Basic path when the root page yields a
+// Server/title (skipping a fingerprint mismatch); otherwise the adapter's own
+// handshake confirms the device.
 func runWebAdapterLogin(ctx context.Context, t *engine.Target, adapter webLoginAdapter, cands []webBasicCred, base string, port int, proto, vendor string, client *http.Client) []engine.Finding {
 	if p := probeWebRoot(ctx, client, base+"/"); p.ok && (p.server != "" || p.title != "") {
 		if !confirmVendorWeb(p.server, p.title, vendor) {
@@ -140,7 +171,7 @@ func runWebAdapterLogin(ctx context.Context, t *engine.Target, adapter webLoginA
 		attempts++
 		okAuth, proof, err := adapter.login(ctx, client, base, c.User, c.Pass)
 		if err != nil {
-			return nil
+			return nil // login flow unavailable / not this device
 		}
 		if !okAuth {
 			continue
@@ -150,6 +181,11 @@ func runWebAdapterLogin(ctx context.Context, t *engine.Target, adapter webLoginA
 	return nil
 }
 
+// httpCredCheckName is the standardized per-vendor default-cred finding name,
+// protocol.vendor.defaultCreds (e.g. "http.supermicro.defaultCreds",
+// "http.moxa.defaultCreds"), matching the existing http.apc/idrac/cim/gude
+// convention so every confirmed web default-cred hit keys the same way. They all
+// share the http.web.defaultCreds explainer via GetExplainer's family fallback.
 func httpCredCheckName(vendor string) string {
 	v := strings.TrimSpace(strings.ToLower(vendor))
 	if v == "" {
@@ -158,6 +194,8 @@ func httpCredCheckName(vendor string) string {
 	return "http." + v + ".defaultCreds"
 }
 
+// webCredFinding builds the shared critical finding for a confirmed web default
+// credential. realm/endpoint are optional (Basic-only) fields.
 func webCredFinding(t *engine.Target, port int, proto, vendor string, c webBasicCred, loginVia, realm, endpoint, proof string) []engine.Finding {
 	t.MarkOpen(port, "tcp", proto)
 	passField := c.Pass
@@ -186,6 +224,7 @@ func webCredFinding(t *engine.Target, port int, proto, vendor string, c webBasic
 	}}
 }
 
+// webBasicCred is a candidate credential with provenance for the finding.
 type webBasicCred struct {
 	User   string
 	Pass   string
@@ -193,6 +232,10 @@ type webBasicCred struct {
 	CVE    string
 }
 
+// webBasicCandidates builds the ordered candidate list: operator-supplied creds
+// first (so a rotated unit is still confirmed), then the identified vendor's
+// documented HTTP/any defaults, de-duplicated by (user, pass). Blank-username
+// rows are dropped (Basic auth needs a username).
 func webBasicCandidates(t *engine.Target, vendor string) []webBasicCred {
 	seen := map[[2]string]struct{}{}
 	var out []webBasicCred
@@ -216,19 +259,27 @@ func webBasicCandidates(t *engine.Target, vendor string) []webBasicCred {
 	return out
 }
 
+// webRootProbe is the result of one unauthenticated GET of the device root: the
+// status, the WWW-Authenticate header, the Server header, and the page <title>.
+// It drives both the vendor-fingerprint gate and the Basic-challenge gate from a
+// single round-trip.
 type webRootProbe struct {
-	ok      bool
+	ok      bool // the request completed (a response was received)
 	status  int
 	wwwAuth string
 	server  string
 	title   string
 }
 
+// basicChallenge reports whether the probe is a genuine HTTP Basic challenge
+// (401 with a `WWW-Authenticate: Basic ...` header).
 func (p webRootProbe) basicChallenge() bool {
 	return p.status == http.StatusUnauthorized &&
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(p.wwwAuth)), "basic")
 }
 
+// probeWebRoot issues one unauthenticated GET and captures the signals the
+// targeting gates need. It never sends a credential.
 func probeWebRoot(ctx context.Context, client *http.Client, url string) webRootProbe {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -249,6 +300,10 @@ func probeWebRoot(ctx context.Context, client *http.Client, url string) webRootP
 	}
 }
 
+// tryBasicLogin sends one Basic-auth GET and reports success. Success is a 2xx
+// response (the 401 challenge cleared and the server returned content); a
+// repeated 401 is a rejected credential, and a 3xx/4xx/5xx is treated as
+// non-success to avoid false positives. The proof is a compact page marker.
 func tryBasicLogin(ctx context.Context, client *http.Client, url, user, pass string) (ok bool, proof string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -267,6 +322,8 @@ func tryBasicLogin(ctx context.Context, client *http.Client, url, user, pass str
 	return true, basicLoginProof(resp, body)
 }
 
+// basicLoginProof builds a short proof line from an authenticated response: the
+// page <title>, else the Server header, else a generic marker.
 func basicLoginProof(resp *http.Response, body []byte) string {
 	if title := htmlTitle(body); title != "" {
 		return proofKV("status", strconv.Itoa(resp.StatusCode), "title", title)
@@ -277,6 +334,7 @@ func basicLoginProof(resp *http.Response, body []byte) string {
 	return proofKV("status", strconv.Itoa(resp.StatusCode))
 }
 
+// basicRealm extracts the realm token from a WWW-Authenticate: Basic header.
 func basicRealm(h string) string {
 	low := strings.ToLower(h)
 	i := strings.Index(low, "realm=")
@@ -293,6 +351,7 @@ func basicRealm(h string) string {
 	return strings.TrimSpace(v)
 }
 
+// htmlTitle returns the trimmed <title> text of an HTML body, or "".
 func htmlTitle(body []byte) string {
 	s := string(body)
 	low := strings.ToLower(s)

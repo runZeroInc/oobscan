@@ -19,12 +19,16 @@ var (
 	hashdumpPotfile string
 )
 
+// hashdumpCmd extracts the RAKP HMAC hashes captured in scan JSONL and writes
+// them as hashcat and John input files for authorized password audits.
 var hashdumpCmd = &cobra.Command{
 	Use:   "hashdump [flags] <scan.jsonl>...",
-	Short: "Write hashcat / John input files from RAKP hashes in scan results.",
+	Short: "Export captured RAKP hashes for authorized hashcat or John password audits.",
 	Long: `hashdump reads one or more oobscan scan JSONL files, reconstructs every
 captured IPMI RAKP HMAC (auth algorithms 1=SHA1, 2=MD5, 3=SHA256), and writes
-them to disk in cracker-ready formats.
+them to disk in hashcat and John input formats. This is an offline operation.
+Exports and recovered credentials can enable access to the assessed devices;
+restrict access to these files and handle them as sensitive evidence.
 
 	--output NAME    write all files derived from NAME:
 						NAME-sha1.7300.hc with "salt:hmac" (hashcat -m 7300),
@@ -56,6 +60,8 @@ func runHashdump(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--ciphers must list at least one of md5,sha1,sha256")
 	}
 
+	// dedup=false: hashdump emits every distinct (salt,mac) so no crackable
+	// material is lost (unlike hashcrack, which keeps one target per host+user).
 	hashes, tally, err := hashcrack.LoadScans(args, want, false)
 	if err != nil {
 		return err
@@ -87,7 +93,7 @@ func runHashdump(cmd *cobra.Command, args []string) error {
 		if h.Algo != hashcrack.AlgoMD5 || h.SMCFixedKey {
 			return "", false
 		}
-
+		// hashcat -m 7350 expects "hmac:salt".
 		return fmt.Sprintf("%x:%x", h.MAC, h.Salt), true
 	})
 	if err != nil {
@@ -174,6 +180,8 @@ func runHashdump(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// writeLines writes render(h) for every hash where render reports ok, returning
+// the number of lines written.
 func writeLines(path string, hashes []*hashcrack.Hash, render func(*hashcrack.Hash) (string, bool)) (int, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -195,12 +203,15 @@ func writeLines(path string, hashes []*hashcrack.Hash, render func(*hashcrack.Ha
 	return n, w.Flush()
 }
 
+// hashcatOutputPaths derives paired output files for modes 7300 and 7350 from
+// a single base name.
 func hashcatOutputPaths(path string) (sha1Path, md5Path string) {
 	stem := outputStem(path)
 	dir := filepath.Dir(path)
 	return filepath.Join(dir, stem+"-sha1.7300.hc"), filepath.Join(dir, stem+"-md5.7350.hc")
 }
 
+// johnOutputPaths derives the per-algorithm John file paths from a base name.
 func johnOutputPaths(path string) (md5Path, sha1Path, sha256Path string) {
 	stem := outputStem(path)
 	dir := filepath.Dir(path)

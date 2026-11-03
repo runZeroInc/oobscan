@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// DeviceID holds the parsed Get Device ID (NetFn App / Cmd 0x01) response. This
+// unauthenticated command is one of the strongest BMC fingerprints: it returns
+// the IANA manufacturer ID, product ID, firmware version, and IPMI version
+// without any session.
 type DeviceID struct {
 	ID                 byte
 	Revision           byte
@@ -19,6 +23,9 @@ type DeviceID struct {
 	AuxFirmwareVersion [4]byte
 }
 
+// manufacturerNames maps IANA enterprise (PEN) numbers to vendor names for the
+// manufacturer IDs commonly seen in BMC Get Device ID responses. Values are
+// checked against the IANA Private Enterprise Number registry.
 var manufacturerNames = map[uint32]string{
 	2:     "IBM",
 	11:    "Hewlett-Packard",
@@ -27,9 +34,9 @@ var manufacturerNames = map[uint32]string{
 	259:   "Accton Technology",
 	343:   "Intel Corporation",
 	674:   "Dell Inc.",
-	802:   "National Semiconductor (Intel mBMC/Sahalee)",
+	802:   "National Semiconductor (Intel mBMC/Sahalee)", // Intel SE7xxx-era boards, IPMI 1.5, fw 2.40
 	2011:  "Huawei",
-	2050:  "Windward Technologies (BMC firmware)",
+	2050:  "Windward Technologies (BMC firmware)", // seen on Intel SE7320VP2
 	2623:  "ASUSTek Computer",
 	4413:  "Broadcom",
 	4542:  "Alerting Specifications Forum",
@@ -39,7 +46,7 @@ var manufacturerNames = map[uint32]string{
 	10437: "Peppercon / Raritan (IPMI-KVM)",
 	10876: "Super Micro Computer",
 	11129: "Google",
-	12290: "Celestica",
+	12290: "Celestica", // ODM for Dell/Silicom VEP-4600 uCPE
 	19046: "Lenovo Group",
 	20301: "IBM eServer",
 	20569: "Inventec",
@@ -47,25 +54,46 @@ var manufacturerNames = map[uint32]string{
 	21317: "ATEN International (Supermicro OEM)",
 	25506: "H3C",
 	37945: "Inspur",
-	47196: "Hewlett Packard Enterprise",
+	47196: "Hewlett Packard Enterprise", // Gen11+/iLO6; distinct from PEN 11 legacy HP
 	47488: "Nedam Engineering",
 	49622: "ASRock Rack",
-	58132: "xFusion Digital Technologies",
+	58132: "xFusion Digital Technologies", // Huawei x86-server spinoff
 }
 
+// ManufacturerNameFor maps an IANA enterprise (PEN) number to a BMC vendor name,
+// returning "" when unknown. Shared by Get Device ID and the Get Channel Auth
+// Caps OEM-ID fingerprint (both carry an IANA manufacturer number).
 func ManufacturerNameFor(id uint32) string { return manufacturerNames[id] }
 
+// ManufacturerName returns the vendor name for the manufacturer ID, or "".
 func (d *DeviceID) ManufacturerName() string { return ManufacturerNameFor(d.ManufacturerID) }
 
+// FormatFirmwareRevision renders the two-component firmware revision carried in
+// the Get Device ID Firmware Revision 1 and Firmware Revision 2 bytes.
+//
+// Firmware Revision 2 is BCD, so its nibbles are printed as hex digits (0x19 ->
+// "19"). Arithmetic-decoding an out-of-spec byte would turn it into a
+// plausible-looking revision, so print it verbatim instead ("ff").
 func FormatFirmwareRevision(major, minor byte) string {
 	return fmt.Sprintf("%d.%02x", major&0x7f, minor)
 }
 
+// auxVersionVendors lists the IANA enterprise numbers whose auxiliary firmware
+// revision encoding is confirmed against shipped firmware; the bytes are
+// vendor-defined, so an unknown encoding cannot be reconstructed. Supermicro/ATEN
+// publish Firmware Revision 1, Firmware Revision 2 and the first auxiliary byte as
+// hex digits, and only those three: the second auxiliary byte is not part of the
+// published string on every generation, so appending it would invent one.
 var auxVersionVendors = map[uint32]bool{
-	10876: true,
-	21317: true,
+	10876: true, // Super Micro Computer
+	21317: true, // ATEN International (the Supermicro OEM stack)
 }
 
+// FormatFirmwareRevisionFull reconstructs the vendor-published firmware version
+// from the two revision bytes plus the auxiliary revision bytes, or returns ""
+// when the vendor's auxiliary encoding is not confirmed or no auxiliary
+// revision is present. Callers should report the raw auxiliary bytes as well,
+// since "" here means "cannot be reconstructed", not "no data".
 func FormatFirmwareRevisionFull(manufacturerID uint32, major, minor byte, aux [4]byte) string {
 	if !auxVersionVendors[manufacturerID] || aux[0] == 0 {
 		return ""
@@ -73,10 +101,14 @@ func FormatFirmwareRevisionFull(manufacturerID uint32, major, minor byte, aux [4
 	return fmt.Sprintf("%02x.%02x.%02x", major&0x7f, minor, aux[0])
 }
 
+// FirmwareRevisionFull reconstructs the vendor-published firmware version, or
+// "" when it cannot be reconstructed. See FormatFirmwareRevisionFull.
 func (d *DeviceID) FirmwareRevisionFull() string {
 	return FormatFirmwareRevisionFull(d.ManufacturerID, d.FirmwareMajor, d.FirmwareMinor, d.AuxFirmwareVersion)
 }
 
+// Attributes renders the decoded fields for reporting. Firmware minor and IPMI
+// version are BCD-encoded per the IPMI spec.
 func (d *DeviceID) Attributes() map[string]string {
 	m := map[string]string{
 		"ipmi.deviceID":         fmt.Sprintf("%d", d.ID),
@@ -98,6 +130,7 @@ func (d *DeviceID) Attributes() map[string]string {
 	return m
 }
 
+// Summary is a one-line human-readable fingerprint.
 func (d *DeviceID) Summary() string {
 	vendor := d.ManufacturerName()
 	if vendor == "" {
@@ -112,6 +145,12 @@ func (d *DeviceID) Summary() string {
 		d.IPMIVersion&0x0f, (d.IPMIVersion>>4)&0x0f)
 }
 
+// GetDeviceID15 sends an unauthenticated Get Device ID (NetFn App/0x06, Cmd 0x01)
+// over the sessionless IPMI 1.5 wrapper and parses the reply. The spec does not
+// require this command be processed without a session (only Get Channel Auth Caps
+// 0x38, Get Channel Cipher Suites 0x54 and session setup), so a BMC may drop the
+// session-zero request: a timeout here says nothing about framing or whether IPMI
+// 1.5 is enabled. Use GetChannelAuthCaps15 for a dependable pre-session fingerprint.
 func GetDeviceID15(host string, port int, timeout time.Duration) (*DeviceID, error) {
 	c, err := NewClient(host, port, timeout)
 	if err != nil {
@@ -125,6 +164,9 @@ func GetDeviceID15(host string, port int, timeout time.Duration) (*DeviceID, err
 	return ParseDeviceIDReply(reply)
 }
 
+// GetSystemGUID15 sends an unauthenticated Get System GUID (NetFn App/0x06,
+// Cmd 0x37) over the sessionless IPMI 1.5 wrapper and returns the 16-byte GUID
+// from the reply.
 func GetSystemGUID15(host string, port int, timeout time.Duration) ([]byte, error) {
 	c, err := NewClient(host, port, timeout)
 	if err != nil {
@@ -138,6 +180,10 @@ func GetSystemGUID15(host string, port int, timeout time.Duration) ([]byte, erro
 	return ParseSystemGUIDReply(reply)
 }
 
+// ParseDeviceIDReply parses a Get Device ID reply. It anchors on the IPMB
+// response header (rsAddr=0x81 followed by rqAddr=0x20) - the same anchoring as
+// ParseAuthCapsReply - reads the completion code at start+6, and decodes the
+// Device ID fields that begin at start+7.
 func ParseDeviceIDReply(reply []byte) (*DeviceID, error) {
 	start := -1
 	for i := 0; i+7 < len(reply); i++ {
@@ -172,6 +218,8 @@ func ParseDeviceIDReply(reply []byte) (*DeviceID, error) {
 	return dev, nil
 }
 
+// ParseSystemGUIDReply parses a Get System GUID reply and returns the 16-byte
+// GUID payload.
 func ParseSystemGUIDReply(reply []byte) ([]byte, error) {
 	start := -1
 	for i := 0; i+7 < len(reply); i++ {

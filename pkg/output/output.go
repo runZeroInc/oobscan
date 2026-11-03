@@ -7,15 +7,21 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Options configures New.
 type Options struct {
-	Fancy   io.Writer
-	Errors  io.Writer
-	Records io.Writer
-	Total   int
-	NoColor bool
-	Verbose bool
+	Fancy   io.Writer // human findings + summary (default os.Stdout)
+	Errors  io.Writer // diagnostics + panics (default os.Stderr)
+	Records io.Writer // NDJSON sink (the --output file)
+	Total   int       // number of targets (reserved for progress reporting)
+	NoColor bool      // disable ANSI styling
+	Verbose bool      // include verbose-only lines such as id.final summaries
 }
 
+// New builds the emitter. There is a single emitter: it always renders the
+// human ("fancy") output to Fancy and diagnostics to Errors, and additionally
+// streams machine NDJSON to Records. The three streams are independent, so
+// `oobscan scan --output out.jsonl` shows the fancy
+// scan on the terminal while out.jsonl stays pure NDJSON.
 func New(o Options) engine.Emitter {
 	if o.Fancy == nil {
 		o.Fancy = os.Stdout

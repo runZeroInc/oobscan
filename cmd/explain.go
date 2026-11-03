@@ -22,15 +22,19 @@ var (
 
 var explainCmd = &cobra.Command{
 	Use:   "explain [flags] <scan.jsonl>...",
-	Short: "Generate a detailed guide from scan results in markdown format.",
+	Short: "Generate a Markdown validation and remediation guide from scan results.",
 	Long: `explain reads one or more oobscan scan NDJSON files and writes a detailed
 markdown guide describing how to validate every identified finding against the
 specific host on which it was observed.
 
 For each finding the guide shows:
   * What was found and why it matters
-  * The exact ipmitool / curl / snmpwalk / hashcat command to reproduce it
-  * Additional exploitation steps where applicable
+	* Commands for authorized reproduction where available
+	* Evidence limitations, operational risks, and remediation guidance
+
+Generating a guide does not contact the targets. Executing its suggested
+commands may authenticate, disclose sensitive data, or change device state;
+review each step against the assessment scope before running it.
 
 Use --match to scope the output to findings whose summary line contains a given
 substring (case-insensitive). The match string is compared against the full
@@ -40,11 +44,12 @@ risk level, or any field value.  --match may be repeated; a finding matches if
 ANY of the provided strings is found in its summary line.
 
 Examples:
+
   oobscan explain results.jsonl
   oobscan explain results.jsonl --match 192.168.0.1
-  oobscan explain results.jsonl --match cipherZero --match authNone
+	oobscan explain results.jsonl --match cipherZero --match authNone
   oobscan explain results.jsonl --match critical --out guide.md
-  oobscan explain oob1.jsonl oob2.jsonl --match rakpHash`,
+	oobscan explain oob1.jsonl oob2.jsonl --match rakpHash`,
 	Args: cobra.MinimumNArgs(1),
 	RunE: runExplain,
 }
@@ -59,7 +64,7 @@ func init() {
 }
 
 func runExplain(cmd *cobra.Command, args []string) error {
-
+	// Normalise match strings once.
 	var needles []string
 	for _, m := range explainMatch {
 		if m != "" {
@@ -67,6 +72,7 @@ func runExplain(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Open the output writer.
 	out := cmd.OutOrStdout()
 	if explainOut != "" {
 		fh, err := os.Create(explainOut)
@@ -82,6 +88,8 @@ func runExplain(cmd *cobra.Command, args []string) error {
 	total := 0
 	written := 0
 
+	// processRecord renders one host's finding explanations. It is a closure so
+	// the read loop can be a thin, robust line reader.
 	processRecord := func(line []byte) {
 		var r output.Result
 		if err := json.Unmarshal(line, &r); err != nil {
@@ -103,6 +111,9 @@ func runExplain(cmd *cobra.Command, args []string) error {
 			if section == "" {
 				continue
 			}
+			if written == 0 {
+				fmt.Fprint(bw, "# OOBscan validation guide\n\nUse these procedures only on systems you are authorized to assess. Review target scope, credentials, rate limits, and maintenance windows before executing commands. Validation can create sessions, affect failure counters, disclose secrets, or change device state. There is no universal dry-run mode.\n\nTreat this guide as sensitive evidence. Distinguish observed behavior from potential impact, and verify remediation against the applicable vendor advisory. A missing finding or unsuccessful validation does not establish that a device is unaffected.\n\n")
+			}
 			written++
 			fmt.Fprintln(bw, section)
 		}
@@ -113,7 +124,9 @@ func runExplain(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("open %s: %w", path, err)
 		}
-
+		// A bufio.Reader grows to hold a whole line, so a record with a large
+		// post-auth blob or web transcript is read intact rather than tripping a
+		// fixed scan-token cap (bufio.Scanner: token too long).
 		rdr := bufio.NewReaderSize(fh, 1<<20)
 		var readErr error
 		for {
@@ -150,6 +163,9 @@ func runExplain(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// matchesAny returns true when:
+//   - needles is empty (no filter -> everything matches), or
+//   - at least one needle is a case-insensitive substring of line.
 func matchesAny(line string, needles []string) bool {
 	if len(needles) == 0 {
 		return true

@@ -4,6 +4,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Version is set at link-time via -ldflags "-X ...cmd.Version=...".
 var Version = "0.0.1-dev"
 
 var versionCmd = &cobra.Command{

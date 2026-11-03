@@ -13,6 +13,8 @@ import (
 
 const SSHClientVersion = "SSH-2.0-OpenSSH_9.2p1"
 
+// KexInfo holds the algorithm name-lists an SSH server offers in its
+// SSH_MSG_KEXINIT (read directly off the wire, before any key exchange).
 type KexInfo struct {
 	Banner   string
 	KEX      []string
@@ -21,6 +23,8 @@ type KexInfo struct {
 	MACs     []string
 }
 
+// Kex performs the SSH version exchange and reads the server's SSH_MSG_KEXINIT,
+// returning the algorithms it offers. No key exchange or auth is attempted.
 func Kex(host string, port int, timeout time.Duration) (*KexInfo, error) {
 	conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(port)), timeout)
 	if err != nil {
@@ -30,6 +34,8 @@ func Kex(host string, port int, timeout time.Duration) (*KexInfo, error) {
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	br := bufio.NewReader(conn)
 
+	// Version exchange: the server may emit pre-banner lines; the identification
+	// string is the first line starting with "SSH-".
 	var banner string
 	for range 50 {
 		line, err := br.ReadString('\n')
@@ -48,6 +54,7 @@ func Kex(host string, port int, timeout time.Duration) (*KexInfo, error) {
 		return nil, err
 	}
 
+	// First binary packet (unencrypted): uint32 len | byte padlen | payload | pad.
 	var lenb [4]byte
 	if _, err := io.ReadFull(br, lenb[:]); err != nil {
 		return nil, err
@@ -65,10 +72,10 @@ func Kex(host string, port int, timeout time.Duration) (*KexInfo, error) {
 		return nil, fmt.Errorf("bad padding")
 	}
 	payload := buf[1 : len(buf)-padlen]
-	if len(payload) < 17 || payload[0] != 20 {
+	if len(payload) < 17 || payload[0] != 20 { // 20 = SSH_MSG_KEXINIT
 		return nil, fmt.Errorf("expected KEXINIT, got msg type %d", payload[0])
 	}
-	p := payload[17:]
+	p := payload[17:] // skip msg type (1) + cookie (16)
 	next := func() []string {
 		if len(p) < 4 {
 			return nil
@@ -86,14 +93,17 @@ func Kex(host string, port int, timeout time.Duration) (*KexInfo, error) {
 		return strings.Split(s, ",")
 	}
 	ki := &KexInfo{Banner: banner}
-	ki.KEX = next()
-	ki.HostKeys = next()
-	ki.Ciphers = next()
-	next()
-	ki.MACs = next()
+	ki.KEX = next()      // kex_algorithms
+	ki.HostKeys = next() // server_host_key_algorithms
+	ki.Ciphers = next()  // encryption client->server
+	next()               // encryption server->client (mirror)
+	ki.MACs = next()     // mac client->server
 	return ki, nil
 }
 
+// WeakAlgos classifies the offered algorithms into weak buckets (kex, cipher,
+// mac, hostkey), matching what Nessus/GreenBone flag. Returns only the weak
+// entries found.
 func (k *KexInfo) WeakAlgos() map[string][]string {
 	out := map[string][]string{}
 	collect := func(key string, in []string, weak func(string) bool) {

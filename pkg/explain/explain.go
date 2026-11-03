@@ -1,24 +1,65 @@
+// Package explain produces human-readable markdown validation guides from
+// oobscan findings. The actual per-finding explainer functions live in the
+// same file as the check that emits each finding (pkg/check/*.go) and
+// self-register via check.RegisterExplain so they stay in sync with the check.
+// This package is the thin consumer: it dispatches to those registered
+// explainers and provides a generic fallback for unregistered findings.
 package explain
 
 import (
 	"fmt"
 	"strings"
 
+	"github.com/runZeroInc/oobscan/pkg/advisory"
 	"github.com/runZeroInc/oobscan/pkg/check"
 	"github.com/runZeroInc/oobscan/pkg/engine"
 	"github.com/runZeroInc/oobscan/pkg/output"
 )
 
+// Section returns a self-contained markdown block for one finding. It
+// dispatches to the explainer registered by the check that emits the finding
+// (via check.RegisterExplain), falling back to a generic block that lists
+// the raw fields. An empty string is returned for risk=none findings. Findings
+// that carry a runZero advisory CVE end with a link to that advisory.
 func Section(host string, r *output.Result, f engine.Finding) string {
 	if f.Risk == "none" {
 		return ""
 	}
+	var s string
 	if fn, ok := check.GetExplainer(f.Check); ok {
-		return fn(host, f)
+		s = fn(host, f)
+	} else {
+		s = genericSection(host, r, f)
 	}
-	return genericSection(host, r, f)
+	return s + advisoryRefs(f)
 }
 
+// advisoryRefs renders a markdown block linking each runZero advisory the
+// finding's CVEs resolve to, or "" when none do.
+func advisoryRefs(f engine.Finding) string {
+	var b strings.Builder
+	for _, cve := range f.CVE {
+		a, ok := advisory.Lookup(cve)
+		if !ok {
+			continue
+		}
+		if b.Len() == 0 {
+			b.WriteString("\n### runZero advisory\n\n")
+		}
+		rating := ""
+		if a.Score != "" {
+			rating = fmt.Sprintf(" (CVSS %s, %s)", a.Score, strings.ToUpper(a.Severity[:1])+a.Severity[1:])
+		}
+		fmt.Fprintf(&b, "- %s: %s%s: %s\n", a.CVE, a.Title, rating, a.URL)
+	}
+	return b.String()
+}
+
+// MatchLine builds the plain-text representation of a finding used for
+// --match= filtering. Format mirrors the tty emitter's human output so
+// operators can copy-paste a scan line and use it as a filter:
+//
+//	CRITICAL 192.168.0.1 ipmi.v15.authNoneSession 623/udp ipmi priv=admin proof="..."
 func MatchLine(host string, f engine.Finding) string {
 	parts := []string{strings.ToUpper(f.Risk), host, f.Check}
 	if f.Port != 0 {
@@ -34,8 +75,11 @@ func MatchLine(host string, f engine.Finding) string {
 	return strings.Join(parts, " ")
 }
 
+// genericSection is the fallback for findings with no registered explainer.
+// It renders the raw finding fields in a structured markdown block so the
+// reader still has full detail without a bespoke validation script.
 func genericSection(host string, r *output.Result, f engine.Finding) string {
-	_ = r
+	_ = r // reserved for future cross-finding context
 	var b strings.Builder
 	b.WriteString(sectionHeading(host, f))
 	b.WriteString(fmt.Sprintf("\n**Check:** `%s`  **Risk:** %s\n", f.Check, f.Risk))
@@ -56,6 +100,8 @@ func genericSection(host string, r *output.Result, f engine.Finding) string {
 	return b.String()
 }
 
+// sectionHeading is the local heading helper for genericSection. Per-check
+// explainers use check.explainHeading from the check package directly.
 func sectionHeading(host string, f engine.Finding) string {
 	loc := ""
 	if f.Port != 0 {

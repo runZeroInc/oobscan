@@ -61,6 +61,9 @@ func runDigiRealPortBanner(ctx context.Context, t *engine.Target) []engine.Findi
 	return out
 }
 
+// digiRealPortNoBannerFinding reports a RealPort listener whose lines all read
+// empty. The proof records the handshake that identified the device and the
+// line count it advertised, so the silent arm still ships the measurement.
 func digiRealPortNoBannerFinding(ri *digi.RealPortInfo) engine.Finding {
 	return engine.Finding{
 		Check:     "tcp.digi.realportBanner",
@@ -74,7 +77,8 @@ func digiRealPortNoBannerFinding(ri *digi.RealPortInfo) engine.Finding {
 			"baud", "0",
 			"realportName", strings.TrimSpace(ri.Name),
 			"realportPorts", strconv.Itoa(ri.PortCount),
-
+			// noBannerReason carries the machine-readable reason; the prose lives in
+			// the explainer rather than being repeated on every host.
 			"noBannerReason", "emptyRead",
 			"proof", proofKV(
 				"realportName", strings.TrimSpace(ri.Name),
@@ -86,6 +90,8 @@ func digiRealPortNoBannerFinding(ri *digi.RealPortInfo) engine.Finding {
 	}
 }
 
+// digiRealPortBannerFinding reports one serial line's capture, escalating from
+// info to medium on a readable banner and to high on a likely auth prompt.
 func digiRealPortBannerFinding(ri *digi.RealPortInfo, b digi.RealPortBanner) engine.Finding {
 	bannerClean := sanitizeBanner(b.Banner)
 	risk := "info"

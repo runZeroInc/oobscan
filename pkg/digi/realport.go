@@ -12,9 +12,13 @@ import (
 )
 
 const (
+	// RealPortPort is Digi RealPort cleartext mux port.
 	RealPortPort    = 771
 	RealPortTLSPort = 1027
-
+	// maxRealPortSerialPorts caps how many serial ports we will enumerate,
+	// regardless of the (wire-supplied) PortCount, so a device that over-reports
+	// cannot turn the scan into tens of thousands of per-port round-trips. The
+	// largest real Digi PortServer TS is 64-port.
 	maxRealPortSerialPorts = 64
 )
 
@@ -33,8 +37,13 @@ var realportBaudMap = map[int][2]byte{
 	921600: {0x00, 0x02},
 }
 
+// realportBaudOrder is the preferred trial order for baud-rate detection:
+// most common rates first, then less common ones. Each port is tried in this
+// order and scanning stops at the first baud that produces a readable banner.
 var realportBaudOrder = []int{9600, 115200, 38400, 19200, 57600, 2400, 76800, 230400, 460800, 921600}
 
+// RealPortInfo is the parsed RealPort service identity from the initial
+// handshake response.
 type RealPortInfo struct {
 	Port      int
 	TLS       bool
@@ -44,17 +53,21 @@ type RealPortInfo struct {
 	RawInfo   []byte
 }
 
+// RealPortBanner is captured serial data from one port/speed probe.
 type RealPortBanner struct {
 	SerialPort int
 	Baud       int
 	Banner     string
 }
 
+// RealPortScan contains the handshake info and any collected banners.
 type RealPortScan struct {
 	Info    *RealPortInfo
 	Banners []RealPortBanner
 }
 
+// ProbeRealPort connects to Digi RealPort and parses the product name and
+// exposed serial-port count from the handshake.
 func ProbeRealPort(host string, port int, useTLS bool, timeout time.Duration) (*RealPortInfo, error) {
 	c, err := dialRealPort(host, port, useTLS, timeout)
 	if err != nil {
@@ -68,6 +81,9 @@ func ProbeRealPort(host string, port int, useTLS bool, timeout time.Duration) (*
 	return readRealPortInfo(c, port, useTLS)
 }
 
+// ScanRealPortBanners performs the Metasploit-style serialport scan against a
+// Digi RealPort endpoint: connect, negotiate each serial port at each baud,
+// capture short banners, then close the port.
 func ScanRealPortBanners(host string, port int, useTLS bool, timeout, bannerTimeout time.Duration, serialPorts []int, baudRates []int, maxData int) (*RealPortScan, error) {
 	if maxData <= 0 {
 		maxData = 4096
@@ -91,7 +107,8 @@ func ScanRealPortBanners(host string, port int, useTLS bool, timeout, bannerTime
 			ports = append(ports, p)
 		}
 	}
-
+	// Build ordered baud candidate list: use the caller's list when provided,
+	// otherwise fall back to the standard order (most common rates first).
 	orderedBauds := realportBaudOrder
 	if len(baudRates) > 0 {
 		orderedBauds = baudRates
@@ -116,7 +133,7 @@ func ScanRealPortBanners(host string, port int, useTLS bool, timeout, bannerTime
 			_ = realportClose(c, idx)
 			if looksReadableBanner(banner) {
 				out.Banners = append(out.Banners, RealPortBanner{SerialPort: p, Baud: baud, Banner: banner})
-				break
+				break // correct baud found; no need to try others for this port
 			}
 		}
 	}
@@ -163,7 +180,11 @@ func readRealPortInfo(c net.Conn, port int, useTLS bool) (*RealPortInfo, error) 
 	if r.Name == "" {
 		r.Name = "Digi RealPort"
 	}
-
+	// PortCount is read straight off the wire (a uint16), so a hostile or
+	// broken device could advertise up to 65535 serial ports and drive the
+	// per-port enumeration loop into tens of thousands of round-trips against
+	// the target. Clamp to the largest real Digi appliance (64-port PortServer)
+	// so the scan stays polite regardless of what the device claims.
 	if r.PortCount < 0 {
 		r.PortCount = 0
 	}
@@ -238,6 +259,13 @@ func realportClose(c net.Conn, portIndex int) error {
 	return nil
 }
 
+// realportRecvBanner reads framed serial output from the open RealPort port. It
+// first reads any output the device emits on its own, and if nothing arrives it
+// sends a framed carriage-return/line-feed nudge and reads again.
+//
+// The nudge is written with realportSend so it carries the RealPort port byte
+// like the reference client's realport_send; writing a bare "\r\n" straight to
+// the socket is misread by the service as a command rather than serial input.
 func realportRecvBanner(c net.Conn, portIndex int, timeout time.Duration, maxData int) string {
 	if maxData <= 0 {
 		maxData = 4096
@@ -250,6 +278,18 @@ func realportRecvBanner(c net.Conn, portIndex int, timeout time.Duration, maxDat
 	return strings.TrimSpace(banner)
 }
 
+// realportCollect reads framed serial output for a single port. It mirrors the
+// reference RealPort client's realport_recv_banner state machine, where the
+// stream is a sequence of one-byte markers:
+//
+//	0xA0+port  followed by a 2-byte packet sequence number (discarded)
+//	0xF0       keep-alive frame (ignored)
+//	0x80+port  followed by a 1-byte length and that many serial data bytes
+//
+// Reading the exact framed structure (rather than scanning a TCP buffer for the
+// data marker) keeps the stream aligned so that data bytes which happen to equal
+// a marker value are not misinterpreted as a new frame header, and so that
+// frames spanning TCP segment boundaries are not dropped.
 func realportCollect(c net.Conn, portIndex int, timeout time.Duration, maxData int) string {
 	if c == nil {
 		return ""
@@ -270,10 +310,10 @@ func realportCollect(c net.Conn, portIndex int, timeout time.Duration, maxData i
 		}
 		switch head[0] {
 		case seqMarker:
-
+			// Packet sequence number: two bytes we can discard.
 			_, _ = realportReadN(c, 2, time.Second)
 		case 0xf0:
-
+			// Keep-alive frame, nothing to collect.
 		case dataMarker:
 			lenBuf, ok := realportReadN(c, 1, time.Second)
 			if !ok {
@@ -296,6 +336,9 @@ func realportCollect(c net.Conn, portIndex int, timeout time.Duration, maxData i
 	return string(banner)
 }
 
+// realportSend writes serial data to a port using the RealPort framing used by
+// the reference client's realport_send: the one-byte port index followed by the
+// raw data.
 func realportSend(c net.Conn, portIndex int, data []byte) {
 	if c == nil {
 		return
@@ -306,6 +349,9 @@ func realportSend(c net.Conn, portIndex int, data []byte) {
 	_, _ = c.Write(buf)
 }
 
+// realportReadN reads up to n bytes within the timeout, returning what it read
+// and whether at least one byte was received. Reading the exact number of
+// requested bytes keeps the framed stream aligned across TCP segment boundaries.
 func realportReadN(c net.Conn, n int, timeout time.Duration) ([]byte, bool) {
 	if c == nil || n <= 0 {
 		return nil, false
@@ -325,6 +371,14 @@ func realportReadN(c net.Conn, n int, timeout time.Duration) ([]byte, bool) {
 	return buf[:total], total > 0
 }
 
+// looksReadableBanner returns true when the banner shows evidence of a real device
+// on the serial port: at least one alphanumeric byte, and no single byte dominating
+// the total, which is what a baud-rate mismatch produces.
+//
+// A printable-ratio threshold must not be used instead: serial-attached devices often
+// speak binary framing with few printable bytes, and those are real findings.
+// Comparison is byte-level so unicode.IsPrint cannot treat the UTF-8 replacement
+// character as printable and mask non-ASCII framing bytes.
 func looksReadableBanner(banner string) bool {
 	banner = strings.TrimSpace(banner)
 	if banner == "" {
@@ -342,7 +396,10 @@ func looksReadableBanner(banner string) bool {
 	if alnum == 0 {
 		return false
 	}
-
+	// Reject monotone banners: baud-rate mismatch produces streams of one
+	// repeated byte (e.g. 0x77 'w' at every attempted speed). A threshold of
+	// 75% rejects the observed 80% pattern with headroom while staying well
+	// clear of real banners (P0 embedded in binary has max byte freq ~25%).
 	if len(raw) > 8 {
 		for _, cnt := range freq {
 			if float64(cnt)/float64(len(raw)) >= 0.75 {

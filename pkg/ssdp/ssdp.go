@@ -1,3 +1,6 @@
+// Package ssdp sends an SSDP M-SEARCH and parses Location / Server / USN
+// headers that identify BMCs, IP-KVMs, and PDUs. HPE iLO 5/6, Supermicro
+// ATEN, and some Avocent/Raritan devices advertise via SSDP on the mgmt LAN.
 package ssdp
 
 import (
@@ -8,6 +11,7 @@ import (
 	"time"
 )
 
+// Result is one device that answered M-SEARCH.
 type Result struct {
 	From     string
 	Location string
@@ -16,9 +20,16 @@ type Result struct {
 	ST       string
 	Headers  map[string]string
 	Raw      string
-	Vendor   string
+	Vendor   string // best-effort guess
 }
 
+// MSearch sends one M-SEARCH with the supplied search target. Typical STs:
+//
+//	"upnp:rootdevice"
+//	"urn:dmtf-org:service:redfish-rest:1"
+//	"urn:schemas-hp-com:service:iLO:1"
+//
+// Returns every reply seen within timeout.
 func MSearch(st string, timeout time.Duration) ([]Result, error) {
 	if st == "" {
 		st = "upnp:rootdevice"
@@ -62,6 +73,8 @@ func MSearch(st string, timeout time.Duration) ([]Result, error) {
 	return out, nil
 }
 
+// UnicastSearch queries one host directly on UDP/1900. Useful when multicast
+// is blocked on the scanner link but the target still speaks SSDP.
 func UnicastSearch(host string, st string, timeout time.Duration) (*Result, error) {
 	if st == "" {
 		st = "upnp:rootdevice"

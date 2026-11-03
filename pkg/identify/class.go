@@ -7,6 +7,9 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/oob"
 )
 
+// classForCategory translates an pkg/oob category into the runtime
+// DeviceClass the pipeline switches on. pkg/oob stays the single source of
+// truth for which product belongs to which class.
 func classForCategory(c oob.Category) engine.DeviceClass {
 	switch c {
 	case oob.CatBMC:
@@ -26,6 +29,9 @@ func classForCategory(c oob.Category) engine.DeviceClass {
 	}
 }
 
+// classForVendorProduct resolves a device class from a vendor slug and optional
+// product string by consulting the oob registry: an exact product match wins,
+// otherwise the vendor's first registered device supplies the class.
 func classForVendorProduct(vendor, product string) (engine.DeviceClass, bool) {
 	vendor = strings.ToLower(vendor)
 	if vendor == "" {

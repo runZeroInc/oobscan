@@ -8,13 +8,19 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Avocent DSView Access Protocol (adsap2d, TCP 3502). A reachable adsap2d
+// listener is the DSView management transport; its default nonsecure mode
+// accepts and logs presented credentials. This probe only fingerprints the
+// listener and captures the connect banner (read-only, no credential sent).
 func init() {
 	Register(Check{
 		Name:        "tcp.avocent.adsap",
 		Description: "Avocent DSView Access Protocol (adsap2d, TCP 3502) reachable; nonsecure by default",
 		Category:    "exposure",
 		Applies:     Applicability{CrossVendor: true},
-
+		// Disabled: reachability-only on 3502; fires on ACK-all/tarpit hosts that
+		// accept any TCP port (correlated with the redlion 1594 false positives).
+		// Re-enable after a distinctive adsap2d banner signature is pinned.
 		Enabled: false,
 		Run:     runAvocentADSAP,
 	})

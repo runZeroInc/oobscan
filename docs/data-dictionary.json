@@ -1,0 +1,1383 @@
+{
+  "schemaName": "oobscan scan NDJSON result",
+  "schemaVersion": "2026-07-06.camelCase-v3",
+  "recordFormat": "newline-delimited JSON; one JSON object per responsive scanned target or target error; non-responsive targets with no result evidence are omitted",
+  "keyPolicy": {
+    "case": "lowerCamelCase for all emitted object keys",
+    "legacyKeyPolicy": "snake_case, dotted, and abbreviated source keys are normalized at JSON serialization boundaries",
+    "canonicalTokenPolicy": "Delimited key tokens cred, fw, mfr, postauth, and preauth are normalized during lower-camel normalization to credential, firmwareVersion, manufacturer, postAuth, and preAuth. The creds abbreviation is preserved as Creds.",
+    "multiValueStringPolicy": "fields that compact multiple scalar values into one field use sorted, de-duplicated CSV with no spaces after commas",
+    "majorCollections": "arrays of objects remain arrays: findings, identity.signals, rakp, ipmiPostAuth.cipherMatrix, ipmiPostAuth.setPrivAttempts, ipmiPostAuth.users, and ipmiPostAuth.fru",
+    "dynamicObjectPolicy": "identity.attributes, finalIdentity.flags, ipmiPostAuth.lan, ipmiPostAuth.lan6, and findings[].fields are dynamic objects whose keys are canonicalized with the same lowerCamelCase policy"
+  },
+  "enums": {
+    "deviceClass": ["unknown", "bmc", "kvm", "serial", "pdu", "amt", "firmware", "honeypot"],
+    "confidence": ["high", "medium", "low"],
+    "risk": ["critical", "high", "medium", "low", "info", "none"],
+    "transport": ["tcp", "udp"],
+    "ipmiPostAuthFlowVersion": ["1.5", "2.0"],
+    "ipmiPostAuthFlowMode": ["cred", "authNone", "cipherZero"],
+    "redfishPostAuthMethod": ["defaultCreds", "providedCreds", "mtls"],
+    "redfishPostAuthVia": ["session", "basic", "mtls"]
+  },
+  "fields": [
+    {
+      "path": "host",
+      "type": "string",
+      "required": true,
+      "description": "Target host as supplied to the scan pipeline, usually an IP address or hostname.",
+      "examples": ["10.0.0.5", "bmc.example.net"]
+    },
+    {
+      "path": "timestamp",
+      "type": "integer",
+      "required": false,
+      "description": "Unix timestamp in nanoseconds when the target result was emitted.",
+      "examples": [1783366955491805000]
+    },
+    {
+      "path": "ports",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "Discovered open surface. Keys are port/transport pairs; values are sorted CSV protocol labels observed on that port.",
+      "examples": [{"443/tcp": "https,redfish", "623/udp": "ipmi"}],
+      "csvSortedValues": true
+    },
+    {
+      "path": "identity",
+      "type": "object",
+      "required": false,
+      "description": "Best identity from pre-check fingerprinting. Used to select applicable checks."
+    },
+    {
+      "path": "identity.class",
+      "type": "string enum: deviceClass",
+      "required": true,
+      "examples": ["bmc", "serial", "pdu"]
+    },
+    {
+      "path": "identity.vendor",
+      "type": "string",
+      "required": false,
+      "description": "Lowercase vendor slug.",
+      "examples": ["dell", "hpe", "supermicro", "lantronix"]
+    },
+    {
+      "path": "identity.product",
+      "type": "string",
+      "required": false,
+      "examples": ["iDRAC9", "iLO5", "MegaRAC", "NPort"]
+    },
+    {
+      "path": "identity.generation",
+      "type": "string",
+      "required": false,
+      "examples": ["iDRAC9", "X13+", "iLO 5"]
+    },
+    {
+      "path": "identity.confidence",
+      "type": "string enum: confidence",
+      "required": true,
+      "examples": ["high", "medium", "low"]
+    },
+    {
+      "path": "identity.signals",
+      "type": "array<object>",
+      "required": false,
+      "description": "Evidence signals used by identify.",
+      "examples": [[{"source": "redfish", "vendor": "dell", "detail": "iDRAC9"}]]
+    },
+    {
+      "path": "identity.signals[].source",
+      "type": "string",
+      "required": true,
+      "examples": ["ipmi.deviceId", "guid", "http.server", "redfish", "ilo", "idrac", "tls", "snmp"]
+    },
+    {
+      "path": "identity.signals[].vendor",
+      "type": "string",
+      "required": false,
+      "examples": ["dell", "ami", "lantronix"]
+    },
+    {
+      "path": "identity.signals[].detail",
+      "type": "string",
+      "required": false,
+      "examples": ["PowerEdge R760", "HP-iLO-5/2.44"]
+    },
+    {
+      "path": "identity.attributes",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "Additional identity attributes. Keys are normalized lowerCamelCase; values are strings. Known multi-value attributes such as wsmanSecurityProfiles use sorted CSV.",
+      "examples": [{"webScheme": "https", "webPort": "443", "idracFirmwareVersion": "7.00.00.00", "dellServiceTag": "ABC1234"}]
+    },
+    {
+      "path": "finalIdentity",
+      "type": "object",
+      "required": false,
+      "description": "Post-check aggregate identity and exposure summary. Present when finalization ran."
+    },
+    {
+      "path": "finalIdentity.class",
+      "type": "string enum: deviceClass",
+      "required": true,
+      "examples": ["bmc"]
+    },
+    {
+      "path": "finalIdentity.vendor",
+      "type": "string",
+      "required": false,
+      "examples": ["dell", "supermicro"]
+    },
+    {
+      "path": "finalIdentity.product",
+      "type": "string",
+      "required": false,
+      "examples": ["iDRAC9", "OpenBMC"]
+    },
+    {
+      "path": "finalIdentity.generation",
+      "type": "string",
+      "required": false,
+      "examples": ["iDRAC9/10", "X13+"]
+    },
+    {
+      "path": "finalIdentity.version",
+      "type": "string",
+      "required": false,
+      "description": "Firmware or software version selected from identity attributes.",
+      "examples": ["7.00.00.00", "2.55"]
+    },
+    {
+      "path": "finalIdentity.confidence",
+      "type": "string enum: confidence",
+      "required": true,
+      "examples": ["high"]
+    },
+    {
+      "path": "finalIdentity.flags",
+      "type": "object<string,string enum: risk>",
+      "required": false,
+      "description": "Derived exposure flags. Keys are camelCase flag names; values are the highest risk backing the flag.",
+      "examples": [{"defaultCreds": "critical", "rakpHash": "critical", "sharedKey": "high"}]
+    },
+    {
+      "path": "finalIdentity.findingCount",
+      "type": "integer",
+      "required": true,
+      "description": "Count of findings with risk >= info on the host.",
+      "examples": [4]
+    },
+    {
+      "path": "finalIdentity.topRisk",
+      "type": "string enum: risk",
+      "required": false,
+      "description": "Most severe risk observed on the host.",
+      "examples": ["critical", "high"]
+    },
+    {
+      "path": "findings",
+      "type": "array<object>",
+      "required": false,
+      "description": "Positive findings. Clean risk=none findings are aggregated into attemptedChecks instead of remaining here."
+    },
+    {
+      "path": "findings[].check",
+      "type": "string",
+      "required": true,
+      "description": "Stable finding/check identifier.",
+      "examples": ["ipmi.v20.rakpHash", "http.idrac.defaultCreds", "tls.sharedKey"]
+    },
+    {
+      "path": "findings[].timestamp",
+      "type": "integer",
+      "required": false,
+      "description": "Unix timestamp in nanoseconds for the finding.",
+      "examples": [1783366955491805000]
+    },
+    {
+      "path": "findings[].category",
+      "type": "string",
+      "required": false,
+      "examples": ["creds", "tls", "redfish", "rakp", "http"]
+    },
+    {
+      "path": "findings[].risk",
+      "type": "string enum: risk",
+      "required": true,
+      "examples": ["critical", "high", "info"]
+    },
+    {
+      "path": "findings[].address",
+      "type": "string",
+      "required": false,
+      "examples": ["10.0.0.5"]
+    },
+    {
+      "path": "findings[].port",
+      "type": "integer",
+      "required": false,
+      "examples": [443, 623, 22]
+    },
+    {
+      "path": "findings[].transport",
+      "type": "string enum: transport",
+      "required": false,
+      "examples": ["tcp", "udp"]
+    },
+    {
+      "path": "findings[].protocol",
+      "type": "string",
+      "required": false,
+      "examples": ["ipmi", "https", "redfish", "ssh", "vnc"]
+    },
+    {
+      "path": "findings[].fields",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "Check-specific details. Keys are normalized lowerCamelCase and values are strings. Known multi-value field values are sorted CSV.",
+      "examples": [{"username": "root", "password": "calvin", "evidenceEndpoint": "/redfish/v1/SessionService/Sessions"}]
+    },
+    {
+      "path": "findings[].cves",
+      "type": "string",
+      "required": false,
+      "description": "Sorted CSV of CVE identifiers associated with the finding.",
+      "examples": ["CVE-2013-4786", "CVE-2023-34329,CVE-2024-54085"],
+      "csvSortedValues": true
+    },
+    {
+      "path": "findings[].durationSeconds",
+      "type": "number",
+      "required": false,
+      "description": "Check duration in seconds when recorded.",
+      "examples": [0.42]
+    },
+    {
+      "path": "attemptedChecks",
+      "type": "string",
+      "required": false,
+      "description": "Sorted CSV of checks that ran and emitted only clean risk=none results.",
+      "examples": ["a.clean,z.clean", "http.idrac.defaultCreds,ipmi.v20.defaultCreds"],
+      "csvSortedValues": true
+    },
+    {
+      "path": "services",
+      "type": "array<object>",
+      "required": false,
+      "description": "Per-service raw attribute bags. Preserves the crypto material and runZero-vocabulary service data a consumer needs to re-score exposure without re-probing."
+    },
+    {
+      "path": "services[].port",
+      "type": "integer",
+      "required": false,
+      "description": "Port the service was observed on."
+    },
+    {
+      "path": "services[].transport",
+      "type": "string",
+      "required": false,
+      "description": "Transport the service was observed on.",
+      "examples": ["tcp", "udp"]
+    },
+    {
+      "path": "services[].protocols",
+      "type": "array<string>",
+      "required": false,
+      "description": "Sorted protocol labels observed on the service.",
+      "examples": [["http", "tls"]]
+    },
+    {
+      "path": "services[].summary",
+      "type": "string",
+      "required": false,
+      "description": "Service summary line. Never set by a live scan; carried through by oobscan convert from a runZero export.",
+      "examples": ["HTTPS"]
+    },
+    {
+      "path": "services[].vhost",
+      "type": "string",
+      "required": false,
+      "description": "Virtual host the service answered for. Convert-only, as with services[].summary."
+    },
+    {
+      "path": "services[].address",
+      "type": "string",
+      "required": false,
+      "description": "Address the service was observed on when it differs from the record host. Convert-only, as with services[].summary."
+    },
+    {
+      "path": "services[].attributes",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "runZero-vocabulary attribute bag for the service (tls.*, ssh.*, http.*, ipmi.*, fp.*), most importantly the badkeys hashes tls.fp.bkhash and ssh.hostKey.bkhash."
+    },
+    {
+      "path": "attributes",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "Host-level attributes: resolved class/vendor/product/version plus any captured identity attributes. oobscan convert additionally carries a source asset's own columns and attribute bag through here."
+    },
+    {
+      "path": "ilo",
+      "type": "object",
+      "required": false,
+      "description": "Pre-auth HPE iLO /xmldata?item=all RIMP document, verbatim. Emitted whenever the iLO probe parsed a populated doc. Previously evidence-only, so MP.PN/MP.ST never reached the output."
+    },
+    {
+      "path": "ilo.hsi.serverModel",
+      "type": "string",
+      "required": false,
+      "description": "Host system product name. The only pre-auth source of the server model on iLOs that do not expose Redfish.",
+      "examples": ["ProLiant DL360 Gen10"]
+    },
+    {
+      "path": "ilo.hsi.productId",
+      "type": "string",
+      "required": false,
+      "description": "HPE product part number.",
+      "examples": ["867959-B21"]
+    },
+    {
+      "path": "ilo.hsi.chassisSerial",
+      "type": "string",
+      "required": false,
+      "description": "Chassis serial number (HSI/SBSN).",
+      "examples": ["CZ3816YC8E"]
+    },
+    {
+      "path": "ilo.hsi.uuid",
+      "type": "string",
+      "required": false,
+      "description": "iLO chassis UUID. Distinct from the Redfish Manager UUID in identity.attributes.redfishUuid.",
+      "examples": ["ILO868703CZ3816YC8E"]
+    },
+    {
+      "path": "ilo.hsi.chassisUuid",
+      "type": "string",
+      "required": false,
+      "description": "Chassis cUUID when present."
+    },
+    {
+      "path": "ilo.hsi.nics.nic",
+      "type": "array<object>",
+      "required": false,
+      "description": "Pre-auth per-port NIC inventory (port, description, location, macAddress, ipAddress, status). Unauthenticated host/iLO MAC and configured IP disclosure."
+    },
+    {
+      "path": "ilo.mp.product",
+      "type": "string",
+      "required": false,
+      "description": "Management processor product string (MP/PN). One of the two inputs to iLO generation resolution.",
+      "examples": ["Integrated Lights-Out 5"]
+    },
+    {
+      "path": "ilo.mp.family",
+      "type": "string",
+      "required": false,
+      "description": "Management processor family code (MP/ST): 5=iLO2, 6=iLO3, 7=iLO4, 8=iLO5, 9=iLO6. The second input to generation resolution; serialized so a fall-through to a bare \"iLO\" is diagnosable without a re-scan.",
+      "examples": ["8"]
+    },
+    {
+      "path": "ilo.mp.firmwareVersion",
+      "type": "string",
+      "required": false,
+      "description": "iLO firmware version (MP/FWRI).",
+      "examples": ["2.82"]
+    },
+    {
+      "path": "ilo.mp.hardwareRevision",
+      "type": "string",
+      "required": false,
+      "description": "iLO hardware revision (MP/HWRI)."
+    },
+    {
+      "path": "ilo.mp.serial",
+      "type": "string",
+      "required": false,
+      "description": "iLO serial number (MP/SN).",
+      "examples": ["ILOCZ3816YC8E"]
+    },
+    {
+      "path": "ilo.mp.uuid",
+      "type": "string",
+      "required": false,
+      "description": "Management processor UUID (MP/UUID)."
+    },
+    {
+      "path": "ilo.mp.sso",
+      "type": "string",
+      "required": false,
+      "description": "Single sign-on state (MP/SSO)."
+    },
+    {
+      "path": "ilo.mp.locfgUrl",
+      "type": "string",
+      "required": false,
+      "description": "Advertised locfg.pl scripting endpoint (MP/LOCFG)."
+    },
+    {
+      "path": "ilo.bladeSystem.bay",
+      "type": "string",
+      "required": false,
+      "description": "Enclosure bay number for blade-housed iLOs."
+    },
+    {
+      "path": "ilo.bladeSystem.enclosure.rack",
+      "type": "string",
+      "required": false,
+      "description": "Enclosure rack name."
+    },
+    {
+      "path": "ilo.bladeSystem.enclosure.serial",
+      "type": "string",
+      "required": false,
+      "description": "Enclosure serial number."
+    },
+    {
+      "path": "rakp",
+      "type": "array<object>",
+      "required": false,
+      "description": "Raw RAKP-2 material for offline cracking. Emitted when IPMI auth evidence exists."
+    },
+    {
+      "path": "rakp[].username",
+      "type": "string",
+      "required": true,
+      "examples": ["root", "ADMIN", ""]
+    },
+    {
+      "path": "rakp[].authAlgo",
+      "type": "integer",
+      "required": true,
+      "description": "IPMI RAKP auth algorithm number: 1=HMAC-SHA1, 2=HMAC-MD5, 3=HMAC-SHA256.",
+      "examples": [1, 2, 3]
+    },
+    {
+      "path": "rakp[].clientSid",
+      "type": "integer",
+      "required": true,
+      "examples": [1871346752]
+    },
+    {
+      "path": "rakp[].bmcSid",
+      "type": "integer",
+      "required": true,
+      "examples": [1363683967]
+    },
+    {
+      "path": "rakp[].clientRand",
+      "type": "string hex",
+      "required": true,
+      "examples": ["31313233343536373839616263646565"]
+    },
+    {
+      "path": "rakp[].bmcRand",
+      "type": "string hex",
+      "required": true,
+      "examples": ["65656463626139383736353433323131"]
+    },
+    {
+      "path": "rakp[].bmcGuid",
+      "type": "string hex",
+      "required": true,
+      "examples": ["00112233445566778899aabbccddeeff"]
+    },
+    {
+      "path": "rakp[].rakpHash",
+      "type": "string hex",
+      "required": true,
+      "examples": ["9f1d2a3b4c5d6e7f00112233445566778899aabb"]
+    },
+    {
+      "path": "rakp[].hashcat",
+      "type": "string",
+      "required": false,
+      "description": "Ready-to-crack hashcat -m 7300 line for HMAC-SHA1 RAKP hashes.",
+      "examples": ["313233...:9f1d..."]
+    },
+    {
+      "path": "rakp[].cracked",
+      "type": "string",
+      "required": false,
+      "description": "Recovered password when offline cracking succeeded during scan.",
+      "examples": ["calvin"]
+    },
+    {
+      "path": "rakp[].redacted",
+      "type": "boolean",
+      "required": false,
+      "description": "The source withheld this row's salt and HMAC rather than never capturing them. Set only by oobscan convert on a runZero export; a live scan leaves it unset.",
+      "examples": [true]
+    },
+    {
+      "path": "ipmiPostAuth",
+      "type": "object",
+      "required": false,
+      "description": "Authenticated IPMI inventory captured after a valid default credential, authNone, or cipherZero flow."
+    },
+    {
+      "path": "ipmiPostAuth.flow",
+      "type": "object",
+      "required": true,
+      "description": "Authentication path used for the IPMI post-auth inventory."
+    },
+    {
+      "path": "ipmiPostAuth.flow.version",
+      "type": "string enum: ipmiPostAuthFlowVersion",
+      "required": true,
+      "examples": ["1.5", "2.0"]
+    },
+    {
+      "path": "ipmiPostAuth.flow.mode",
+      "type": "string enum: ipmiPostAuthFlowMode",
+      "required": true,
+      "examples": ["cred", "authNone", "cipherZero"]
+    },
+    {
+      "path": "ipmiPostAuth.flow.username",
+      "type": "string",
+      "required": false,
+      "examples": ["root", "ADMIN"]
+    },
+    {
+      "path": "ipmiPostAuth.flow.password",
+      "type": "string",
+      "required": false,
+      "examples": ["calvin", "admin"]
+    },
+    {
+      "path": "ipmiPostAuth.flow.authType",
+      "type": "integer",
+      "required": false,
+      "description": "IPMI 1.5 auth type byte.",
+      "examples": [0, 2]
+    },
+    {
+      "path": "ipmiPostAuth.flow.suite",
+      "type": "object",
+      "required": false,
+      "description": "IPMI 2.0 cipher-suite algorithm triple."
+    },
+    {
+      "path": "ipmiPostAuth.flow.suite.suite",
+      "type": "integer",
+      "required": true,
+      "examples": [0, 3, 17]
+    },
+    {
+      "path": "ipmiPostAuth.flow.suite.auth",
+      "type": "integer",
+      "required": true,
+      "examples": [0, 1, 2, 3]
+    },
+    {
+      "path": "ipmiPostAuth.flow.suite.integrity",
+      "type": "integer",
+      "required": true,
+      "examples": [0, 1, 4]
+    },
+    {
+      "path": "ipmiPostAuth.flow.suite.conf",
+      "type": "integer",
+      "required": true,
+      "description": "IPMI confidentiality algorithm byte.",
+      "examples": [0, 1]
+    },
+    {
+      "path": "ipmiPostAuth.flow.source",
+      "type": "string",
+      "required": false,
+      "examples": ["ipmi.auth.defaultCreds", "ipmi.v15.authNone", "ipmi.auth.cipherZero"]
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix",
+      "type": "array<object>",
+      "required": false,
+      "description": "Results from probing post-auth RMCP+ cipher suites."
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix[].suite",
+      "type": "integer",
+      "required": true,
+      "examples": [1, 3, 17]
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix[].auth",
+      "type": "integer",
+      "required": true,
+      "examples": [1, 2, 3]
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix[].integrity",
+      "type": "integer",
+      "required": true,
+      "examples": [0, 1, 4]
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix[].conf",
+      "type": "integer",
+      "required": true,
+      "examples": [0, 1]
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix[].success",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.cipherMatrix[].error",
+      "type": "string",
+      "required": false,
+      "examples": ["timeout", "completion code 0x81"]
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts",
+      "type": "array<object>",
+      "required": false,
+      "description": "Observed Set Session Privilege Level probe outcomes from the authenticated IPMI 2.0 session."
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts[].requested",
+      "type": "integer",
+      "required": true,
+      "description": "Requested IPMI privilege level byte.",
+      "examples": [1, 2, 3, 4]
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts[].name",
+      "type": "string",
+      "required": false,
+      "examples": ["callback", "user", "operator", "administrator"]
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts[].success",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts[].cc",
+      "type": "integer",
+      "required": false,
+      "description": "IPMI completion code returned by the privilege request.",
+      "examples": [0, 129]
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts[].granted",
+      "type": "integer",
+      "required": false,
+      "description": "Granted privilege level byte when the BMC returned one.",
+      "examples": [2, 4]
+    },
+    {
+      "path": "ipmiPostAuth.setPrivAttempts[].error",
+      "type": "string",
+      "required": false,
+      "examples": ["timeout", "completion code 0x81"]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo",
+      "type": "object",
+      "required": false,
+      "description": "Parsed IPMI Get Device ID data."
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.deviceId",
+      "type": "integer",
+      "required": true,
+      "examples": [32]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.deviceRevision",
+      "type": "integer",
+      "required": true,
+      "examples": [1]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.firmwareVersion",
+      "type": "string",
+      "required": true,
+      "examples": ["2.14", "7.00"]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.ipmiVersion",
+      "type": "string",
+      "required": true,
+      "examples": ["2.0", "1.5"]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.manufacturerId",
+      "type": "integer",
+      "required": true,
+      "examples": [674]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.manufacturerName",
+      "type": "string",
+      "required": false,
+      "examples": ["Dell", "Supermicro"]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.productId",
+      "type": "integer",
+      "required": true,
+      "examples": [256]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.auxFirmwareHex",
+      "type": "string hex",
+      "required": false,
+      "examples": ["00000000"]
+    },
+    {
+      "path": "ipmiPostAuth.mcInfo.additionalSupport",
+      "type": "integer",
+      "required": true,
+      "examples": [143]
+    },
+    {
+      "path": "ipmiPostAuth.chassis",
+      "type": "object",
+      "required": false,
+      "description": "Parsed chassis status."
+    },
+    {
+      "path": "ipmiPostAuth.chassis.powerOn",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.powerOverload",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.powerInterlock",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.mainPowerFault",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.powerControlFault",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.powerRestorePolicy",
+      "type": "string",
+      "required": false,
+      "examples": ["always-off", "restore"]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.lastPowerEvent",
+      "type": "string",
+      "required": false,
+      "examples": ["ac-failed", "power-overload"]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.identifyOn",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.coolingFault",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.driveFault",
+      "type": "boolean",
+      "required": true,
+      "examples": [false]
+    },
+    {
+      "path": "ipmiPostAuth.chassis.raw",
+      "type": "string hex",
+      "required": false,
+      "examples": ["01000000"]
+    },
+    {
+      "path": "ipmiPostAuth.users",
+      "type": "array<object>",
+      "required": false,
+      "description": "Compact user-slot inventory."
+    },
+    {
+      "path": "ipmiPostAuth.users[].id",
+      "type": "integer",
+      "required": true,
+      "examples": [1, 2]
+    },
+    {
+      "path": "ipmiPostAuth.users[].name",
+      "type": "string",
+      "required": false,
+      "examples": ["root", "ADMIN"]
+    },
+    {
+      "path": "ipmiPostAuth.users[].priv",
+      "type": "string",
+      "required": true,
+      "examples": ["administrator", "operator", "user", "no-access"]
+    },
+    {
+      "path": "ipmiPostAuth.users[].enabled",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.users[].linkAuth",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.users[].ipmiAuth",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.users[].callin",
+      "type": "boolean",
+      "required": true,
+      "examples": [true, false]
+    },
+    {
+      "path": "ipmiPostAuth.users[].raw",
+      "type": "string hex",
+      "required": false,
+      "examples": ["02041400"]
+    },
+    {
+      "path": "ipmiPostAuth.lan",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "IPv4 LAN channel parameters. Keys are normalized lowerCamelCase.",
+      "examples": [{"ipAddress": "192.0.2.10", "mac": "00:11:22:33:44:55", "communityString": "public", "vlanId": "disabled"}]
+    },
+    {
+      "path": "ipmiPostAuth.lan6",
+      "type": "object<string,string>",
+      "required": false,
+      "description": "IPv6 LAN channel parameters. Keys are normalized lowerCamelCase.",
+      "examples": [{"ipv6Support": "enabled", "ipv6HeaderStaticHopLimit": "64"}]
+    },
+    {
+      "path": "ipmiPostAuth.fru",
+      "type": "array<object>",
+      "required": false,
+      "description": "Decoded FRU string fields."
+    },
+    {
+      "path": "ipmiPostAuth.fru[].area",
+      "type": "string",
+      "required": true,
+      "examples": ["board", "product", "chassis"]
+    },
+    {
+      "path": "ipmiPostAuth.fru[].index",
+      "type": "integer",
+      "required": true,
+      "examples": [0, 1, 2]
+    },
+    {
+      "path": "ipmiPostAuth.fru[].value",
+      "type": "string",
+      "required": true,
+      "examples": ["PowerEdge R760", "Dell Inc."]
+    },
+    {
+      "path": "redfishPostAuth",
+      "type": "object",
+      "required": false,
+      "description": "Authenticated Redfish inventory captured after a valid credential, provided credential, or mTLS path."
+    },
+    {
+      "path": "redfishPostAuth.method",
+      "type": "string enum: redfishPostAuthMethod",
+      "required": false,
+      "examples": ["defaultCreds", "providedCreds", "mtls"]
+    },
+    {
+      "path": "redfishPostAuth.via",
+      "type": "string enum: redfishPostAuthVia",
+      "required": false,
+      "examples": ["session", "basic", "mtls"]
+    },
+    {
+      "path": "redfishPostAuth.username",
+      "type": "string",
+      "required": false,
+      "examples": ["root", "Administrator"]
+    },
+    {
+      "path": "redfishPostAuth.source",
+      "type": "string",
+      "required": false,
+      "examples": ["cli", "vendor-default", "mtls"]
+    },
+    {
+      "path": "redfishPostAuth.info",
+      "type": "object",
+      "required": false,
+      "description": "Authenticated Redfish system/manager/service-root inventory."
+    },
+    {
+      "path": "redfishPostAuth.info.vendor",
+      "type": "string",
+      "required": false,
+      "examples": ["Dell", "OpenBMC"]
+    },
+    {
+      "path": "redfishPostAuth.info.model",
+      "type": "string",
+      "required": false,
+      "examples": ["PowerEdge R760", "X470D4U"]
+    },
+    {
+      "path": "redfishPostAuth.info.firmwareVersion",
+      "type": "string",
+      "required": false,
+      "examples": ["7.00.00.00", "2.14.0"]
+    },
+    {
+      "path": "redfishPostAuth.info.product",
+      "type": "string",
+      "required": false,
+      "examples": ["iDRAC", "OpenBMC"]
+    },
+    {
+      "path": "redfishPostAuth.info.serialNumber",
+      "type": "string",
+      "required": false,
+      "examples": ["ABC1234"]
+    },
+    {
+      "path": "redfishPostAuth.info.redfishVersion",
+      "type": "string",
+      "required": false,
+      "examples": ["1.6.0"]
+    },
+    {
+      "path": "redfishPostAuth.info.serviceUuid",
+      "type": "string UUID",
+      "required": false,
+      "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+    },
+    {
+      "path": "redfishPostAuth.info.managerId",
+      "type": "string",
+      "required": false,
+      "examples": ["iDRAC.Embedded.1", "bmc"]
+    },
+    {
+      "path": "redfishPostAuth.info.systemId",
+      "type": "string",
+      "required": false,
+      "examples": ["System.Embedded.1", "system"]
+    },
+    {
+      "path": "redfishPostAuth.info.biosVersion",
+      "type": "string",
+      "required": false,
+      "examples": ["1.8.2"]
+    },
+    {
+      "path": "redfishPostAuth.info.powerState",
+      "type": "string",
+      "required": false,
+      "examples": ["On", "Off"]
+    },
+    {
+      "path": "redfishPostAuth.info.accountRole",
+      "type": "string",
+      "required": false,
+      "examples": ["Administrator", "ReadOnly"]
+    },
+    {
+      "path": "redfishPostAuth.info.accountEnabled",
+      "type": "string boolean",
+      "required": false,
+      "examples": ["true", "false"]
+    },
+    {
+      "path": "error",
+      "type": "string",
+      "required": false,
+      "description": "Target-level scan error.",
+      "examples": ["context deadline exceeded"]
+    }
+  ],
+  "knownDynamicKeys": {
+    "identity.attributes": [
+      {"sourceKey": "ipmi.fw", "emittedKey": "ipmiFirmwareVersion", "type": "string", "examples": ["2.14"]},
+      {"sourceKey": "guid.family", "emittedKey": "guidFamily", "type": "string", "examples": ["dell-service-tag"]},
+      {"sourceKey": "web.port", "emittedKey": "webPort", "type": "string integer", "examples": ["443"]},
+      {"sourceKey": "web.scheme", "emittedKey": "webScheme", "type": "string", "examples": ["https", "http"]},
+      {"sourceKey": "http.server", "emittedKey": "httpServer", "type": "string", "examples": ["Apache", "HP-iLO-5/2.44"]},
+      {"sourceKey": "http.title", "emittedKey": "httpTitle", "type": "string", "examples": ["Integrated Dell Remote Access Controller"]},
+      {"sourceKey": "http.apc_nmc", "emittedKey": "httpApcNmc", "type": "string", "examples": ["webserver-header/nmc-path"]},
+      {"sourceKey": "redfish.version", "emittedKey": "redfishVersion", "type": "string", "examples": ["1.6.0"]},
+      {"sourceKey": "redfish.uuid", "emittedKey": "redfishUuid", "type": "string UUID", "examples": ["550e8400-e29b-41d4-a716-446655440000"]},
+      {"sourceKey": "redfish.vendor", "emittedKey": "redfishVendor", "type": "string", "examples": ["Dell"]},
+      {"sourceKey": "redfish.product", "emittedKey": "redfishProduct", "type": "string", "examples": ["iDRAC"]},
+      {"sourceKey": "redfish.fw", "emittedKey": "redfishFirmwareVersion", "type": "string", "examples": ["2.14.0"]},
+      {"sourceKey": "redfish.ami_cve_2024_54085", "emittedKey": "redfishAmiCve202454085", "type": "string", "examples": ["candidate"]},
+      {"sourceKey": "idrac.fw", "emittedKey": "idracFirmwareVersion", "type": "string", "examples": ["7.00.00.00"]},
+      {"sourceKey": "idrac.version", "emittedKey": "idracVersion", "type": "string", "examples": ["iDRAC9"]},
+      {"sourceKey": "idrac.hostname", "emittedKey": "idracHostname", "type": "string", "examples": ["idrac-r760"]},
+      {"sourceKey": "idrac.oem.hostname", "emittedKey": "idracOemHostname", "type": "string", "examples": ["idrac"]},
+      {"sourceKey": "idrac.sysDesc", "emittedKey": "idracSysDesc", "type": "string", "examples": ["Integrated Dell Remote Access Controller"]},
+      {"sourceKey": "idrac.status", "emittedKey": "idracStatus", "type": "string", "examples": ["Ready"]},
+      {"sourceKey": "idrac.gui.titleBar", "emittedKey": "idracGuiTitleBar", "type": "string", "examples": ["iDRAC"]},
+      {"sourceKey": "idrac.adEnabled", "emittedKey": "idracAdEnabled", "type": "string", "examples": ["Enabled", "Disabled"]},
+      {"sourceKey": "idrac.isOemBranded", "emittedKey": "idracIsOemBranded", "type": "string boolean", "examples": ["false"]},
+      {"sourceKey": "idrac.license", "emittedKey": "idracLicense", "type": "string", "examples": ["Enterprise"]},
+      {"sourceKey": "idrac.ssoEnabled", "emittedKey": "idracSsoEnabled", "type": "string", "examples": ["Disabled"]},
+      {"sourceKey": "idrac.serverGen", "emittedKey": "idracServerGen", "type": "string", "examples": ["16G"]},
+      {"sourceKey": "idrac.systemLockdown", "emittedKey": "idracSystemLockdown", "type": "string", "examples": ["Disabled"]},
+      {"sourceKey": "idrac.systemModelName", "emittedKey": "idracSystemModelName", "type": "string", "examples": ["PowerEdge R760"]},
+      {"sourceKey": "idrac.tfaEnabled", "emittedKey": "idracTfaEnabled", "type": "string", "examples": ["Disabled"]},
+      {"sourceKey": "idrac.name", "emittedKey": "idracName", "type": "string", "examples": ["idrac-r760"]},
+      {"sourceKey": "dell.service_tag", "emittedKey": "dellServiceTag", "type": "string", "examples": ["ABC1234"]},
+      {"sourceKey": "ilo.fw", "emittedKey": "iloFirmwareVersion", "type": "string", "examples": ["iLO 5 v3.10"]},
+      {"sourceKey": "ilo.serial", "emittedKey": "iloSerial", "type": "string", "examples": ["ABC1234"]},
+      {"sourceKey": "ilo.model", "emittedKey": "iloModel", "type": "string", "examples": ["ProLiant DL360 Gen10"]},
+      {"sourceKey": "ilo.productId", "emittedKey": "iloProductId", "type": "string", "examples": ["867959-B21"]},
+      {"sourceKey": "ilo.uuid", "emittedKey": "iloUuid", "type": "string", "examples": ["ILO868703CZ3816YC8E"]},
+      {"sourceKey": "ilo.mpProduct", "emittedKey": "iloMpProduct", "type": "string", "examples": ["Integrated Lights-Out 5"]},
+      {"sourceKey": "ilo.mpFamily", "emittedKey": "iloMpFamily", "type": "string", "examples": ["8"]},
+      {"sourceKey": "wsman.vendor", "emittedKey": "wsmanVendor", "type": "string", "examples": ["Intel"]},
+      {"sourceKey": "wsman.product", "emittedKey": "wsmanProduct", "type": "string", "examples": ["Intel AMT"]},
+      {"sourceKey": "wsman.protocol_version", "emittedKey": "wsmanProtocolVersion", "type": "string", "examples": ["2.0"]},
+      {"sourceKey": "wsman.security_profiles", "emittedKey": "wsmanSecurityProfiles", "type": "string sorted CSV", "examples": ["Digest,TLS"]},
+      {"sourceKey": "wsman.url", "emittedKey": "wsmanUrl", "type": "string URL", "examples": ["http://10.0.0.5:16992/wsman"]},
+      {"sourceKey": "mac", "emittedKey": "mac", "type": "string MAC address", "examples": ["00:11:22:33:44:55"]},
+      {"sourceKey": "lantronix.setup_telnet", "emittedKey": "lantronixSetupTelnet", "type": "string", "examples": ["Lantronix Setup Mode"]},
+      {"sourceKey": "moxa.model", "emittedKey": "moxaModel", "type": "string", "examples": ["NPort 5150"]},
+      {"sourceKey": "moxa.firmware", "emittedKey": "moxaFirmwareVersion", "type": "string", "examples": ["1.7"]},
+      {"sourceKey": "moxa.ip", "emittedKey": "moxaIp", "type": "string IP address", "examples": ["192.0.2.50"]},
+      {"sourceKey": "moxa.serial_ports", "emittedKey": "moxaSerialPorts", "type": "string integer", "examples": ["16"]},
+      {"sourceKey": "moxa.serial", "emittedKey": "moxaSerial", "type": "string", "examples": ["123456"]},
+      {"sourceKey": "digi.hostname", "emittedKey": "digiHostname", "type": "string", "examples": ["digi-01"]},
+      {"sourceKey": "digi.realport_port", "emittedKey": "digiRealportPort", "type": "string integer", "examples": ["771"]},
+      {"sourceKey": "digi.serial_ports", "emittedKey": "digiSerialPorts", "type": "string integer", "examples": ["32"]},
+      {"sourceKey": "digi.realport_name", "emittedKey": "digiRealportName", "type": "string", "examples": ["RealPort"]},
+      {"sourceKey": "digi.realport_ports", "emittedKey": "digiRealportPorts", "type": "string integer", "examples": ["16"]},
+      {"sourceKey": "digi.realport_tls", "emittedKey": "digiRealportTls", "type": "string boolean", "examples": ["true"]},
+      {"sourceKey": "snmp.engine_id", "emittedKey": "snmpEngineId", "type": "string hex", "examples": ["80001f8880"]},
+      {"sourceKey": "honeypot", "emittedKey": "honeypot", "type": "string", "examples": ["decoy signature"]}
+    ],
+    "finalIdentity.flags": [
+      {"sourceKey": "rakpHash", "emittedKey": "rakpHash", "valueType": "risk"},
+      {"sourceKey": "defaultCreds", "emittedKey": "defaultCreds", "valueType": "risk"},
+      {"sourceKey": "cipherZero", "emittedKey": "cipherZero", "valueType": "risk"},
+      {"sourceKey": "sharedKey", "emittedKey": "sharedKey", "valueType": "risk"},
+      {"sourceKey": "defaultCert", "emittedKey": "defaultCert", "valueType": "risk"},
+      {"sourceKey": "authNone", "emittedKey": "authNone", "valueType": "risk"},
+      {"sourceKey": "kvm", "emittedKey": "kvm", "valueType": "risk"},
+      {"sourceKey": "vmedia", "emittedKey": "vmedia", "valueType": "risk"},
+      {"sourceKey": "authBypass", "emittedKey": "authBypass", "valueType": "risk"}
+    ],
+    "findings[].fields": [
+      {"key": "username", "type": "string", "examples": ["root", "admin"]},
+      {"key": "password", "type": "string", "examples": ["calvin", "admin"]},
+      {"key": "defaultUsername", "type": "string", "examples": ["admin"]},
+      {"key": "defaultPassword", "type": "string", "examples": ["password"]},
+      {"key": "defaultCreds", "type": "string sorted CSV", "examples": ["admin:admin,root:calvin"], "csvSortedValues": true},
+      {"key": "defaultCredential", "type": "string boolean", "examples": ["true"]},
+      {"key": "profile", "type": "string", "examples": ["APC demo"]},
+      {"key": "via", "type": "string", "examples": ["default", "redfish.session:443", "ssh.password(root:calvin)"]},
+      {"key": "loginVia", "type": "string", "examples": ["session", "basic", "http.form"]},
+      {"key": "source", "type": "string", "examples": ["cli", "vendor-default"]},
+      {"key": "proof", "type": "string", "examples": ["sessionAuthenticated=true status=201"]},
+      {"key": "evidence", "type": "string", "examples": ["pre-auth response marker"]},
+      {"key": "evidenceEndpoint", "type": "string", "examples": ["/data?get=defaultCred_inplace"]},
+      {"key": "result", "type": "string", "examples": ["default_cred_replaced"]},
+      {"key": "url", "type": "string URL or path", "examples": ["https://10.0.0.5/redfish/v1/", "/login.html"]},
+      {"key": "method", "type": "string", "examples": ["GET", "POST", "HEAD"]},
+      {"key": "httpStatus", "type": "string integer", "examples": ["200", "401"]},
+      {"key": "status", "type": "string integer", "examples": ["200"]},
+      {"key": "path", "type": "string", "examples": ["/index.html"]},
+      {"key": "endpoint", "type": "string", "examples": ["https:443/cgi-bin/jsonSrvr.lua"]},
+      {"key": "response", "type": "string", "examples": ["{...}", "<html>..."]},
+      {"key": "raw", "type": "string hex or raw string", "examples": ["01020304"]},
+      {"key": "output", "type": "string", "examples": ["command output"]},
+      {"key": "banner", "type": "string", "examples": ["OpenSSH_8.4", "Lantronix"]},
+      {"key": "hash", "type": "string", "examples": ["deadbeef:cafebabe"]},
+      {"key": "hashAlgo", "type": "string", "examples": ["hmac-sha1", "hmac-md5", "hmac-sha256"]},
+      {"key": "authAlgo", "type": "string or integer", "examples": ["none", "hmac-sha1", "1"]},
+      {"key": "integrityAlgo", "type": "string", "examples": ["none", "hmac-sha1-96"]},
+      {"key": "confAlgo", "type": "string", "examples": ["none", "aes-cbc-128"]},
+      {"key": "hashcatMode", "type": "string integer", "examples": ["7300"]},
+      {"key": "crackableZeroRand", "type": "string boolean", "examples": ["true"]},
+      {"key": "cracked", "type": "string", "examples": ["calvin"]},
+      {"key": "commonName", "type": "string", "examples": ["iDRAC"]},
+      {"key": "subject", "type": "string", "examples": ["CN=iDRAC"]},
+      {"key": "serialNumber", "type": "string", "examples": ["ABC1234"]},
+      {"key": "sha256", "type": "string hex", "examples": ["012345..."]},
+      {"key": "spki", "type": "string hex", "examples": ["abcdef..."]},
+      {"key": "key", "type": "string", "examples": ["AMI MegaRAC shipped key"]},
+      {"key": "kind", "type": "string", "examples": ["shipped-cert", "shared-private-key-spki"]},
+      {"key": "vendors", "type": "string sorted CSV", "examples": ["ami,asrockrack,supermicro"], "csvSortedValues": true},
+      {"key": "vendor", "type": "string", "examples": ["dell", "ami"]},
+      {"key": "product", "type": "string", "examples": ["iDRAC9", "MegaRAC"]},
+      {"key": "model", "type": "string", "examples": ["PowerEdge R760", "OM2224-24E"]},
+      {"key": "manufacturer", "type": "string", "examples": ["Dell Inc."]},
+      {"key": "firmwareVersion", "type": "string", "examples": ["7.00.00.00", "2.14.0"]},
+      {"key": "version", "type": "string", "examples": ["1.2.3"]},
+      {"key": "versionSource", "type": "string", "examples": ["http.server", "wsman.product"]},
+      {"key": "detectionSource", "type": "string", "examples": ["http_server", "http_body"]},
+      {"key": "redfishVersion", "type": "string", "examples": ["1.6.0"]},
+      {"key": "odataVersion", "type": "string", "examples": ["4.0"]},
+      {"key": "sdk", "type": "string", "examples": ["GoAhead"]},
+      {"key": "server", "type": "string", "examples": ["Apache", "Appweb"]},
+      {"key": "title", "type": "string", "examples": ["iDRAC Login"]},
+      {"key": "favicon", "type": "string hex MD5", "examples": ["d41d8cd98f00b204e9800998ecf8427e"]},
+      {"key": "faviconMmh3", "type": "string integer", "examples": ["1428702434"]},
+      {"key": "faviconVendor", "type": "string", "examples": ["dell"]},
+      {"key": "faviconProduct", "type": "string", "examples": ["iDRAC"]},
+      {"key": "license", "type": "string", "examples": ["Enterprise"]},
+      {"key": "nics", "type": "string sorted CSV", "examples": ["dedicated,shared"], "csvSortedValues": true},
+      {"key": "nonce", "type": "string", "examples": ["abcdef"]},
+      {"key": "guid", "type": "string hex or GUID", "examples": ["44454c4c53001048804bcac04f4b5858"]},
+      {"key": "family", "type": "string", "examples": ["dell-service-tag"]},
+      {"key": "mac", "type": "string MAC address or SSH MAC algorithm", "examples": ["00:11:22:33:44:55", "hmac-sha1"]},
+      {"key": "hostname", "type": "string", "examples": ["idrac-r760"]},
+      {"key": "protocolVersion", "type": "string", "examples": ["2.0"]},
+      {"key": "securityProfiles", "type": "string sorted CSV", "examples": ["Digest,TLS"], "csvSortedValues": true},
+      {"key": "vendorSlug", "type": "string", "examples": ["intel"]},
+      {"key": "class", "type": "string enum: deviceClass", "examples": ["serial"]},
+      {"key": "ports", "type": "string sorted CSV", "examples": ["443,5900"], "csvSortedValues": true},
+      {"key": "encryption", "type": "string", "examples": ["tls", "none"]},
+      {"key": "tlsVersion", "type": "string", "examples": ["TLS1.2"]},
+      {"key": "tlsAlpn", "type": "string", "examples": ["http/1.1"]},
+      {"key": "sessionInfo", "type": "string", "examples": ["CIMC session info"]},
+      {"key": "slotId", "type": "string", "examples": ["1"]},
+      {"key": "chassisSerial", "type": "string", "examples": ["FCH1234"]},
+      {"key": "match", "type": "string sorted CSV", "examples": ["preAuthReadable,staticDisclosure"], "csvSortedValues": true},
+      {"key": "fingerprint", "type": "string", "examples": ["xz redfish-metadata tar (68 files, supermicro)"]},
+      {"key": "archiveCount", "type": "string integer", "examples": ["68"]},
+      {"key": "archiveContents", "type": "string sorted CSV", "examples": ["$metadata,ActivateLicense_v1.xml,DumpService_v1.xml"], "csvSortedValues": true},
+      {"key": "urlCount", "type": "string integer", "examples": ["3"]},
+      {"key": "extraUrls", "type": "string sorted CSV", "examples": ["/a,/b"], "csvSortedValues": true},
+      {"key": "plainStatus", "type": "string integer", "examples": ["401"]},
+      {"key": "spoofedStatus", "type": "string integer", "examples": ["200"]},
+      {"key": "spoofHeader", "type": "string", "examples": ["X-Forwarded-For"]},
+      {"key": "access", "type": "string", "examples": ["readWrite", "readOnly"]},
+      {"key": "level", "type": "string", "examples": ["authPriv"]},
+      {"key": "priv", "type": "string", "examples": ["administrator", "user"]},
+      {"key": "users", "type": "string integer", "examples": ["4"]},
+      {"key": "lan", "type": "string integer", "examples": ["12"]},
+      {"key": "lan6", "type": "string integer", "examples": ["8"]},
+      {"key": "fruFields", "type": "string integer", "examples": ["6"]},
+      {"key": "fruPreview", "type": "string", "examples": ["product=PowerEdge | board=Dell"]},
+      {"key": "cipherSuitesProbed", "type": "string integer", "examples": ["7"]},
+      {"key": "flow", "type": "string", "examples": ["2.0/cred"]},
+      {"key": "suite", "type": "string integer", "examples": ["17"]},
+      {"key": "manufacturerId", "type": "string integer", "examples": ["674"]},
+      {"key": "productId", "type": "string integer", "examples": ["256"]},
+      {"key": "power", "type": "string", "examples": ["on", "off"]},
+      {"key": "lastEvent", "type": "string", "examples": ["ac-failed"]},
+      {"key": "reachable", "type": "string integer", "examples": ["2"]},
+      {"key": "responses", "type": "string integer", "examples": ["12"]},
+      {"key": "leaks", "type": "string integer", "examples": ["1"]},
+      {"key": "bypasses", "type": "string integer", "examples": ["0"]},
+      {"key": "bytes", "type": "string integer", "examples": ["1024"]},
+      {"key": "recovered", "type": "string sorted CSV", "examples": ["admin:admin,root:calvin"], "csvSortedValues": true},
+      {"key": "reg0", "type": "string hex", "examples": ["0x0001"]},
+      {"key": "exceptionCode", "type": "string hex", "examples": ["0x02"]},
+      {"key": "universalKey", "type": "string", "examples": ["secret"]},
+      {"key": "httpOnly", "type": "string boolean", "examples": ["true"]},
+      {"key": "otherPreauthObjects", "type": "string sorted CSV", "examples": ["CfgSystem,StsSystemInfo"], "csvSortedValues": true},
+      {"key": "localPasswordPolicy", "type": "string", "examples": ["disabled"]},
+      {"key": "defaultCredentialProfile", "type": "string", "examples": ["vendor-default"]},
+      {"key": "auth", "type": "string", "examples": ["none", "vnc-password", "basic"]},
+      {"key": "channel", "type": "string integer", "examples": ["1"]},
+      {"key": "observedAuthTypes", "type": "string sorted CSV", "examples": ["md2,md5,none"], "csvSortedValues": true},
+      {"key": "anonymousLoginEnabled", "type": "string boolean", "examples": ["true", "false"]},
+      {"key": "nullUserLoginEnabled", "type": "string boolean", "examples": ["true", "false"]},
+      {"key": "ipmiSupported", "type": "string sorted CSV", "examples": ["1.5,2.0"], "csvSortedValues": true},
+      {"key": "methods", "type": "string sorted CSV", "examples": ["basic,session"], "csvSortedValues": true},
+      {"key": "versions", "type": "string sorted CSV", "examples": ["1.5,2.0"], "csvSortedValues": true},
+      {"key": "suites", "type": "string sorted CSV", "examples": ["0,1,2,3,17"], "csvSortedValues": true},
+      {"key": "probed", "type": "string integer", "examples": ["4"]},
+      {"key": "probes", "type": "string integer", "examples": ["1207"]},
+      {"key": "test", "type": "string", "examples": ["authNone", "cipherZero"]},
+      {"key": "sessionEstablished", "type": "string boolean", "examples": ["true"]},
+      {"key": "accepted", "type": "string integer", "examples": ["3"]},
+      {"key": "rtt", "type": "string duration", "examples": ["1234us"]},
+      {"key": "error", "type": "string", "examples": ["timeout"]},
+      {"key": "setPrivProbed", "type": "string integer", "examples": ["4"]},
+      {"key": "setPrivSuccess", "type": "string integer", "examples": ["2"]},
+      {"key": "setPrivSuccessValues", "type": "string sorted CSV", "examples": ["administrator,operator"], "csvSortedValues": true},
+      {"key": "postAuthError", "type": "string", "examples": ["users: timeout; fru: completion code 0xc1"]},
+      {"key": "unauthStatus", "type": "string integer", "examples": ["401"]},
+      {"key": "basicStatus", "type": "string integer", "examples": ["500"]},
+      {"key": "sessionStatus", "type": "string integer", "examples": ["500"]},
+      {"key": "challenge", "type": "string", "examples": ["Basic realm=\"RedfishService\""]},
+      {"key": "probeUser", "type": "string", "examples": ["ADMIN"]},
+      {"key": "bmcVendor", "type": "string", "examples": ["ASRockRack", "Dell"]},
+      {"key": "mtls", "type": "string boolean", "examples": ["true"]},
+      {"key": "serviceUuid", "type": "string UUID", "examples": ["550e8400-e29b-41d4-a716-446655440000"]},
+      {"key": "managerId", "type": "string", "examples": ["iDRAC.Embedded.1", "bmc"]},
+      {"key": "systemId", "type": "string", "examples": ["System.Embedded.1", "system"]},
+      {"key": "biosVersion", "type": "string", "examples": ["1.8.2"]},
+      {"key": "powerState", "type": "string", "examples": ["On", "Off"]},
+      {"key": "accountRole", "type": "string", "examples": ["Administrator", "ReadOnly"]},
+      {"key": "accountEnabled", "type": "string boolean", "examples": ["true", "false"]},
+      {"key": "scheme", "type": "string", "examples": ["http", "https"]},
+      {"key": "imei", "type": "string", "examples": ["356938035643809"]},
+      {"key": "imeisv", "type": "string", "examples": ["01"]},
+      {"key": "hwVer", "type": "string", "examples": ["1.0"]},
+      {"key": "module", "type": "string", "examples": ["xPico"]},
+      {"key": "sitename", "type": "string", "examples": ["rack-12"]},
+      {"key": "location", "type": "string", "examples": ["datacenter-a"]},
+      {"key": "uptime", "type": "string", "examples": ["12 days"]},
+      {"key": "object", "type": "string", "examples": ["device"]},
+      {"key": "ip", "type": "string IP address", "examples": ["192.0.2.50"]},
+      {"key": "netmask", "type": "string IP address", "examples": ["255.255.255.0"]},
+      {"key": "gateway", "type": "string IP address", "examples": ["192.0.2.1"]},
+      {"key": "dns", "type": "string IP address", "examples": ["192.0.2.53"]},
+      {"key": "realport", "type": "string", "examples": ["enabled"]},
+      {"key": "realportEncrypted", "type": "string boolean", "examples": ["true"]},
+      {"key": "realportName", "type": "string", "examples": ["RealPort"]},
+      {"key": "realportPorts", "type": "string integer", "examples": ["16"]},
+      {"key": "authStatus", "type": "string", "examples": ["enabled", "disabled"]},
+      {"key": "serialPort", "type": "string integer", "examples": ["1"]},
+      {"key": "tcpPort", "type": "string integer", "examples": ["4001"]},
+      {"key": "serialPorts", "type": "string integer", "examples": ["16"]},
+      {"key": "noBannerReason", "type": "string", "examples": ["timeout"]},
+      {"key": "telnetIac", "type": "string", "examples": ["fffd18"]},
+      {"key": "detection", "type": "string", "examples": ["banner"]},
+      {"key": "sentEnter", "type": "string boolean", "examples": ["true"]},
+      {"key": "note", "type": "string", "examples": ["login prompt observed"]},
+      {"key": "line", "type": "string", "examples": ["login:"]},
+      {"key": "baud", "type": "string integer", "examples": ["9600"]},
+      {"key": "part", "type": "string", "examples": ["UCS-C220-M5"]},
+      {"key": "uuid", "type": "string UUID", "examples": ["550e8400-e29b-41d4-a716-446655440000"]},
+      {"key": "iloFirmwareVersion", "type": "string", "examples": ["iLO 5 v3.10"]},
+      {"key": "iloSerial", "type": "string", "examples": ["ABC1234"]},
+      {"key": "sysname", "type": "string", "examples": ["XCC-01"]},
+      {"key": "mtm", "type": "string", "examples": ["7X06CTO1WW"]},
+      {"key": "hostkeyType", "type": "string", "examples": ["ssh-rsa"]},
+      {"key": "hostkeyTypes", "type": "string sorted CSV", "examples": ["ecdsa-sha2-nistp256,ssh-rsa"], "csvSortedValues": true},
+      {"key": "hostkeyFingerprint", "type": "string", "examples": ["SHA256:abcdef"]},
+      {"key": "keyType", "type": "string", "examples": ["ssh-rsa"]},
+      {"key": "bkhash", "type": "string", "examples": ["SHA256:abcdef"]},
+      {"key": "bkKind", "type": "string", "examples": ["shared-host-key"]},
+      {"key": "bkVendor", "type": "string", "examples": ["dell"]},
+      {"key": "bkProduct", "type": "string", "examples": ["iDRAC"]},
+      {"key": "kex", "type": "string", "examples": ["diffie-hellman-group1-sha1"]},
+      {"key": "cipher", "type": "string", "examples": ["aes128-cbc"]},
+      {"key": "hostkey", "type": "string", "examples": ["ssh-rsa"]},
+      {"key": "engineId", "type": "string hex", "examples": ["80001f8880"]},
+      {"key": "engineBoots", "type": "string integer", "examples": ["12"]},
+      {"key": "sysdescr", "type": "string", "examples": ["APC Web/SNMP Management Card"]},
+      {"key": "sample", "type": "string", "examples": ["1.3.6.1.2.1.1.1.0"]},
+      {"key": "impact", "type": "string", "examples": ["cross-device private key reuse"]},
+      {"key": "expired", "type": "string date", "examples": ["2026-01-02"]},
+      {"key": "modelNameUrl", "type": "string URL or path", "examples": ["/api/v2/model_name"]},
+      {"key": "bannerUrl", "type": "string URL or path", "examples": ["/api/v2/banner"]},
+      {"key": "localPasswordPolicyUrl", "type": "string URL or path", "examples": ["/api/v2/local_password_policy"]}
+    ],
+    "ipmiPostAuth.lan": [
+      {"sourceKey": "set_in_progress", "emittedKey": "setInProgress", "type": "string"},
+      {"sourceKey": "auth_type_support", "emittedKey": "authTypeSupport", "type": "string"},
+      {"sourceKey": "auth_type_enable", "emittedKey": "authTypeEnable", "type": "string"},
+      {"sourceKey": "ip_addr", "emittedKey": "ipAddress", "type": "string IP address"},
+      {"sourceKey": "ip_source", "emittedKey": "ipSource", "type": "string"},
+      {"sourceKey": "mac", "emittedKey": "mac", "type": "string MAC address"},
+      {"sourceKey": "subnet_mask", "emittedKey": "subnetMask", "type": "string IP address"},
+      {"sourceKey": "arp_control", "emittedKey": "arpControl", "type": "string"},
+      {"sourceKey": "default_gw_ip", "emittedKey": "defaultGatewayIp", "type": "string IP address"},
+      {"sourceKey": "default_gw_mac", "emittedKey": "defaultGatewayMac", "type": "string MAC address"},
+      {"sourceKey": "backup_gw_ip", "emittedKey": "backupGatewayIp", "type": "string IP address"},
+      {"sourceKey": "backup_gw_mac", "emittedKey": "backupGatewayMac", "type": "string MAC address"},
+      {"sourceKey": "community_string", "emittedKey": "communityString", "type": "string"},
+      {"sourceKey": "community_string_raw", "emittedKey": "communityStringRaw", "type": "string hex"},
+      {"sourceKey": "vlan_id", "emittedKey": "vlanId", "type": "string"},
+      {"sourceKey": "vlan_priority", "emittedKey": "vlanPriority", "type": "string"},
+      {"sourceKey": "rmcp_udp_port", "emittedKey": "rmcpUdpPort", "type": "string integer"},
+      {"sourceKey": "rmcp_secondary_port", "emittedKey": "rmcpSecondaryPort", "type": "string integer"}
+    ],
+    "ipmiPostAuth.lan6": [
+      {"sourceKey": "ipv6_support", "emittedKey": "ipv6Support", "type": "string"},
+      {"sourceKey": "ipv6_ipv4_enables", "emittedKey": "ipv6Ipv4Enabled", "type": "string"},
+      {"sourceKey": "ipv6_header_traffic_class", "emittedKey": "ipv6HeaderTrafficClass", "type": "string"},
+      {"sourceKey": "ipv6_header_static_hop_limit", "emittedKey": "ipv6HeaderStaticHopLimit", "type": "string"},
+      {"sourceKey": "ipv6_status", "emittedKey": "ipv6Status", "type": "string"},
+      {"sourceKey": "ipv6_static_addr_max", "emittedKey": "ipv6StaticAddrMax", "type": "string integer"},
+      {"sourceKey": "ipv6_dynamic_addr_max", "emittedKey": "ipv6DynamicAddrMax", "type": "string integer"},
+      {"sourceKey": "ipv6_dynamic_addr_0", "emittedKey": "ipv6DynamicAddr0", "type": "string"},
+      {"sourceKey": "ipv6_static_router_1", "emittedKey": "ipv6StaticRouter1", "type": "string"}
+    ]
+  },
+  "canonicalAliases": [
+    {"legacy": "archive_contents", "canonical": "archiveContents"},
+    {"legacy": "archive_count", "canonical": "archiveCount"},
+    {"legacy": "auth_algo", "canonical": "authAlgo"},
+    {"legacy": "backup_gw_ip", "canonical": "backupGatewayIp"},
+    {"legacy": "backup_gw_mac", "canonical": "backupGatewayMac"},
+    {"legacy": "cn", "canonical": "commonName"},
+    {"legacy": "community_string", "canonical": "communityString"},
+    {"legacy": "default", "canonical": "defaultCredential"},
+    {"legacy": "default_cred_profile", "canonical": "defaultCredentialProfile"},
+    {"legacy": "default_creds", "canonical": "defaultCreds"},
+    {"legacy": "default_gw_ip", "canonical": "defaultGatewayIp"},
+    {"legacy": "default_gw_mac", "canonical": "defaultGatewayMac"},
+    {"legacy": "default_gateway_ip", "canonical": "defaultGatewayIp"},
+    {"legacy": "default_gateway_mac", "canonical": "defaultGatewayMac"},
+    {"legacy": "default_pass", "canonical": "password"},
+    {"legacy": "default_user", "canonical": "username"},
+    {"legacy": "defaultPassword", "canonical": "password"},
+    {"legacy": "defaultUsername", "canonical": "username"},
+    {"legacy": "evidence", "canonical": "proof"},
+    {"legacy": "httpStatus", "canonical": "status"},
+    {"legacy": "http_status", "canonical": "status"},
+    {"legacy": "output", "canonical": "response"},
+    {"legacy": "raw", "canonical": "response"},
+    {"legacy": "sample", "canonical": "response"},
+    {"legacy": "snippet", "canonical": "response"},
+    {"legacy": "via", "canonical": "source"},
+    {"legacy": "evidence_endpoint", "canonical": "evidenceEndpoint"},
+    {"legacy": "firmware", "canonical": "firmwareVersion"},
+    {"legacy": "firmware_revision", "canonical": "firmwareVersion"},
+    {"legacy": "firmware_version", "canonical": "firmwareVersion"},
+    {"legacy": "fw", "canonical": "firmwareVersion"},
+    {"legacy": "hash_algo", "canonical": "hashAlgo"},
+    {"legacy": "ip_addr", "canonical": "ipAddress"},
+    {"legacy": "ipv6_ipv4_enables", "canonical": "ipv6Ipv4Enabled"},
+    {"legacy": "login_via", "canonical": "loginVia"},
+    {"legacy": "mfr", "canonical": "manufacturer"},
+    {"legacy": "model_name", "canonical": "model"},
+    {"legacy": "moxa.firmware", "canonical": "moxaFirmwareVersion"},
+    {"legacy": "pass", "canonical": "password"},
+    {"legacy": "rmcp_udp_port", "canonical": "rmcpUdpPort"},
+    {"legacy": "rmcp_secondary_port", "canonical": "rmcpSecondaryPort"},
+    {"legacy": "serial", "canonical": "serialNumber"},
+    {"legacy": "serial_number", "canonical": "serialNumber"},
+    {"legacy": "user", "canonical": "username"}
+  ],
+  "canonicalTokenAliases": [
+    {"token": "cred", "canonicalToken": "credential"},
+    {"token": "fw", "canonicalToken": "firmwareVersion"},
+    {"token": "mfr", "canonicalToken": "manufacturer"}
+  ]
+}

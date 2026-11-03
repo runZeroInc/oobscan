@@ -10,10 +10,18 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Avocent (Vertiv) ACS8000/ACS800 console servers serve a small, non-standard
+// Redfish service root as a static file at GET /redfish/v1/index.json,
+// reachable pre-auth. The distinctive {Vendor:"Avocent",Product:"ACS"} pair
+// (a mini root, not the full ServiceRoot schema) both attributes the
+// appliance and confirms the pre-auth web surface tied to the unauthenticated
+// cleartext handler POST /appliance/avtrans (no auth, no SSL), the pre-auth
+// stack-overflow sink in root uicontrold. This check only performs the
+// static read; it never touches /appliance/avtrans.
 func init() {
 	Register(Check{
 		Name:        "http.avocent.acsRedfishRoot",
-		Description: "Avocent ACS console server pre-auth Redfish service-root disclosure",
+		Description: "Avocent ACS console server pre-auth Redfish service-root disclosure (avtrans overflow surface)",
 		Category:    "exposure",
 		Applies: Applicability{
 			Vendors: []string{"avocent"},
@@ -72,5 +80,9 @@ func explainAvocentACSRedfishRoot(host string, f engine.Finding) string {
 	b.WriteString("without authentication, confirming the appliance and its live pre-auth web tier.\n")
 	b.WriteString("\n**Read the pre-auth service root (SAFE):**\n")
 	b.WriteString(explainSh(fmt.Sprintf("curl -sk %s/redfish/v1/index.json", baseURL)))
+	b.WriteString("\n\n**Why it matters:** ACS8000/ACS800 firmware exposes the unauthenticated,\n")
+	b.WriteString("cleartext handler `POST /appliance/avtrans` (no auth, no TLS) -- the pre-auth\n")
+	b.WriteString("stack-overflow sink in the root `uicontrold` process. Confirm the appliance is\n")
+	b.WriteString("patched and restrict the management network; do not expose port 80/443 publicly.\n")
 	return b.String()
 }

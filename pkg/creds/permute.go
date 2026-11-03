@@ -8,6 +8,8 @@ import (
 	"sync"
 )
 
+// CommonPasswordSeeds are base words used to generate password variants when the
+// static default/vendor lists miss. Ported from the runZero platform IPMI probe.
 var CommonPasswordSeeds = []string{
 	"", "admin", "administrator", "root", "calvin", "changeme", "letmein",
 	"welcome", "default", "password", "badpassword", "superuser", "system",
@@ -19,6 +21,8 @@ var (
 	permAffixe []string
 )
 
+// passwordAffixes returns year / digit-sequence / symbol tokens that get combined
+// (as prefix or suffix) with base variants during a deep permutation pass.
 func passwordAffixes() []string {
 	permOnce.Do(func() {
 		set := map[string]struct{}{}
@@ -39,6 +43,11 @@ func passwordAffixes() []string {
 	return permAffixe
 }
 
+// Permute generates case, leetspeak, and word-doubling variants of base and tests
+// each with test(). When deep is true it also combines each variant with common
+// year/sequence/symbol affixes as a prefix and suffix. It returns the first
+// candidate for which test() reports a match. Ported/adapted from the runZero
+// platform PermutePassword (rules-driven RAKP candidate engine).
 func Permute(base string, deep bool, test func(string) bool) (string, bool) {
 	variants := map[string]struct{}{
 		base:                  {},
@@ -47,9 +56,10 @@ func Permute(base string, deep bool, test func(string) bool) (string, bool) {
 	}
 	if base != "" {
 		lb := strings.ToLower(base)
-		variants[strings.ToUpper(lb[:1])+lb[1:]] = struct{}{}
+		variants[strings.ToUpper(lb[:1])+lb[1:]] = struct{}{} // Title case
 	}
 
+	// Leetspeak substitutions on each case variant.
 	reps := []struct{ a, b string }{
 		{"s", "5"}, {"S", "5"}, {"s", "$"}, {"S", "$"},
 		{"a", "@"}, {"a", "4"}, {"A", "@"}, {"A", "4"},
@@ -64,6 +74,7 @@ func Permute(base string, deep bool, test func(string) bool) (string, bool) {
 	}
 	maps.Copy(variants, leet)
 
+	// Word doubling (e.g. adminadmin).
 	for w := range maps.Clone(variants) {
 		variants[w+w] = struct{}{}
 	}

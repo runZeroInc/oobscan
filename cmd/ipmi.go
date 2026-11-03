@@ -26,30 +26,11 @@ import (
 )
 
 var (
-	ipmiPort           int
-	ipmiUser           string
-	ipmiPassword       string
-	ipmiTimeout        time.Duration
-	ipmiMaxRetries     int
-	ipmiDisableSMCRAKP bool
-	ipmiCipher         int
-	ipmiVersion        string
-	ipmiAuth           string
-	ipmiProto          string
-	ipmiOutputJSON     bool
-	ipmiOutputFormat   string
-	ipmiMaxFRUField    int
+	ansiSeqRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
-	ipmiSMCConfigKey       string
-	ipmiSMCConfigCipher    string
-	ipmiSMCConfigIV        string
-	ipmiSMCConfigInnerPass string
-	ipmiSMCOut             string
-	ipmiSMCNoDecrypt       bool
-	ipmiSMCChunk           int
-
-	ansiSeqRE         = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	ipmiKnownCommands = []string{"isol", "mc", "chassis", "lan", "lan6", "fru", "user", "raw", "sol", "i2c", "spd", "channel", "xdp", "smcbackup"}
+	// ipmiKnownCommands marks where target input ends and the command begins.
+	// The Supermicro OEM workflows are top-level `smc-*` commands, not tokens here.
+	ipmiKnownCommands = []string{"isol", "mc", "chassis", "lan", "lan6", "fru", "user", "raw", "sol", "i2c", "spd", "mem", "channel", "xdp"}
 )
 
 var ipmiCmd = &cobra.Command{
@@ -59,6 +40,11 @@ var ipmiCmd = &cobra.Command{
 IPMI stack so responders can quickly validate exposures and perform common
 triage/remediation tasks (user inventory/disable/reset, mc/chassis/lan/fru,
 raw requests, SOL config, and i2c/spd checks).
+
+Run only operations authorized for the specified targets. Raw requests, account
+changes, resets, and some service settings execute immediately; there is no
+global dry-run mode. A register read or diagnostic request can have hardware
+side effects. Review command-specific apply requirements and maintenance needs.
 
 Targets can be comma-separated and/or space-separated and may be IPs, hostnames,
 CIDRs, and hyphen ranges. The first recognized subcommand token marks where
@@ -129,6 +115,77 @@ Command sections and syntax:
 		i2c read <slave_addr> <read_len> [write_byte ...]
 		spd read <slave_addr> [offset] [length]
 
+	Remote memory and hardware-register access
+		mem info
+		mem probe [<addr|region> ...]
+		mem read  <addr|region> <length> [key=value ...]
+		mem write <addr|region> <hexbytes...|in=FILE> [key=value ...] apply
+
+		Reads and writes the BMC's own address space, and the buses hanging
+		off it, through whichever OEM primitive the target's firmware
+		exposes. Options are key=value tokens rather than flags, so they do
+		not collide with the shared "oobscan ipmi" flag namespace.
+
+		The vendor profile is detected from the IPMI System GUID board code
+		(the same lookup smc-backup uses), refined by the firmware revision
+		where one build differs from its family; pin it with profile=<id>.
+		"mem info" prints the resolved profile, which address spaces it
+		supports, its page allowlist, its named regions and its hazards.
+
+		Address spaces (space=):
+			physical  the BMC's own physical space, via the vendor
+			          /dev/mem primitive (Supermicro: 0x30/0x70 subfn 0xC0)
+			virtual   a kernel virtual address, translated through the
+			          profile's PAGE_OFFSET and DRAM base. Valid only inside
+			          the 1:1 lowmem window
+			flash     an offset into the BMC SPI flash, translated through
+			          the memory-mapped window (Supermicro FMC CS0 at
+			          0x20000000). via=wst instead streams the ATEN
+			          whole-flash staging chain (NetFn 0x3E), 56 B/request
+			scu       an offset into the SoC system-control registers
+			gpio      an offset into the GPIO register block, or a single
+			          pin with pin=<n> where the firmware has a pin-level
+			          command (X14 subfn 0x4B)
+			i2c       a byte offset inside a device on an I2C/SMBus segment,
+			          via App/0x52 Master Write-Read; oem switches to the
+			          vendor transport, which on Supermicro reaches bus 0 on
+			          the generations where App/0x52 answers CC 0xd6
+			spd       i2c with the SPD conventions. Above 256 bytes it does
+			          the DDR4 SPA page select, which is the JEDEC
+			          convention rather than something measured on these
+			          boards, so treat a long read as unverified. DDR5 pages
+			          through SPD5118 MR11 instead and is not handled: stay
+			          under 256 bytes, or drive the part with space=i2c
+			fru       raw bytes inside a FRU inventory device (0x0a/0x11,
+			          0x0a/0x12) - no field decoding, unlike "fru print"
+			sdr       raw bytes inside one SDR repository record
+			mii       an MDIO/PHY register on the BMC NIC
+			peci      a raw PECI transaction to the host CPU, 32 B each way
+			cpu       the host CPU's own register planes over AMD APML on
+			          the Supermicro AMD boards (0x30/0x80): the SMU mailbox
+			          (apml=mailbox), SB-TSI (apml=sbtsi) and the 16-bit
+			          SB-RMI space (apml=sbrmi), socket=0|1
+			nvram     the vendor manufacturing-data store, one indexed byte
+			          at a time
+
+		BYTE ORDER IS THE TRAP. On X10 and X11 the read reply serialises the
+		loaded word MSB-first even though the BMC is a little-endian ARM, so
+		each group is reversed to reconstruct a faithful image. X13 01.07.01
+		and X14 answer in ascending-address order and must not be reversed.
+		The profile carries the right default; order=ascending|msb-first
+		overrides it, and unit=1 sidesteps the question entirely at four
+		times the request cost.
+
+		THROUGHPUT. The physical primitive moves 1-4 bytes per request. A
+		64 KB sector is ~16k requests and takes minutes; megabytes are not
+		realistic. Point it at something small and specific.
+
+		WRITES ARE STAGED BY DEFAULT. "mem write" prints the exact request
+		bytes it would send and transmits nothing until the bare token
+		"apply" is present. Add verify to read each unit back. An
+		unrestricted physical write is BMC code execution and can wedge the
+		board; the profile's hazards are printed before every write.
+
 	Channel access
 		channel info [channel]
 		channel getaccess <channel> [id]
@@ -148,16 +205,12 @@ Command sections and syntax:
 		(session idle seconds), and editmask=aa,bb (which fields the handler
 		applies; default 80,80).
 
-	Supermicro/ATEN OEM config export
-		smcbackup
-
-		smcbackup exports the BMC configuration (the SaveConfig download path)
-		and, when the config-obfuscation key is known, decrypts it to a gzip tar
-		of the /nv preserve_config tree. Read-only against the BMC. The key is
-		auto-selected from the generation detected via the System GUID; pass
-		--config-key for generations without a built-in profile. Files: --out
-		(default smc-backup-<host>.bin) plus <out>.tar.gz when decrypted;
-		--no-decrypt keeps only the ciphertext.
+	Supermicro/ATEN OEM workflows
+		The Supermicro config backup, restore-shell, file/CDB and
+		RAKP-bypass workflows are top-level commands, not tokens here:
+		smc-backup, smc-restore-shell, smc-uninstall,
+		smc-read, smc-cdb, smc-rakp-bypass, smc-priv-esc, smc-shell, smc-kvm.
+		Run "oobscan smc-<tool> --help" for each.
 
 Examples:
 
@@ -176,58 +229,95 @@ Examples:
 	oobscan ipmi --ipmi-version=1.5 --auth=md5 -u ADMIN -P ADMIN 10.0.0.10 isol console
 	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 i2c read 0xa0 16 0x00
 	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 spd read 0xa0 0x00 64
-	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 channel info
-	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 xdp enable 6868
-	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 smcbackup --out backup.bin
 
-Two legacy weak-authentication modes can be selected explicitly:
+	# Read the Supermicro U-Boot environment. The SPI flash is memory-mapped at
+	# FMC CS0 0x20000000 and the uboot_env sector is at flash offset 0x1FC0000,
+	# i.e. physical 0x21FC0000, 64 KB. Word 0 is the environment's CRC32; the
+	# NUL-separated name=value pairs start at +4 and end at a double NUL, and a
+	# provisioned unit's whole environment is realistically under 1 KB - so read
+	# 2 KB, not the full sector.
+	# Live on X11. On X10 the FMC CE0 window is left in command mode, so reads
+	# there return ZEROS rather than flash content; "mem read" says so, and
+	# changing it would need a write to the flash controller.
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read 0x21FC0000 2k
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read uboot-env 2k out=uboot-env.bin
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=flash 0x1FC0000 2k
+
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem info
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem probe
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read scu 64
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read 0x1e6e2078 4 unit=4
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=virtual 0xc0008000 256
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=i2c bus=1 slave=0x50 0 256
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=spd bus=1 slave=0x50 0 512
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=fru fru=0 0 256 out=fru.bin
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=gpio pin=42
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=cpu apml=sbtsi socket=0 0x01
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem read space=cpu apml=mailbox 0x11 apply
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem write 0x1e6e2000 deadbeef
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem write 0x1e6e2000 deadbeef verify apply
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 mem write space=fru fru=0 0x10 in=patch.bin apply
+
+	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 xdp enable 6868
+
+Two protocol-level authentication bypass methods include:
 	--ipmi-version=1.5 --auth=none
 	--ipmi-version=2   --cipher=0
 
 SMCRAKP mode is automatically detected and handled, but can be disabled with:
 	--disable-smcrakp
+
+OpenBMC targets support two unique features:
+	--openbmc-relabel=<admin-user>
+
+	This replaces the credentials of the active session after authentication and
+	is useful for privilege escalation and when chained to --openbmc-bmcrand.
+
+	--openbmc-bmcrand=<16-byte hex or 4-byte heap pointer>
+
+	This opens the session with no password using the OpenBMC default-userKey
+	bypass, given a stale bmcRandomNum you already know (e.g. sampled with shell
+	access). On a miss it retries nearby heap pages and the constant strings.
+
+	--openbmc-bypass
+
+	This opens the session with no password and NO seed value, the same way the
+	scanner's fast path does: it opens sessions and re-rolls the known
+	constant-string residues (the freed phosphor-logging / D-Bus buffers), grooming
+	the target to manufacture the log-template residue, and retries until one
+	activates. Only an enabled --user is needed (default root). Example:
+		oobscan ipmi --openbmc-bypass -u root 10.0.0.10 user list
+
+HPE iLO4 targets support a RAKP-none authentication bypass:
+	--ilo-rakp-none
+
+	This opens a session with no password by declaring the RMCP+ Open Session
+	authentication-algorithm record as payload-type 0x02 (confidentiality) with
+	algorithm 0, which evades iLO4's auth-algo-0 reject guard while the parser
+	positionally assigns it as the authentication algorithm (NONE). Only an enabled
+	username is required (--user, default Administrator); the session is
+	Administrator-capable. Example:
+	oobscan ipmi --ilo-rakp-none -u Administrator 10.0.0.10 user list
 `,
 	Args: cobra.ArbitraryArgs,
 	RunE: runIPMI,
 }
 
 func init() {
-	f := ipmiCmd.Flags()
-	f.IntVarP(&ipmiPort, "port", "p", ipmi.DefaultPort, "UDP port for IPMI (default 623)")
-	f.StringVarP(&ipmiUser, "user", "u", "", "IPMI username")
-	f.StringVarP(&ipmiPassword, "password", "P", "", "IPMI password")
-	f.DurationVarP(&ipmiTimeout, "timeout", "t", time.Second, "per-attempt IPMI request timeout")
-	f.IntVarP(&ipmiMaxRetries, "max-retries", "r", 2, "maximum retry attempts for timed-out IPMI requests")
-	f.BoolVar(&ipmiDisableSMCRAKP, "disable-smcrakp", false, "disable automatic SMCRAKP fixed-key detection/handling")
-	f.IntVarP(&ipmiCipher, "cipher", "c", -1, "RMCP+ cipher suite id (-1 auto, 0 none/none/none bypass)")
-	f.StringVarP(&ipmiVersion, "ipmi-version", "i", "2.0", "IPMI session version: 2.0 or 1.5")
-	f.StringVar(&ipmiAuth, "auth", "", "IPMI 1.5 auth mode: none|md2|md5|password")
-	f.StringVar(&ipmiProto, "proto", "auto", "IPMI 2.0 in-session command protection: auto|cleartext|negotiated")
-	f.StringVar(&ipmiOutputFormat, "format", "table", "output format: table|json|jsonl|ndjson")
-	f.IntVar(&ipmiMaxFRUField, "fru-max-fields", 64, "maximum FRU string fields to decode")
-	f.StringVar(&ipmiSMCConfigKey, "config-key", "", "smcbackup: config-obfuscation key as hex (16 bytes for AES, 24 for 3DES). Default: auto by detected generation")
-	f.StringVar(&ipmiSMCConfigCipher, "config-cipher", "", "smcbackup: config cipher for --config-key: aes-128-cbc or 3des-ede3-cbc (default aes-128-cbc)")
-	f.StringVar(&ipmiSMCConfigIV, "config-iv", "", "smcbackup: config IV as hex (default: AES fixed IV, or zero IV for 3des-ede3-cbc)")
-	f.StringVar(&ipmiSMCConfigInnerPass, "config-inner-pass", "", "smcbackup: openssl -pass password for the older X10 (FW ~3.5x) openssl-enc-salted INNER config layer. Only needed on units whose config is double-encrypted (smcbackup reports innerFormat=openssl-enc-salted)")
-	f.StringVar(&ipmiSMCOut, "out", "", "smcbackup: output path for the exported blob (default smc-backup-<host>.bin)")
-	f.BoolVar(&ipmiSMCNoDecrypt, "no-decrypt", false, "smcbackup: save only the encrypted blob, do not decrypt")
-	f.IntVar(&ipmiSMCChunk, "chunk", 0, "smcbackup: transfer chunk size in bytes (0 = default ~1400; lower it if a board throttles/times out mid-transfer)")
+	registerIPMIAllSessionFlags(ipmiCmd)
+	ipmiCmd.Flags().IntVar(&ipmiMaxFRUField, "fru-max-fields", 64, "maximum FRU string fields to decode")
+	// "mem ... via=shell" reaches the BMC through a root shell a prior
+	// smc-restore-shell deploy left behind, so it needs that service's address
+	// and the pinned client identity.
+	registerSMCShellPortFlag(ipmiCmd)
+	registerSMCCertPathFlag(ipmiCmd)
 	rootCmd.AddCommand(ipmiCmd)
 }
 
 func runIPMI(cmd *cobra.Command, args []string) error {
 	out := cmd.OutOrStdout()
-	errOut := cmd.ErrOrStderr()
-	if ipmiOutputJSON {
-		ipmiOutputFormat = "json"
-	}
-	if !isSupportedIPMIFormat(ipmiOutputFormat) {
-		fmt.Fprintf(out, "ipmi: unsupported --format %q (use table, json, jsonl, or ndjson)\n", ipmiOutputFormat)
-		printIPMIShortUsage(cmd)
-		return nil
-	}
-	if ipmiMaxRetries < 1 {
-		fmt.Fprintf(out, "ipmi: invalid --max-retries %d (use 1 or greater)\n", ipmiMaxRetries)
+	if err := validateIPMIOutputFlags(); err != nil {
+		fmt.Fprintf(out, "ipmi: %v\n", err)
 		printIPMIShortUsage(cmd)
 		return nil
 	}
@@ -250,110 +340,39 @@ func runIPMI(cmd *cobra.Command, args []string) error {
 	}
 	commandArgs := args[idx:]
 
-	ctx := context.Background()
-	failures := 0
-	validationErrs := 0
-	interactiveSOL := isSOLConsoleCommand(commandArgs)
-	status := newIPMIStatusSpinner(errOut, len(targets), summarizeIPMICommand(commandArgs))
-	status.Start()
-	defer status.Stop("")
-	if interactiveSOL && len(targets) != 1 {
+	if isSOLConsoleCommand(commandArgs) && len(targets) != 1 {
 		fmt.Fprintln(out, "ipmi: sol/isol console supports exactly one target")
 		printIPMIShortUsage(cmd)
 		return nil
 	}
-	for i, host := range targets {
-		status.Set(i+1, host, "opening session")
-		if interactiveSOL {
-			status.Set(i+1, host, "starting interactive console")
-			if err := runIPMISOLConsole(host, commandArgs); err != nil {
-				failures++
-				status.WithPaused(func() {
-					fmt.Fprintf(out, "[%s] sol console error: %v\n", host, err)
-				})
-			}
-			status.Set(i+1, host, "interactive console finished")
-			continue
-		}
-		opts := ipmi.CmdSessOptions{
-			Host:              host,
-			Port:              ipmiPort,
-			Username:          ipmiUser,
-			Password:          ipmiPassword,
-			Timeout:           ipmiTimeout,
-			MaxRetries:        ipmiMaxRetries,
-			IPMIVersion:       ipmiVersion,
-			Auth:              ipmiAuth,
-			Cipher:            ipmiCipher,
-			DisableSMCRAKP:    ipmiDisableSMCRAKP,
-			CommandProtection: ipmiProto,
-		}
-		sess, err := ipmi.OpenCmdSess(opts)
-		if err != nil {
-			status.Set(i+1, host, "session failed")
-			failures++
-			msg := err.Error()
-			if strings.Contains(msg, "required") || strings.Contains(msg, "unsupported --") {
-				validationErrs++
-			}
-			status.WithPaused(func() {
-				fmt.Fprintf(out, "[%s] session error: %v\n", host, err)
-			})
-			continue
-		}
-		if sess.SMCRAKPDetected() {
-			status.WithPaused(func() {
-				log().Warnf("[%s] Hardcoded SMCRAKP RAKP key detected, passwords may be optional...", host)
-			})
-		}
 
-		status.Set(i+1, host, "running command")
-		commandCtx := ipmi.WithCommandProgress(ctx, func(update string) {
-			status.Set(i+1, host, update)
-		})
-		res, err := runIPMITargetCommand(commandCtx, sess, commandArgs)
-		sess.Close()
-		if err != nil {
-			status.Set(i+1, host, "command failed")
-			failures++
-			msg := err.Error()
-			if strings.Contains(msg, "usage:") || strings.Contains(msg, "unsupported") || strings.Contains(msg, "invalid") {
-				validationErrs++
+	usage := func() { printIPMIShortUsage(cmd) }
+	return runIPMITargets(cmd, targets, summarizeIPMICommand(commandArgs), usage,
+		func(ctx context.Context, idx int, host string, status *ipmiStatusSpinner) error {
+			// sol/isol console hands the terminal to ipmitool, and
+			// "mem ... via=shell" reaches the BMC through a deployed root shell.
+			// Both replace the session rather than running inside one, so they
+			// come before OpenCmdSess. via=shell is what keeps the memory
+			// primitive usable when IPMI is wedged, unauthenticated, or has none
+			// (e.g. X10 fw 3.53, where the IPMI /dev/mem open fails).
+			switch {
+			case isSOLConsoleCommand(commandArgs):
+				status.Set(idx, host, "starting interactive console")
+				return stepErrorf("sol console", runIPMISOLConsole(host, commandArgs))
+			case memViaShell(commandArgs):
+				status.Set(idx, host, "via=shell (no IPMI session)")
+				res, merr := runIPMIMemViaShell(host, commandArgs)
+				if merr != nil {
+					status.Set(idx, host, "command failed")
+					return stepErrorf("command", merr)
+				}
+				status.WithPaused(func() {
+					_ = printViaShellResult(cmd, host, res)
+				})
+				return nil
 			}
-			status.WithPaused(func() {
-				fmt.Fprintf(out, "[%s] command error: %v\n", host, err)
-			})
-			continue
-		}
-		status.Set(i+1, host, "rendering output")
-		var printErr error
-		status.WithPaused(func() {
-			printErr = printIPMIResult(cmd, host, sess, res)
+			return runIPMISessionStep(cmd, commandArgs, runIPMITargetCommand)(ctx, idx, host, status)
 		})
-		if printErr != nil {
-			status.Set(i+1, host, "output failed")
-			failures++
-			status.WithPaused(func() {
-				fmt.Fprintf(out, "[%s] output error: %v\n", host, printErr)
-			})
-			continue
-		}
-		status.Set(i+1, host, "done")
-	}
-	if failures > 0 {
-		status.Stop(fmt.Sprintf("ipmi finished: %d/%d target(s) failed", failures, len(targets)))
-		if validationErrs > 0 {
-			status.WithPaused(func() {
-				printIPMIShortUsage(cmd)
-			})
-		}
-		status.WithPaused(func() {
-			fmt.Fprintf(out, "ipmi: %d target(s) failed\n", failures)
-		})
-		return nil
-	}
-	status.Stop(fmt.Sprintf("ipmi finished: %d target(s) ok", len(targets)))
-	return nil
 }
 
 type ipmiStatusSpinner struct {
@@ -532,26 +551,39 @@ func summarizeIPMICommand(args []string) string {
 }
 
 func printIPMIShortUsage(cmd *cobra.Command) {
-	fmt.Fprintln(cmd.OutOrStdout(), "Usage:")
-	fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", cmd.UseLine())
-	fmt.Fprintln(cmd.OutOrStdout(), "")
-	fmt.Fprintln(cmd.OutOrStdout(), "Supported commands:")
-	fmt.Fprintln(cmd.OutOrStdout(), "  mc [info]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  chassis [status]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  lan [print]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  lan6 [print]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  fru [print]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  user <list|enable|disable|clear|set ...>")
-	fmt.Fprintln(cmd.OutOrStdout(), "  raw <netfn> <cmd> [data ...]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  sol <info|set|activate|deactivate|console>")
-	fmt.Fprintln(cmd.OutOrStdout(), "  isol <console>")
-	fmt.Fprintln(cmd.OutOrStdout(), "  channel info [channel]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  channel getaccess <channel> [id]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  channel setaccess <channel> <id> callin=<on|off> ipmi=<on|off> link=<on|off> privilege=<level>")
-	fmt.Fprintln(cmd.OutOrStdout(), "  i2c read <slave_addr> <read_len> [write_byte ...]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  spd read <slave_addr> [offset] [length]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  mem info | probe | read <addr|region> <len> [key=value ...]")
-	fmt.Fprintln(cmd.OutOrStdout(), "  mem write <addr|region> <hexbytes|in=FILE> [key=value ...] apply")
+	out := cmd.OutOrStdout()
+	fmt.Fprintln(out, "Usage:")
+	fmt.Fprintf(out, "  %s\n", cmd.UseLine())
+	fmt.Fprintln(out, "")
+	fmt.Fprintln(out, "Supported commands:")
+	for _, line := range ipmiShortUsageLines {
+		fmt.Fprintf(out, "  %s\n", line)
+	}
+	fmt.Fprintln(out, "")
+	fmt.Fprintf(out, "Supermicro OEM workflows are separate commands: %s\n", strings.Join(smcCommandNames(), ", "))
+}
+
+// ipmiShortUsageLines is the one-line-per-command summary printed on a usage
+// error. Every entry in ipmiKnownCommands is represented here; the
+// TestIPMIShortUsageCoversKnownCommands test keeps the two in step.
+var ipmiShortUsageLines = []string{
+	"mc [info] | mc reset <cold|warm>",
+	"chassis [status]",
+	"lan [print]",
+	"lan6 [print]",
+	"fru [print]",
+	"user <list|enable|disable|clear|set ...>",
+	"raw <netfn> <cmd> [data ...]",
+	"sol <info|set|activate|deactivate|console>",
+	"isol <console>",
+	"channel info [channel]",
+	"channel getaccess <channel> [id]",
+	"channel setaccess <channel> <id> callin=<on|off> ipmi=<on|off> link=<on|off> privilege=<level>",
+	"i2c read <slave_addr> <read_len> [write_byte ...]",
+	"spd read <slave_addr> [offset] [length]",
+	"mem info | probe | read <addr|region> <len> [key=value ...]",
+	"mem write <addr|region> <hexbytes|in=FILE> [key=value ...] apply",
+	"xdp <status|enable|disable> [port] [key=value ...]",
 }
 
 func printIPMIResult(cmd *cobra.Command, host string, sess *ipmi.CmdSess, result any) error {
@@ -675,6 +707,24 @@ func printIPMIResultTable(out any, host string, flow ipmi.AuthFlow, ciphers []in
 		return writeKVFromJSON(w, v)
 	case map[string]any:
 		return writeKVMapAny(w, v)
+	case *ipmiMemReadResult:
+		if v == nil {
+			_, err := fmt.Fprintln(w, "(no data)")
+			return err
+		}
+		return writeMemReadResult(w, v)
+	case *ipmiMemGlobalVarResult:
+		if v == nil {
+			_, err := fmt.Fprintln(w, "(no data)")
+			return err
+		}
+		return writeMemGlobalVarResult(w, v)
+	case *ipmi.FlashCredResult:
+		if v == nil {
+			_, err := fmt.Fprintln(w, "(no data)")
+			return err
+		}
+		return writeFlashCredResult(w, v)
 	case *ipmiChannelInfoResult:
 		if v == nil {
 			_, err := fmt.Fprintln(w, "(no data)")
@@ -750,6 +800,12 @@ func printIPMIResultTable(out any, host string, flow ipmi.AuthFlow, ciphers []in
 		}
 		return nil
 	default:
+		// A workflow result that renders its own table wins over the generic
+		// key/value rendering, so the command-injection validators can lay out a
+		// verdict, a safety contract and a per-field store/readback table.
+		if tr, ok := result.(ipmi.TableReporter); ok {
+			return tr.SMCPrintTable(w)
+		}
 		rv := reflect.ValueOf(result)
 		if rv.IsValid() && rv.Kind() == reflect.Slice {
 			return writeSliceGeneric(w, result)
@@ -829,8 +885,10 @@ func runIPMITargetCommand(ctx context.Context, sess *ipmi.CmdSess, args []string
 		return runIPMII2C(sess, args[1:])
 	case "spd":
 		return runIPMISPD(sess, args[1:])
-	case "smcbackup":
-		return runIPMISMCBackup(ctx, sess, args[1:])
+	case "mem":
+		return runIPMIMem(ctx, sess, args[1:])
+	case "xdp":
+		return runIPMIXDP(sess, args[1:])
 	}
 	return nil, fmt.Errorf("unsupported command %q", strings.Join(args, " "))
 }
@@ -1317,7 +1375,8 @@ func expandIPMITargets(parts []string) ([]string, error) {
 	out := make([]string, 0, len(specs))
 	seen := make(map[string]struct{}, len(specs))
 	for _, spec := range specs {
-
+		// An IPv6 multicast spec (ff02::1%en0) is a link-local sweep: probe the
+		// group and take the BMCs that answer as the target list.
 		if discover.IsSpec(spec) {
 			found, err := expandLinkLocalIPMITargets(spec)
 			if err != nil {
@@ -1337,7 +1396,8 @@ func expandIPMITargets(parts []string) ([]string, error) {
 			return nil, err
 		}
 		for _, raw := range hosts {
-
+			// IPMI runs over UDP/623 (or the ipmi subcommand's own port flag), so a
+			// host:port target's web-port hint is not meaningful here - drop it.
 			h, _ := engine.SplitHostPortHint(raw)
 			if _, ok := seen[h]; ok {
 				continue
@@ -1349,6 +1409,10 @@ func expandIPMITargets(parts []string) ([]string, error) {
 	return out, nil
 }
 
+// expandLinkLocalIPMITargets sweeps an IPv6 multicast group for link-local hosts
+// and returns them as IPMI targets. The RMCP vector alone would be the tighter
+// filter here, but a BMC that answers ICMPv6 while its IPMI listener is slow to
+// come up is still worth handing to the caller's command, so both vectors run.
 func expandLinkLocalIPMITargets(spec string) ([]string, error) {
 	lg := log()
 	ctx, cancel := context.WithTimeout(context.Background(), discover.DefaultWait+15*time.Second)

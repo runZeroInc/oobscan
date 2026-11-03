@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+// OpenBMCSetupProbe captures the read-only local-command reachability observed
+// after Open Session + RAKP-1, before RAKP-3 proves the account password.
 type OpenBMCSetupProbe struct {
 	Username                     string `json:"username"`
 	Suite                        int    `json:"suite,omitempty"`
@@ -44,6 +46,10 @@ type OpenBMCSetupProbe struct {
 	Error                        string `json:"error,omitempty"`
 }
 
+// OpenBMCDisabledSetupOverwriteProbe captures whether a setup slot that first
+// saw a disabled-user RAKP1 can be overwritten by a second RAKP1 naming an
+// enabled Admin user, allowing setup-state local commands before any password is
+// proven.
 type OpenBMCDisabledSetupOverwriteProbe struct {
 	DisabledUsername           string `json:"disabledUsername"`
 	AdminUsername              string `json:"adminUsername"`
@@ -66,6 +72,9 @@ type OpenBMCDisabledSetupOverwriteProbe struct {
 	Error                      string `json:"error,omitempty"`
 }
 
+// OpenBMCSetupSession is a half-authenticated RMCP+ setup session after Open
+// Session + RAKP-1, before RAKP-3. Vulnerable phosphor-net-ipmid builds execute
+// local session commands in this state.
 type OpenBMCSetupSession struct {
 	client  *Client
 	bmcSID  uint32
@@ -73,6 +82,8 @@ type OpenBMCSetupSession struct {
 	setPriv []SetPrivAttempt
 }
 
+// OpenOpenBMCSetupSession opens a half-authenticated setup session for an
+// enabled username without proving the password.
 func OpenOpenBMCSetupSession(host string, port int, username string, suite CipherAlgos, timeout time.Duration) (*OpenBMCSetupSession, error) {
 	if username == "" {
 		return nil, errors.New("openbmc setup session: username required")
@@ -162,6 +173,10 @@ func (s *OpenBMCSetupSession) Close() {
 	s.client = nil
 }
 
+// ProbeOpenBMCSetupState opens a setup session, sends RAKP-1 for a known enabled
+// username, and checks whether phosphor-net-ipmid local session commands execute
+// before RAKP-3. The probe is intentionally read-only except for Set Session
+// Privilege on the transient setup session and best-effort Close Session cleanup.
 func ProbeOpenBMCSetupState(host string, port int, username string, suite CipherAlgos, timeout time.Duration) (*OpenBMCSetupProbe, error) {
 	if username == "" {
 		return nil, errors.New("openbmc setup probe: username required")
@@ -244,6 +259,10 @@ func ProbeOpenBMCSetupState(host string, port int, username string, suite Cipher
 	return probe, nil
 }
 
+// ProbeOpenBMCDisabledSetupOverwrite tests whether a setup session that first
+// hit a disabled-user RAKP1 can be relabeled by another RAKP1 naming an enabled
+// Admin user. It requires no valid password and only sends local setup-session
+// commands against a scanner-created setup slot.
 func ProbeOpenBMCDisabledSetupOverwrite(host string, port int, disabledUsername, adminUsername string, suite CipherAlgos, timeout time.Duration) (*OpenBMCDisabledSetupOverwriteProbe, error) {
 	if disabledUsername == "" {
 		return nil, errors.New("openbmc disabled-overwrite probe: disabled username required")
@@ -491,14 +510,28 @@ func execSetupClear(c *Client, bmcSID uint32, netfn, cmd byte, data []byte, rqSe
 	return cc, out, nil
 }
 
+// ExecClearIPMI sends a single cleartext IPMI command on an existing RMCP+
+// session (no integrity or confidentiality wrapping). It is the exported form of
+// the internal execSetupClear used by the setup-state probes. The caller is
+// responsible for sequencing rqSeq values (1-63, wrapping).
 func ExecClearIPMI(c *Client, bmcSID uint32, netfn, cmd byte, data []byte, rqSeq byte) (byte, []byte, error) {
 	return execSetupClear(c, bmcSID, netfn, cmd, data, rqSeq)
 }
 
+// SendRAKP1ToSession sends a RAKP1 message targeting an existing bmcSID (rather
+// than requiring a preceding Open Session on the same connection). This is the
+// exported form used by checks that perform cross-socket / cross-session RAKP1
+// relabelling attacks.
 func SendRAKP1ToSession(c *Client, bmcSID uint32, cRand []byte, username string, role byte) (*RAKPResult, error) {
 	return sendRAKP1OnSession(c, bmcSID, cRand, username, role)
 }
 
+// CloseSetupSession best-effort closes an RMCP+ setup/active session using the
+// local Close Session command over the given BMC session ID. It is exported for
+// low-level checks that craft RAKP packets manually and want to release the slot
+// on error paths. Whether a half-open session is releasable this way is
+// stack-dependent -- see abortSetupSession -- so the returned completion code is
+// the only evidence that it worked.
 func CloseSetupSession(c *Client, bmcSID uint32) (byte, error) {
 	return closeSetupSession(c, bmcSID)
 }
@@ -508,6 +541,12 @@ func closeSetupSession(c *Client, bmcSID uint32) (byte, error) {
 	return cc, err
 }
 
+// CloseSetupSessionAsync sends Close Session without waiting for the reply. In a
+// tight candidate loop (the OpenBMC default-userKey heap sweep closes a setup
+// session per guess) waiting adds a full round trip -- or, when the reply is
+// dropped, a full timeout -- to every iteration. Use this wherever the close is
+// housekeeping rather than an observation; discarding the reply also discards the
+// only signal that the stack honored it.
 func CloseSetupSessionAsync(c *Client, bmcSID uint32) error {
 	lan := buildSessionLANMsg(NetFnApp, CmdCloseSession, binary.LittleEndian.AppendUint32(nil, bmcSID), 63)
 	return c.SendRaw(buildRMCPPlusSID(PayloadIPMI, bmcSID, 0, lan))

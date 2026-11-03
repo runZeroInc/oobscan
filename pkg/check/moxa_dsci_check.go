@@ -9,13 +9,20 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/wire"
 )
 
+// Moxa DSCI configuration-utility protocol (UDP): the UDP dispatcher runs a
+// 1-byte opcode with no authentication check, so the read opcodes disclose
+// device/network state pre-auth (and an ungated network-config setter exists
+// on 0x79 sub-3, which this probe never touches). Framing/port are heuristic
+// (see the package doc); the probe reports every field the reply carries.
 func init() {
 	Register(Check{
 		Name:        "udp.moxa.dsciConfig",
 		Description: "Moxa DSCI config-utility protocol (UDP) pre-auth opcode dispatcher; read-opcode disclosure (heuristic framing)",
 		Category:    "exposure",
 		Applies:     Applicability{CrossVendor: true},
-
+		// Disabled: heuristic framing (unconfirmed port/layout) means it fires on
+		// any printable UDP reply, incl. SIP reflectors. Re-enable after the DSCI
+		// wire framing + port are pinned from a real capture.
 		Enabled: false,
 		Run:     runMoxaDSCI,
 	})

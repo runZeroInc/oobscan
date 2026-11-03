@@ -5,7 +5,19 @@ import (
 	"maps"
 )
 
+// rzservices reads the runZero services export (models.ServiceWithJoin): one JSON
+// object per line holding a single service with its whole asset denormalized
+// alongside it, under `service_`-prefixed keys for the service and bare keys for
+// the asset.
+//
+// Unlike the SQL export this format is neither grouped nor sorted by asset: rows
+// for an already-seen asset reappear later in the file. Rows are therefore grouped
+// in memory by asset id and emitted at the end in first-seen order, which makes
+// peak memory proportional to the input.
+
+// servicesLine is one line of the services export.
 type servicesLine struct {
+	// Service
 	ServiceAssetID string            `json:"service_asset_id"`
 	Port           int               `json:"service_port"`
 	Transport      string            `json:"service_transport"`
@@ -15,6 +27,7 @@ type servicesLine struct {
 	Protocols      []string          `json:"service_protocol"`
 	Data           map[string]string `json:"service_data"`
 
+	// Asset (denormalized onto every one of its service rows)
 	ID             string            `json:"id"`
 	Type           string            `json:"type"`
 	Category       string            `json:"category"`
@@ -37,6 +50,7 @@ type servicesLine struct {
 	OrgName        string            `json:"org_name"`
 }
 
+// assetKey identifies the asset a row belongs to.
 func (l *servicesLine) assetKey() string {
 	if l.ServiceAssetID != "" {
 		return l.ServiceAssetID
@@ -44,10 +58,13 @@ func (l *servicesLine) assetKey() string {
 	if l.ID != "" {
 		return l.ID
 	}
-
+	// No id at all: fall back to the address so rows for one host still merge.
 	return l.Address
 }
 
+// asset builds the asset view from a row. The export carries the site and
+// organization names, which have no asset column of their own, so they are
+// folded into the attribute bag rather than dropped.
 func (l *servicesLine) asset() rzAsset {
 	attrs := l.Attrs
 	if l.SiteName != "" || l.OrgName != "" {
@@ -95,6 +112,8 @@ func (l *servicesLine) service() rzService {
 	}
 }
 
+// streamRZServices reads the services export at path, groups its rows by asset,
+// and invokes fn once per asset in first-seen order.
 func streamRZServices(path string, fn func(*rzHost) error) (stats sourceStats, err error) {
 	byAsset := map[string]*rzHost{}
 	var order []string

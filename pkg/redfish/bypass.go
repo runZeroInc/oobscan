@@ -11,6 +11,16 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// NoXFFResult reports the AMI / ASRock MegaRAC ":9080 no-X-Forwarded-For" pre-auth
+// admin bypass check.
+//
+// On affected MegaRAC builds the Lua Redfish backend binds 0.0.0.0:9080 in the
+// clear and only enforces credentials when an X-Forwarded-For header is present
+// (lighttpd injects XFF on the fronted :443 path). A request sent directly to
+// :9080 without that header falls into the else-branch that assigns
+// user_id=0 / role Administrator (firmware: redfish-handler.lua.dec:1044-1167).
+// So an unauthenticated GET of an admin-scoped Redfish resource on :9080 that
+// returns a real resource body (not a login page) indicates the bypass.
 type NoXFFResult struct {
 	Host      string `json:"host"`
 	Port      int    `json:"port"`
@@ -25,6 +35,11 @@ type NoXFFResult struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// CheckNoXFFBypass probes host:port (default 9080) for the no-XFF admin bypass
+// by comparing two unauthenticated GETs for each admin-scoped path: one with no
+// X-Forwarded-For and one with X-Forwarded-For: 1.2.3.4. A bypass is asserted
+// only on a differential where the no-XFF request returns real Redfish data and
+// the XFF control is denied/non-Redfish.
 func CheckNoXFFBypass(host string, port int, scheme string, timeout time.Duration) ([]NoXFFResult, error) {
 	if port == 0 {
 		port = 9080
@@ -51,7 +66,7 @@ func CheckNoXFFBypass(host string, port int, scheme string, timeout time.Duratio
 			lastErr = err
 			continue
 		}
-
+		// Deliberately send no X-Forwarded-For and no Authorization.
 		resp, err := client.Do(req)
 		cancel()
 		r := NoXFFResult{Host: host, Port: port, Scheme: scheme, Path: p}
@@ -92,7 +107,7 @@ func CheckNoXFFBypass(host string, port int, scheme string, timeout time.Duratio
 		r.XFFStatus = resp2.StatusCode
 		low2 := strings.ToLower(string(body2))
 		xffRedfish := strings.Contains(low2, "@odata")
-
+		// Bypass: no-XFF request got real Redfish; XFF control got denied/non-Redfish.
 		r.Bypassed = r.Status == http.StatusOK && r.IsRedfish && !r.IsLogin &&
 			((r.XFFStatus == http.StatusUnauthorized || r.XFFStatus == http.StatusForbidden) ||
 				((r.XFFStatus == http.StatusBadRequest || r.XFFStatus == http.StatusNotFound || r.XFFStatus >= 500) && !xffRedfish))

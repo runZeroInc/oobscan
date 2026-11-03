@@ -13,6 +13,11 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// The Cisco CIMC check reads /api/cimcInfo.json, an endpoint the CIMC web UI
+// calls before login. It returns the device hostname, serial number, banner,
+// session info, and slot id without authentication, so it is both a reliable
+// Cisco CIMC confirmation and a pre-auth asset-identity disclosure (hostname and
+// serial support model and warranty correlation). The request is read-only.
 func init() {
 	Register(Check{
 		Name:        "http.cisco.cimcInfo",
@@ -38,7 +43,7 @@ func runCiscoCIMCInfo(ctx context.Context, t *engine.Target) []engine.Finding {
 		return nil
 	}
 	t.SetEvidence("cisco.cimcInfo", info)
-
+	// engine.F drops empty values, so blank banner/session/slot fields are omitted.
 	return []engine.Finding{{
 		Check: "http.cisco.cimcInfo", Category: "http", Risk: "medium",
 		Port: webPort(t), Transport: "tcp", Protocol: webProto(t),

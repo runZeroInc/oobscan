@@ -11,6 +11,12 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/redfish"
 )
 
+// http.redfish.authPathProbe detects Redfish auth-handler crash patterns
+// pre-auth, without CLI credentials. It differentiates a firmware bug (protected
+// resources challenge correctly with 401/403, but authenticated requests return
+// 5xx) from a normal 401-only BMC. The probe uses a synthetic username so it
+// cannot lock out a real account, and it only runs when online logins are
+// allowed and Redfish is reachable.
 func init() {
 	Register(Check{
 		Name:        "http.redfish.authPathProbe",
@@ -26,7 +32,9 @@ func runRedfishAuthPathProbe(_ context.Context, t *engine.Target) []engine.Findi
 	if t.DisableLogins {
 		return nil
 	}
-
+	// If the user supplied CLI credentials, the postAuthEnum check already
+	// runs this differential with the real credential pair; do not duplicate
+	// the login-attempt traffic.
 	if len(suppliedCreds(t)) > 0 {
 		return nil
 	}
@@ -41,7 +49,9 @@ func runRedfishAuthPathProbe(_ context.Context, t *engine.Target) []engine.Findi
 	}
 	base := redfish.BaseURL(t.Host, port)
 	client := redfish.InsecureClient(per)
-
+	// Synthetic non-existent username: a random 16-hex string that no real
+	// account will ever be provisioned under. This keeps the probe safe from
+	// triggering account lockout on the shipped root/admin accounts.
 	userBytes := make([]byte, 8)
 	if _, err := rand.Read(userBytes); err != nil {
 		return nil

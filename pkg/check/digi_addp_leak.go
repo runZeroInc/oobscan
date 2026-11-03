@@ -9,6 +9,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Digi ADDP is an unauthenticated UDP/2362 discovery service on Digi
+// PortServer/ConnectPort/TransPort/Connect ES devices; one probe returns
+// hostname, LAN MAC, IPv4 config, DNS/DHCP state, product/firmware, RealPort
+// port and encryption state, and serial-port count -- bounded metadata with no
+// credentials or access. identify already parses this; this check surfaces it
+// as an info finding, read-only, reusing identify's evidence when present.
+
 func init() {
 	Register(Check{
 		Name:        "udp.digi.addpLeak",
@@ -37,7 +44,8 @@ func runDigiADDPLeak(ctx context.Context, t *engine.Target) []engine.Finding {
 		r = got
 		t.SetEvidence("digi.addp", r)
 	}
-
+	// Require at least one substantive field so a bare-minimum ADDP replier
+	// (no hostname/MAC/firmware/RealPort/ports) does not fire this finding.
 	if r.MAC == "" && r.Hostname == "" && r.Firmware == "" && r.HWName == "" && r.RealPort == 0 && r.Ports == 0 {
 		return nil
 	}

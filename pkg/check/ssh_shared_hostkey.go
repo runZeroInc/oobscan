@@ -11,6 +11,9 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ssh"
 )
 
+// ssh.sharedHostKey captures SSH host keys from every discovered SSH service
+// and asserts when the key is known fleet-wide/shared (or badkeys FW/SSH),
+// independent of device class attribution.
 func init() {
 	Register(Check{
 		Name:        "ssh.sharedHostKey",
@@ -40,7 +43,9 @@ func runSSHSharedHostKey(ctx context.Context, t *engine.Target) []engine.Finding
 		if err != nil {
 			continue
 		}
-
+		// Stash every captured host key (not just matches) so the output layer
+		// can emit ssh.hostKey.bkhash per service for downstream shared/default
+		// key detection without re-probing.
 		if cap.BKHash != "" || cap.Fingerprint != "" {
 			captures[port] = cap
 		}

@@ -12,6 +12,15 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/telnet"
 )
 
+// Perle IOLAN serial console servers answer on TCP/10064, the diagnostic slot
+// in their raw-serial port map (10000 + line number); a reachable pre-auth
+// serial line is unauthenticated console access. The check only connects and
+// reads what the service volunteers (no bytes sent, so it cannot drive a
+// shell or change state), asserting critical only on a positive Perle match
+// (diag slot, telnet-negotiating raw line, or IOLAN banner) since 10001 is a
+// commonly reused port; it never asserts whether diag mode actually drops to
+// a privileged shell. perleRawLinePorts also probes line 1 (10001/tcp) when
+// already in the scan set, catching units with diag disabled but line 1 exposed.
 const perleDiagPort = 10064
 
 var perleRawLinePorts = []int{perleDiagPort, 10001}
@@ -73,7 +82,10 @@ func runPerleCGIUnauthLeak(ctx context.Context, t *engine.Target) []engine.Findi
 }
 
 func runPerleDiagTelnet(ctx context.Context, t *engine.Target) []engine.Finding {
-
+	// Zero-network-cost gate: only probe listeners that are in the scan set
+	// (either an explicit --ports candidate or an already-discovered open
+	// port). This keeps the check from adding a connect to every
+	// serialConsole host.
 	var out []engine.Finding
 	for _, port := range perleRawLinePorts {
 		if port != perleDiagPort && !isPerleRawLineTarget(t) {
@@ -88,15 +100,26 @@ func runPerleDiagTelnet(ctx context.Context, t *engine.Target) []engine.Finding 
 		}
 		banner := string(res.Visible)
 		iac := res.IACString()
-
+		// False-positive guard: a Perle raw serial line / diag slot speaks telnet
+		// framing (IAC negotiation) and, if anything, an IOLAN serial-console
+		// banner. An SSH/HTTP/TLS banner means this port is not a Perle serial
+		// listener (10001 is a commonly reused port), so do not report an
+		// unrelated service as a Perle diagnostic exposure.
 		if looksLikeObviousNonSerialBanner(banner) {
 			continue
 		}
-
+		// Require a positive Perle identification before asserting the exposure: the
+		// diag slot (10064 is Perle-specific), a telnet-negotiating raw line, or an
+		// IOLAN/Perle banner. A silent, non-telnet port yields no assertion.
 		matchedOn := ""
 		switch {
 		case port == perleDiagPort && isPerleRawLineTarget(t):
-
+			// The diag slot is Perle-specific only when the device is already
+			// identified as Perle: port 10064 alone (= 10000+line 64) is a generic
+			// raw-TCP serial slot other console servers (Opengear/Lantronix/Digi)
+			// also expose, so a bare-port match would misattribute them as a
+			// critical Perle exposure. Non-Perle hosts fall through to the evidence
+			// branches.
 			matchedOn = "diag-port"
 		case iac != "":
 			matchedOn = "telnet-negotiation"
@@ -121,7 +144,9 @@ func runPerleDiagTelnet(ctx context.Context, t *engine.Target) []engine.Finding 
 		if iac != "" {
 			fields = append(fields, "telnetIAC", iac)
 		}
-
+		// A pre-auth-reachable Perle serial line / diag slot is unauthenticated
+		// access to the attached console (or, in diag mode, the device shell) - a
+		// critical exposure, gated on the positive match above.
 		out = append(out, engine.Finding{
 			Check: "telnet.perleDiag", Category: "exposure", Risk: "critical",
 			Port: port, Transport: "tcp", Protocol: "telnet",
@@ -131,6 +156,9 @@ func runPerleDiagTelnet(ctx context.Context, t *engine.Target) []engine.Finding 
 	return out
 }
 
+// perleSerialBanner reports whether a banner positively identifies a Perle IOLAN
+// serial / diagnostic listener (rather than some unrelated service on a reused
+// port).
 func perleSerialBanner(banner string) bool {
 	b := strings.ToLower(banner)
 	return strings.Contains(b, "iolan") || strings.Contains(b, "perle") || strings.Contains(b, "trueport")
@@ -140,6 +168,8 @@ func isPerleRawLineTarget(t *engine.Target) bool {
 	return t != nil && t.Identity != nil && strings.EqualFold(t.Identity.Vendor, "perle")
 }
 
+// perleLineForPort returns the Perle IOLAN "line N" label for a given raw-TCP
+// port, or the empty string for the diag slot (which is not a serial line).
 func perleLineForPort(port int) string {
 	if port == perleDiagPort {
 		return ""
@@ -150,6 +180,13 @@ func perleLineForPort(port int) string {
 	return ""
 }
 
+// probePerlePort dials one Perle raw-TCP port and returns whether it accepted
+// plus the full BannerResult. Both the diagnostic port (10064) and raw-line
+// ports (10000+N) speak telnet-style IAC negotiation before printing
+// anything, so the shared telnet helper answers it (WILL->DONT, DO->WONT),
+// tracks which options were negotiated (via IACString), and -- if the banner
+// is still empty after negotiation -- sends `\r\n` and waits 100ms for one
+// more read, all bounded by the supplied timeout.
 func probePerlePort(ctx context.Context, host string, port int, timeout time.Duration) (open bool, res telnet.BannerResult) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second

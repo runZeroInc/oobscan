@@ -28,6 +28,8 @@ var (
 	reportAdvisories  string
 )
 
+// reportCmd builds an interactive HTML report from one or more oobscan NDJSON
+// corpora. Named sources enable comparisons using prevalence and absolute counts.
 var reportCmd = &cobra.Command{
 	Use:   "report -o <dir> [Name=]<file.jsonl> ...",
 	Short: "Build an interactive HTML exposure report from one or more scan corpora.",
@@ -45,19 +47,22 @@ the cross-source comparison (when more than one source is given), and one per
 source -- navigable with the arrow keys, presentable fullscreen (Present / F),
 and screenshottable to a 1920x1080 PNG with the controls hidden (Capture / P).
 Deeper, scrollable detail views (full vendor and exposure tables, ports,
-protocols, findings, IPMI/RAKP) sit under the per-source "Detail views" menu.
+protocols, the per-product-line firmware version breakdown, findings, IPMI/RAKP)
+sit under the per-source "Detail views" menu.
 
-The bundle holds only aggregates -- no per-host rows and no addresses -- so the
-HTML can be shared without exposing which specific systems were scanned.
+The HTML holds aggregates, not per-host rows or addresses. Aggregates may still
+disclose sensitive information about small populations; review them before
+sharing. The accompanying artifact files have a different privacy boundary and
+can contain passwords and authentication material.
 
 Percentages are always relative to each source's own population, so two corpora
 of very different size are compared on prevalence; absolute host counts are
 shown alongside so the population gap stays visible.
 
 Alongside the HTML, each source gets a subdirectory named after it holding the
-research artifacts (unless --no-artifacts is given):
+assessment artifacts (unless --no-artifacts is given):
 
-  <out>/<Name>/hashes/    cracker-ready RAKP hash files (hashcat -m 7300/7350,
+	<out>/<Name>/hashes/    RAKP password-audit inputs (hashcat -m 7300/7350,
                           John RAKP/-MD5/-SHA256), rakp-hashes.csv, README.txt.
                           The hash files match "oobscan hashdump" byte for byte.
   <out>/<Name>/overview/  vendor, class, product, os, hardware, port, protocol,
@@ -99,6 +104,9 @@ func runReport(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("specify an output directory with -o")
 	}
 
+	// Load the potfile (unless explicitly disabled with --potfile "") so the
+	// report can mark RAKP hashes already cracked, and grow that number as the
+	// pot fills. A redacted source carries no hash material, so it never matches.
 	potDisabled := cmd.Flags().Changed("potfile") && reportPotfile == ""
 	potCheck := reportPotCheck(potDisabled)
 
@@ -124,7 +132,8 @@ func runReport(cmd *cobra.Command, args []string) error {
 
 	sources := make([]*report.Source, 0, len(inputs))
 	for _, in := range inputs {
-
+		// Accumulate the side-artifact tree (RAKP hashes, CSVs) in the same
+		// streaming pass as the HTML aggregate, unless it was turned off.
 		var art *report.Artifacts
 		if !reportNoArtifacts {
 			art = report.NewArtifacts(in.Name)
@@ -182,6 +191,16 @@ func runReport(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// reportPotCheck loads the potfile and returns a function yielding the cracks it
+// already holds for a record's captured RAKP hashes, one entry per cracked hash, so
+// len() is the count the crack funnel shows. It returns nil when --potfile is empty
+// or the potfile is missing, and the report then omits the "potfile cracked" stat.
+//
+// The plaintexts travel with the count because the password-pattern analysis
+// classifies offline recoveries too: a factory-generated per-unit password is far
+// likelier to fall to an offline mask run than to the scan's default-credential pass.
+// The account each hash belongs to travels with them because an offline recovery on a
+// named account is a usable credential and one on the empty/callback account is not.
 func reportPotCheck(disabled bool) func(rec *scanfile.Record) []report.PotCrack {
 	if disabled {
 		return nil
@@ -205,6 +224,10 @@ func reportPotCheck(disabled bool) func(rec *scanfile.Record) []report.PotCrack 
 	}
 }
 
+// rakpPotKey rebuilds the "algo:salt:mac" potfile key for one captured RAKP
+// row, matching exactly the key oobscan writes when it cracks a hash
+// (AlgoName + hex(Salt) + hex(MAC)). A redacted row (no hash material) yields
+// ok=false.
 func rakpPotKey(r *output.RAKPRecord) (string, bool) {
 	if r.RAKPHash == "" {
 		return "", false

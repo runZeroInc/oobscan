@@ -6,6 +6,7 @@
 <title>Out-of-Band Exposure</title>
 <style>
 :root{
+  --page:#FFFBF5; /* report canvas behind the white slide cards */
   --paper:#f5f7f5; --surface:#ffffff; --ink:#152019; --muted:#65726b; --faint:#98a49d;
   --rule:#dde4df; --rule-2:#c6d0c9; --shadow:0 18px 50px rgba(20,34,25,.14);
   --danger:#c02a3d; --crit:#b0243a; --high:#d5602c; --med:#c9960e; --low:#6b8f3f; --info:#7f8c85;
@@ -14,8 +15,8 @@
   --a0soft:#dcf0e8; --a1soft:#f9e2d7; --a2soft:#e0eafa; --a3soft:#ece2f8; --a4soft:#d9f1f1; --a5soft:#f9e0ef;
 }
 *{box-sizing:border-box}
-html{background:var(--paper)}
-body{margin:0;background:var(--paper);color:var(--ink);
+html{background:var(--page)}
+body{margin:0;background:var(--page);color:var(--ink);
   font:15px/1.4 "Atkinson Hyperlegible","Inter","Avenir Next","Segoe UI",Verdana,sans-serif;letter-spacing:0}
 button,input,select{font:inherit;color:inherit}
 ::selection{background:#bfe9d7;color:#0b3326}
@@ -319,6 +320,21 @@ tr.secrow+tr>td{border-top:0}
 .bignum-row.denom .bn-l{padding-left:14px;text-transform:uppercase;letter-spacing:.06em;font-size:11.5px;
   font-weight:700;color:var(--muted)}
 .bignum-row.denom .bn-v{font-size:26px}
+/* Compare headline: fewer rows and no section bands, so the numbers grow to slide
+   scale. A label may carry a muted sub-line clarifying what the row counts. */
+.bn-ltxt{display:flex;flex-direction:column;gap:2px}
+.bn-sub{font-size:11.5px;font-weight:500;color:var(--muted);text-transform:none;letter-spacing:0;line-height:1.2}
+.cmp-headline .bignum-row .bn-l{font-size:16px}
+.cmp-headline .bn-v{font-size:32px}
+.cmp-headline .bn-p{font-size:13px;margin-top:3px}
+.cmp-headline .bignum-row.denom .bn-v{font-size:36px}
+/* Honeypot accounting row: dimmed so it reads as a deduction from the scanned
+   population, not another headline exposure. It carries no meter/bar. */
+.cmp-headline .muted-row .bn-l,.cmp-headline .muted-row .bn-c{color:var(--muted)}
+.cmp-headline .muted-row .bn-v{font-size:24px;font-weight:700;color:var(--muted)}
+/* Tabular figures everywhere a count is right-aligned, so the digit columns line
+   up regardless of which font the viewer falls back to. */
+.bn-v,.bn-p{font-feature-settings:"tnum" 1;font-variant-numeric:tabular-nums}
 .cmp-table td:first-child,.cmp-table th:first-child{white-space:nowrap}
 
 /* Advisory / CVE identifier above a compromise-path label. */
@@ -416,7 +432,7 @@ table.heatmap tbody tr:hover .vhead-v{background:var(--paper)}
   padding:0 13px;font-weight:700;cursor:pointer;box-shadow:0 5px 20px rgba(0,0,0,.12)}
 body.present{overflow:hidden}
 body.present .topbar{display:none}
-body.present .stage{max-width:none;height:100vh;padding:0;display:grid;place-items:center;background:var(--paper)}
+body.present .stage{max-width:none;height:100vh;padding:0;display:grid;place-items:center;background:var(--page)}
 body.present .view{width:min(100vw,calc(100vh*16/9));height:min(100vh,calc(100vw*9/16))}
 body.present .slide{width:100%;height:100%;border-radius:0;border:0;box-shadow:none;aspect-ratio:auto;
   display:flex;flex-direction:column}
@@ -488,7 +504,7 @@ var GAIN_LABEL={admin:"Administrator",host:"managed host",session:"session (priv
 var INFER_KEY={
   ipmi_smcrakp_bypass:"smcrakp_bypass",
   ipmi_ilo_auth_bypass:"ilo_ipmi_bypass",
-  ipmi_openbmc_bypass:"openbmc_rakp_bypass",
+  ipmi_openbmc_bypass:"openbmc_userkey",
   ami_redfish_bypass:"ami_redfish_bypass",
   ami_mtls_bypass:"ami_mtls_bypass",
   ssh_ilo_overflow:"ssh_ilo_overflow",
@@ -752,6 +768,9 @@ function buildViews(){
     addView({id:"d-"+i+"-exposure",label:"Exposure detail",kind:"detail",src:i,build:function(){return buildDetailExposure(i)}});
     addView({id:"d-"+i+"-vendors",label:"Vendor detail",kind:"detail",src:i,build:function(){return buildDetailVendors(i)}});
     addView({id:"d-"+i+"-services",label:"Services & ports",kind:"detail",src:i,build:function(){return buildDetailServices(i)}});
+    if(s.firmware&&s.firmware.length){
+      addView({id:"d-"+i+"-firmware",label:"Firmware versions",kind:"detail",src:i,build:function(){return buildDetailFirmware(i)}});
+    }
     addView({id:"d-"+i+"-findings",label:"Findings",kind:"detail",src:i,build:function(){return buildDetailFindings(i)}});
     addView({id:"d-"+i+"-ipmi",label:"IPMI / RAKP / SNMP",kind:"detail",src:i,build:function(){return buildDetailIPMI(i)}});
     if(s.guid&&s.guid.decoded>0){
@@ -830,11 +849,12 @@ function cmpTable(rows,labelHead,opts){
   return wrap;
 }
 
-/* Comparative headline: the big referenceable numbers, Internal vs External.
-   The scanned population leads as an explicit denominator row (it is a count,
-   not a prevalence, so it is banded rather than left with an empty % slot), then
-   the metrics follow in three labelled sections, each row carrying its own
-   percentage of its own source and a 0-100% meter of the same value. */
+/* Comparative headline: the big referenceable numbers, Internal vs External, as
+   two clean right-aligned number columns. The scanned population leads as a
+   denominator row, the honeypot count follows so the reader can net out decoys,
+   then the metrics run reach -> credential weakness -> compromise, each carrying
+   its own percentage of its own source. No section bands and no meter bars: both
+   turned the slide into an eye chart. */
 function buildCmpHeadline(){
   var sub=el("div","slide-sub");sub.innerHTML="<b>prevalence</b>% of each source's own population";
   var s=slideShell("Out-of-band exposure",{text:"Internal vs External"},sub);
@@ -849,51 +869,43 @@ function buildCmpHeadline(){
   function srcRow(label,fn){
     return {label:label,hosts:SRC.map(fn),pct:SRC.map(function(sc,i){return 100*fn(sc,i)/(sc.total||1)})};
   }
-  var maxTotal=Math.max.apply(null,SRC.map(function(sc){return sc.total||0}))||1;
+  // No section bands: on a slide the labelled headers made this an eye chart. The
+  // rows read top to bottom as reach -> credential weakness -> compromise without
+  // needing group titles, and dropping them lets the numbers grow.
+  var weak=srcRow("Weak credentials",function(sc){var c=sc.cracks||{};return c.total||sc.potCracked||0});
+  weak.sub="non-default, recovered by cracking";
+  // Honeypot decoys are counted in the scanned population but their findings are
+  // withheld, so surfacing the count lets the reader reconcile the math (real
+  // assets = scanned - decoys).
+  var honeypot={label:"Honeypot decoys (excluded)",muted:true,sub:"counted in scanned; findings withheld",
+    hosts:SRC.map(function(sc){return sc.honeypot||0}),
+    pct:SRC.map(function(sc){return 100*(sc.honeypot||0)/(sc.total||1)})};
   var rows=[
     {label:"Hosts scanned",denom:true,hosts:SRC.map(function(sc){return sc.total}),
-     pct:SRC.map(function(){return null}),note:"100% · population",
-     meter:SRC.map(function(sc){return 100*(sc.total||0)/maxTotal})},
-    {sec:"Reachable management plane"},
+     pct:SRC.map(function(){return null}),note:"100% · population"},
+    honeypot,
     expRow("IPMI reachable","ipmi"),
-    {sec:"Credential and authentication exposure"},
     expRow("RAKP hash disclosure","ipmi_rakp_hash"),
     expRow("IPMI default credentials","ipmi_default_creds"),
     expRow("Cipher-zero session","ipmi_cipher_zero"),
-    srcRow("Weak credentials (live)",function(sc){return sc.autoCracked||0}),
-    srcRow("Weak credentials (cracked)",function(sc){var c=sc.cracks||{};return c.total||sc.potCracked||0}),
-    {sec:"Immediate compromise"},
-    srcRow("Immediate compromise (known)",function(sc){return sc.immediatePre||0}),
+    weak,
+    srcRow("Immediate compromise paths (baseline)",function(sc){return sc.immediatePre||0}),
     srcRow("Extended with our findings",function(sc){return sc.immediateExt||0})
   ];
-  // Render as a large-number grid: label, meter, then one big cell per source.
-  var g=el("div","bignum bignum-fill");
-  g.style.gridTemplateColumns="minmax(210px,1.15fr) minmax(120px,1fr) repeat("+SRC.length+",minmax(140px,.72fr))";
-  var hr=el("div","bignum-head");hr.appendChild(el("div","bn-l",""));hr.appendChild(el("div","bn-m",""));
+  // Two clean number columns, right-aligned, no meter: the varying bar fill made
+  // each row's count float at a different position, which read as vertical
+  // drift. Label on the left, one big cell per source on the right.
+  var g=el("div","bignum bignum-fill cmp-headline");
+  g.style.gridTemplateColumns="minmax(240px,1.5fr) repeat("+SRC.length+",minmax(150px,1fr))";
+  var hr=el("div","bignum-head");hr.appendChild(el("div","bn-l",""));
   SRC.forEach(function(sc){hr.appendChild(el("div","bn-h",esc(sc.name)))});
   g.appendChild(hr);
   rows.forEach(function(r){
-    if(r.sec){
-      var band=el("div","bignum-sec");band.appendChild(el("div","bn-s",esc(r.sec)));g.appendChild(band);return;
-    }
-    var row=el("div","bignum-row"+(r.denom?" denom":""));
-    row.appendChild(el("div","bn-l",esc(r.label)));
-    // Meter: the same percentage the cell states, on a fixed 0-100% scale, so a
-    // small share reads as a small share instead of filling the track.
-    var m=el("div","bn-m");
-    SRC.forEach(function(sc,i){
-      var p=r.meter?r.meter[i]:r.pct[i];
-      var track=el("div","bn-track");
-      if(p!=null){
-        var fill=el("div","bn-fill");
-        fill.style.width=Math.max(p>0?1.5:0,Math.min(100,p))+"%";
-        fill.style.background=srcColor(i);
-        track.appendChild(fill);
-      }
-      track.title=esc(sc.name)+(r.meter?" · relative population size":" · "+pct(p||0)+" of "+esc(sc.name));
-      m.appendChild(track);
-    });
-    row.appendChild(m);
+    var row=el("div","bignum-row"+(r.denom?" denom":"")+(r.muted?" muted-row":""));
+    var lcell=el("div","bn-l");
+    var ltx=el("div","bn-ltxt");ltx.appendChild(el("div",null,esc(r.label)));
+    if(r.sub)ltx.appendChild(el("div","bn-sub",esc(r.sub)));
+    lcell.appendChild(ltx);row.appendChild(lcell);
     SRC.forEach(function(sc,i){
       var cell=el("div","bn-c");
       cell.appendChild(el("div","bn-v",fmt(r.hosts[i])));
@@ -1378,10 +1390,9 @@ function buildCrackFunnel(i){
     {k:"Recovered after offline crack",n:potTotal,sub:potLbl,c:"#26332c"}
   ].filter(function(x){return x.n>0});
   s._fill.appendChild(stackedBar(stages, hashRows));
-  /* Account-shape breakout of the recovered credentials (host-scoped): a named
-     login is a full takeover, an empty/callback secret is a weaker foothold. */
+  /* Recovered credential shapes are host-scoped, not proof of login or privilege. */
   var shape=[
-    {k:"Named accounts",n:cr.scanNamed,sub:"real login, full takeover"},
+    {k:"Named accounts",n:cr.scanNamed,sub:"recovered named-account secrets"},
     {k:"Empty / callback",n:cr.scanEmpty,sub:"blank or vendor-callback secret"},
     {k:"Potfile total (hosts)",n:cr.total,sub:"scan + later offline growth"}
   ].filter(function(x){return x.n>0});
@@ -1515,7 +1526,7 @@ function patternTable(rows){
 /* Passwords: every source's recovered credentials pooled into one view. The
    split that organises it is per-unit vs shared -- a value on many hosts is a
    vendor default, a value on one host is a factory-generated secret -- because
-   only the second kind carries a generator shape worth attacking. */
+  only the second kind carries a generator pattern relevant to password auditing. */
 function buildPasswordsSlide(){
   var pv=DATA.passwords||{};
   var sub=el("div","slide-sub");
@@ -1667,7 +1678,7 @@ function buildAdvisorySlide(){
     list.appendChild(row);
   });
   right.appendChild(list);
-  right.appendChild(el("div","proof-rule","Affected versions and coordination state travel with every advisory. No firmware-static result is presented here as live exploitation."));
+  right.appendChild(el("div","proof-rule","Each advisory records affected versions and coordination status. Firmware analysis alone is not evidence of confirmed live access."));
   g.appendChild(left);g.appendChild(right);s._fill.appendChild(g);
   return s;
 }
@@ -1836,6 +1847,38 @@ function protoColor(p){p=String(p).toLowerCase();
   if(p.indexOf("vnc")>=0||p.indexOf("kvm")>=0)return "#2f6bc4";
   if(p.indexOf("telnet")>=0||p.indexOf("serial")>=0)return "#d5602c";
   return "#67736c"}
+
+// buildDetailFirmware breaks each product line's hosts down by firmware release,
+// so a reader can see how a controller line splits across versions (the iLO4
+// hosts on 2.82 versus an older rev) instead of reading one pooled version list
+// that mixes every vendor's numbering. Lines are grouped by vendor and run in
+// natural order within a vendor (iLO4 before iLO5). Percentages are of the line's
+// firmware-bearing hosts; the header carries the coverage gap so a line where
+// few controllers exposed a version is not mistaken for a small line.
+function buildDetailFirmware(i){
+  var src=SRC[i];var v=detailShell(i,"Firmware versions");
+  var groups=src.firmware||[];
+  if(!groups.length){
+    section(v,"Firmware by product line").appendChild(el("div","empty","No firmware versions were resolved in this source"));
+    return v;
+  }
+  var head=section(v,"Firmware by product line · versions within each generation");
+  head.appendChild(el("div","proof-rule","Each line lists the firmware releases its controllers run and how many are on each. Hosts is every controller resolved to the line; with-firmware is those that also exposed a version, so the difference is controllers that never revealed one. Percentages are of the with-firmware hosts."));
+  groups.forEach(function(g){
+    var cov=g.total?Math.round(100*g.known/g.total):0;
+    var ctx=[];if(g.generation)ctx.push(g.generation);if(g.product)ctx.push(g.product);
+    var title=esc(g.label)+(ctx.length?" <small>"+esc(ctx.join(" · "))+"</small>":"");
+    var note=fmt(g.total)+" hosts · "+fmt(g.known)+" with firmware ("+cov+"%)";
+    var sec=el("div","section");
+    var pt=el("div","panel-title");
+    pt.appendChild(el("span",null,title));
+    pt.appendChild(el("span","muted",esc(note)));
+    sec.appendChild(pt);
+    sec.appendChild(barRows(g.versions.map(function(p){return {label:p.v,value:100*p.n/(g.known||1),note:fmt(p.n),color:accent(i)}}),{percent:true,max:100}));
+    v.appendChild(sec);
+  });
+  return v;
+}
 
 function buildDetailFindings(i){
   var src=SRC[i];var v=detailShell(i,"Findings");

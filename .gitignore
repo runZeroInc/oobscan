@@ -1,6 +1,23 @@
 # Build output
+/oobscan
+/oobscan-*
 *.exe
 *.bin
+# Root-level scan-data dir only; anchored so it does NOT shadow pkg/oob/.
+/oob
+
+# Live scan data / lab captures (never commit real target data).
+# Use localnet.example.json as the schema reference instead.
+localnet.json
+/data/
+
+# Scan output (real captures are never committed). Anonymized test fixtures
+# under any testdata/ directory ARE committed -- the negations cover both a
+# top-level testdata/ and package-nested ones (e.g. pkg/check/testdata/).
+*.jsonl
+!testdata/**/*.jsonl
+!**/testdata/*.jsonl
+!**/testdata/**/*.jsonl
 
 # Editor / OS
 .DS_Store

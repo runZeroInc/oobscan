@@ -18,6 +18,12 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/sanitize"
 )
 
+// The web.service check records the HTTP identity of every web listener on a
+// target: the Server header, the HTML <title>, and the favicon MD5 (the classic
+// favicon-hash fingerprint). It runs on all targets and covers the common web
+// ports plus any web port in the scan set, so a device is characterized by its
+// web surface even when nothing else fingerprints it. Read-only (GET / and
+// GET /favicon.ico), reported as info.
 func init() {
 	Register(Check{
 		Name:        "web.service",
@@ -34,6 +40,9 @@ type webPortSpec struct {
 	scheme string
 }
 
+// webCandidatePorts returns the web ports to characterize: the always-common
+// 80/443, plus any additional TCP port in the scan set that is a conventional
+// web/management port. Deduplicated, deterministic order.
 func webCandidatePorts(t *engine.Target) []webPortSpec {
 	seen := map[int]bool{}
 	var out []webPortSpec
@@ -66,6 +75,11 @@ func runWebService(ctx context.Context, t *engine.Target) []engine.Finding {
 	var out []engine.Finding
 	done := map[int]bool{}
 
+	// Primary web port: reuse the Server header + title the identify step already
+	// fetched, avoiding another GET against small embedded web connection pools;
+	// add only the favicon hash. The favicon fetch doubles as the only check-time
+	// read of this port, so whether it answered is what separates a live measurement
+	// from a carried-over one.
 	if pp, pscheme, pserver, ptitle, okp := primaryWeb(t); okp {
 		done[pp] = true
 		fav, favMMH3, favVendor, favProduct, answered := webFavicon(ctx, client, t.Host, webPortSpec{pp, pscheme})
@@ -78,13 +92,14 @@ func runWebService(ctx context.Context, t *engine.Target) []engine.Finding {
 		}
 	}
 
+	// Any additional configured web ports identify did not cover.
 	for _, wp := range webCandidatePorts(t) {
 		if done[wp.port] || ctx.Err() != nil {
 			continue
 		}
 		server, title, ok := webRoot(ctx, client, t.Host, wp)
 		if !ok {
-			continue
+			continue // no HTTP response on this port
 		}
 		t.MarkOpen(wp.port, "tcp", wp.scheme)
 		fav, favMMH3, favVendor, favProduct, _ := webFavicon(ctx, client, t.Host, wp)
@@ -95,6 +110,8 @@ func runWebService(ctx context.Context, t *engine.Target) []engine.Finding {
 	return out
 }
 
+// primaryWeb returns the web port/scheme + Server header + title that the
+// identify step already captured, if any.
 func primaryWeb(t *engine.Target) (port int, scheme, server, title string, ok bool) {
 	if t.Identity == nil {
 		return 0, "", "", "", false
@@ -110,13 +127,17 @@ func primaryWeb(t *engine.Target) (port int, scheme, server, title string, ok bo
 	return p, scheme, t.Identity.Attributes["http.server"], t.Identity.Attributes["http.title"], true
 }
 
+// webFinding builds a web.service finding, or nil when nothing was learned (no
+// Server header, title, or favicon - an empty line is noise). source names where the
+// identity came from when the port did not answer at check time, so the finding is
+// not read as proof the service was live; it is empty for a live read.
 func webFinding(port int, scheme, server, title, favicon, faviconMMH3, favVendor, favProduct, source string) *engine.Finding {
 	if server == "" && title == "" && favicon == "" {
 		return nil
 	}
 	fields := []string{"server", server, "title", title, "favicon", favicon}
 	if faviconMMH3 != "" {
-		fields = append(fields, "faviconMmh3", faviconMMH3)
+		fields = append(fields, "faviconMmh3", faviconMMH3) // == Shodan http.favicon.hash
 	}
 	if favVendor != "" {
 		fields = append(fields, "faviconVendor", favVendor, "faviconProduct", favProduct)
@@ -131,6 +152,8 @@ func webFinding(port int, scheme, server, title, favicon, faviconMMH3, favVendor
 	}
 }
 
+// webRoot GETs "/" and returns the Server header and HTML <title>; ok is false
+// when the port yields no HTTP response.
 func webRoot(ctx context.Context, c *http.Client, host string, wp webPortSpec) (server, title string, ok bool) {
 	url := netaddr.URL(wp.scheme, host, wp.port, "/")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -146,6 +169,14 @@ func webRoot(ctx context.Context, c *http.Client, host string, wp webPortSpec) (
 	return resp.Header.Get("Server"), pageTitle(body), true
 }
 
+// webFavicon fetches /favicon.ico once and returns the hex MD5 plus the
+// Shodan-compatible MurmurHash3 (== http.favicon.hash) of the body, and any
+// vendor/product the mmh3 favicon fingerprints attribute. All empty when the
+// icon is absent. The mmh3 lets an oobscan result be cross-referenced directly
+// against Shodan's favicon facet and gives a live vendor tell for BMC/KVM UIs
+// that hide behind a generic Server header. answered reports whether the port
+// served an HTTP response at all, any status - a 404 for the icon still proves the
+// web tier was up, which a caller relying on carried-over identity needs to know.
 func webFavicon(ctx context.Context, c *http.Client, host string, wp webPortSpec) (md5hex, mmh3, vendor, product string, answered bool) {
 	url := netaddr.URL(wp.scheme, host, wp.port, "/favicon.ico")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -173,6 +204,8 @@ func webFavicon(ctx context.Context, c *http.Client, host string, wp webPortSpec
 	return md5hex, mmh3, vendor, product, true
 }
 
+// pageTitle extracts the text of the first <title> element (case-insensitive),
+// whitespace-collapsed and length-capped.
 func pageTitle(body []byte) string {
 	s := string(sanitize.Bytes(body))
 	low := strings.ToLower(s)
@@ -192,7 +225,7 @@ func pageTitle(body []byte) string {
 	title := strings.Join(strings.Fields(s[start:start+end]), " ")
 	title = strings.ReplaceAll(title, "\ufffd", "")
 	title = strings.Join(strings.Fields(title), " ")
-	return sanitize.TruncateString(title, 120)
+	return sanitize.TruncateString(title, 120) // rune-aware; never splits a multibyte rune
 }
 
 func init() {

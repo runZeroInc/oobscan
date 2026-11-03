@@ -11,6 +11,11 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// vendorleak.go holds dedicated pre-auth verifiers for firmware-derived exposures
+// that the generic endpoint sweep only marks "reachable" - here we inspect the
+// response for the specific leak signature and return a confirmed/not verdict.
+
+// LeakResult is one vendor-specific pre-auth verifier outcome.
 type LeakResult struct {
 	Host    string   `json:"host"`
 	Path    string   `json:"path"`
@@ -45,6 +50,10 @@ func looksLoginBody(body string) bool {
 		strings.Contains(low, "<title>login") || strings.Contains(low, "http-equiv=\"refresh\"")
 }
 
+// CheckSMCConfigTftpd tests the Supermicro ATEN pre-auth U-Boot environment read
+// via /cgi/config_tftpd.cgi (firmware: that CGI is fw_getenv/fw_setenv with no
+// session check). Leaked = a 200 whose body carries >=2 U-Boot env-var
+// signatures and is not a login redirect. Firmware-derived.
 func CheckSMCConfigTftpd(host string, port int, timeout time.Duration) (*LeakResult, error) {
 	if port == 0 {
 		port = 443
@@ -78,6 +87,10 @@ func CheckSMCConfigTftpd(host string, port int, timeout time.Duration) (*LeakRes
 	return r, nil
 }
 
+// CheckFujitsuSCCI tests the Fujitsu iRMC SCCI "HP SIM" unauthenticated identity
+// leak (firmware: FTS_WebServer EmitHpSimInfo, documented default-ON on S5/S6).
+// It POSTs an unauthenticated SCCI ConfigSpace query and flags an identity-XML
+// response. Firmware-derived; not live-validated (no Fujitsu hardware in lab).
 func CheckFujitsuSCCI(host string, port int, timeout time.Duration) (*LeakResult, error) {
 	if port == 0 {
 		port = 443

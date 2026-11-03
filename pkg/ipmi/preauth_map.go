@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// PreAuthMapConfig controls deep pre-auth mapping behavior.
 type PreAuthMapConfig struct {
 	NetFns              []byte
 	Cmds                []byte
@@ -18,10 +19,11 @@ type PreAuthMapConfig struct {
 	Timeout             time.Duration
 	LeakLenThreshold    int
 	RepeatCount         int
-	Concurrency         int
+	Concurrency         int // parallel workers for the phase-1 sweep (default 16); each worker uses its own UDP socket
 	Logf                func(string)
 }
 
+// PreAuthRequestResult is one pre-auth request/response observation.
 type PreAuthRequestResult struct {
 	Mode           string `json:"mode"`
 	NetFn          byte   `json:"netfn,omitempty"`
@@ -41,6 +43,7 @@ type PreAuthRequestResult struct {
 	BypassReason        string `json:"bypassReason,omitempty"`
 }
 
+// RAKPPreAuthResult captures one unauthenticated RAKP-2 behavior.
 type RAKPPreAuthResult struct {
 	Username            string `json:"username"`
 	ErrorCode           byte   `json:"errorCode"`
@@ -51,6 +54,7 @@ type RAKPPreAuthResult struct {
 	Error               string `json:"error,omitempty"`
 }
 
+// PreAuthMapResult is the complete deep pre-auth mapping output.
 type PreAuthMapResult struct {
 	Host string `json:"host"`
 	Port int    `json:"port"`
@@ -67,6 +71,7 @@ type PreAuthMapResult struct {
 	PotentialBypassCount int `json:"potentialBypassCount"`
 }
 
+// DefaultBroadNetFns returns a broad set of standard and OEM request NetFns.
 func DefaultBroadNetFns() []byte {
 	return []byte{
 		NetFnChassis, NetFnBridge, NetFnSensor, NetFnApp,
@@ -76,6 +81,7 @@ func DefaultBroadNetFns() []byte {
 	}
 }
 
+// DefaultBroadCmds returns a broad command byte sample used in deep scans.
 func DefaultBroadCmds() []byte {
 	return []byte{
 		0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
@@ -90,6 +96,7 @@ func DefaultBroadCmds() []byte {
 	}
 }
 
+// AllCmds returns the complete 0x00..0xFF command space.
 func AllCmds() []byte {
 	out := make([]byte, 256)
 	for i := range 256 {
@@ -98,6 +105,7 @@ func AllCmds() []byte {
 	return out
 }
 
+// MapPreAuthSurface performs deep pre-auth mapping for IPMI/RAKP behaviors.
 func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMapResult, error) {
 	if port == 0 {
 		port = DefaultPort
@@ -118,7 +126,9 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 		cfg.RepeatCount = 2
 	}
 	if len(cfg.RAKPUsers) == 0 {
-
+		// A crackable RAKP-2 (CVE-2013-4786) comes back only for a username that exists, so
+		// the defaults have to cover each vendor's shipped admin. "USERID" is the IBM IMM /
+		// Lenovo XCC default administrator; without it those targets silently pass.
 		cfg.RAKPUsers = []string{"admin", "root", "ADMIN", "USERID", "ipmiusr"}
 	}
 	if cfg.Logf != nil {
@@ -137,6 +147,11 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 	}
 	defer c.Close()
 
+	// 1) Broad pre-session netfn/cmd map. Parallelized with a bounded worker pool:
+	// unanswered commands each block for the full per-cmd timeout, so a serial
+	// sweep is slow. Each worker uses its own UDP socket because a single socket
+	// cannot demux concurrent send/recv. Results are written by index to preserve
+	// deterministic (netfn,cmd) ordering.
 	type sweepJob struct{ netfn, cmd byte }
 	var jobs []sweepJob
 	for _, netfn := range cfg.NetFns {
@@ -186,6 +201,7 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 		cfg.Logf(fmt.Sprintf("ipmi.fullWalk: pre-session sweep done (%d responses, %d accepted)", res.ResponseCount, res.AcceptedCount))
 	}
 
+	// 2) Session-zero check for requests that already responded pre-session.
 	if cfg.RunSessionZeroCheck {
 		if cfg.Logf != nil {
 			cfg.Logf("ipmi.fullWalk: session-zero follow-up")
@@ -204,6 +220,7 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 		}
 	}
 
+	// 3) IPMB bridge map (satellite pre-auth pivot surface).
 	if cfg.RunIPMBSweep {
 		if cfg.Logf != nil {
 			cfg.Logf("ipmi.fullWalk: IPMB bridge sweep")
@@ -230,11 +247,13 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 		}
 	}
 
+	// 4) RAKP pre-auth checks.
 	if cfg.RunRAKPChecks && len(cfg.RAKPUsers) > 0 {
 		if cfg.Logf != nil {
 			cfg.Logf(fmt.Sprintf("ipmi.fullWalk: RAKP pre-auth checks %d user(s)", len(cfg.RAKPUsers)))
 		}
-
+		// Establish the "user does not exist" baseline from a known-invalid
+		// username, then compare each candidate against that definite negative.
 		invResp, invHash := false, false
 		invCode := byte(0xFF)
 		if inv, err := DoRAKP12(host, port, "oobscan-nouser-x9q7z", RAKPHMACSHA1, IntegrityNone, ConfNone, cfg.Timeout); err == nil && inv != nil {
@@ -255,7 +274,9 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 			rr.HashLen = len(r.RAKPHash)
 			rr.GUIDPrefix = hexPrefix(r.BMCGUID)
 			rr.PotentialHashLeak = len(r.RAKPHash) > 0
-
+			// Oracle: this username is distinguishable from a known-invalid one --
+			// it leaks a hash the invalid user does not, or it drew a response with
+			// a different completion code than the invalid baseline.
 			rr.PotentialUserOracle = (rr.PotentialHashLeak && !invHash) ||
 				(invResp && rr.ErrorCode != invCode)
 			res.RAKP = append(res.RAKP, rr)
@@ -268,6 +289,13 @@ func MapPreAuthSurface(host string, port int, cfg PreAuthMapConfig) (*PreAuthMap
 	return res, nil
 }
 
+// tally (re)computes the summary counters from Requests and RAKP. It is
+// idempotent (resets first) so it can be unit-tested on a constructed result.
+//
+// Categorisation note: a RAKP-2 HMAC disclosure (CVE-2013-4786) or a
+// username-enumeration oracle is an information leak, not an authentication
+// bypass. Only a request-level PotentialAuthBypass, where an unauthenticated
+// command was actually accepted, counts as a bypass.
 func (res *PreAuthMapResult) tally() {
 	res.ResponseCount, res.AcceptedCount = 0, 0
 	res.PotentialLeakCount, res.PotentialBypassCount = 0, 0

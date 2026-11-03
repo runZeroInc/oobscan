@@ -1,3 +1,9 @@
+// Package mdns implements a read-only unicast mDNS / DNS-SD probe on
+// UDP 5353. It sends one PTR query for the DNS-SD meta-service
+// (_services._dns-sd._udp.local) and parses the advertised service types. It is
+// unicast (not multicast) so it works against a single scan target; many
+// responders answer a unicast query. Read-only: it never registers or updates a
+// record.
 package mdns
 
 import (
@@ -8,16 +14,21 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
+// Port is the mDNS UDP port.
 const Port = 5353
 
+// dnssdMeta is the DNS-SD service-type enumeration name.
 const dnssdMeta = "_services._dns-sd._udp.local."
 
+// Result records advertised service types and a best-effort vendor hint.
 type Result struct {
 	From     string
-	Services []string
-	Vendor   string
+	Services []string // e.g. "_http._tcp.local", "_ipmi._udp.local"
+	Vendor   string   // OOB vendor slug guessed from service names, or ""
 }
 
+// Query sends the unicast DNS-SD enumeration query and returns advertised
+// service types, or nil when nothing usable comes back.
 func Query(host string, timeout time.Duration) *Result {
 	q, err := buildQuery(dnssdMeta)
 	if err != nil {
@@ -54,7 +65,7 @@ func parse(host string, raw []byte) *Result {
 	seen := map[string]bool{}
 	for {
 		h, err := p.AnswerHeader()
-		if err != nil {
+		if err != nil { // ErrSectionDone or malformed -> stop
 			break
 		}
 		if h.Type == dnsmessage.TypePTR {
@@ -80,6 +91,8 @@ func parse(host string, raw []byte) *Result {
 	return r
 }
 
+// vendorFromServices maps a distinctive OOB/KVM mDNS service name to a vendor
+// slug (best effort; "" when only generic _http/_ssh services are advertised).
 func vendorFromServices(services []string) string {
 	joined := strings.ToLower(strings.Join(services, " "))
 	switch {
@@ -90,7 +103,7 @@ func vendorFromServices(services []string) string {
 	case strings.Contains(joined, "jetkvm"):
 		return "jetkvm"
 	case strings.Contains(joined, "_ipmi"), strings.Contains(joined, "redfish"):
-		return ""
+		return "" // OOB service present but vendor-agnostic; caller records the service
 	}
 	return ""
 }

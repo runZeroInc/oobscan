@@ -1,16 +1,45 @@
 # OOBscan
 
-> An exploration tool for (in)secure out-of-band management services.
+> A security assessment and diagnostic tool for out-of-band management.
 
 OOBscan enumerates BMCs, serial-port servers, IP-KVMs, PDUs, and other
-out-of-band management surfaces for protocol exposures, pre-auth information
-leakage, default credentials, and known-vulnerable firmware. The BMC/IPMI
-coverage ships enabled by default and drives the "Lights Out" Black Hat USA
-2026 research.
+out-of-band management services to identify exposures, validate remediation,
+and support authorized incident investigation. It provides:
+
+- Reproducible implementations of the findings in the "Lights Out" research
+  and accompanying [security advisories](../advisories/README.md).
+- Network inventory and exposure assessment to help operators prioritize fixes.
+- Manual protocol diagnostics for IPMI and vendor-specific management operations.
 
 ## Status
 
-This pre-release is missing detailed checks for vulnerabilities that are still going through the vendor notification and disclosure process.
+Pre-release. Interfaces under `pkg/` may change before the first stable tag.
+Security-sensitive findings are coordinated with affected vendors before public
+documentation is expanded.
+
+## Authorized use and operational safety
+
+Run OOBscan only against systems you own or have explicit permission to assess.
+Agree on target scope, credentials, rate limits, and maintenance windows before
+testing production or OT networks. Read-only requests can still affect fragile
+management controllers; no scan mode guarantees zero operational impact.
+
+`scan` sends active network probes and enables default-credential checks by
+default. `--disable-logins` suppresses active login checks, not discovery,
+protocol requests, or RAKP hash collection. It is **not a passive scan mode**.
+Use `--checks`, `--categories`, and `--workers` to limit an assessment. Deep IPMI
+enumeration and the full OpenBMC user-key search require explicit opt-in.
+SNMP write-access validation can send a same-value SET. Although it preserves
+the observed value, firmware may still log the write or apply configuration.
+
+Manual commands can change accounts, reset a BMC, access host memory, or alter
+hardware state. Read each command's help before use. An `apply` gate is a
+confirmation of execution, not a substitute for authorization; raw IPMI and
+some administrative operations execute immediately.
+
+Scan records, configuration backups, hash exports, potfiles, and reports can
+contain credentials, authentication material, and identifying device data.
+Restrict access and retention. Review even redacted output before sharing it.
 
 ## Build
 
@@ -20,9 +49,10 @@ $ go build -o oobscan .
 
 ## Commands
 
-`scan` is the flagship: point it at targets and it runs the full
-identify -> checks -> creds pipeline. The remaining commands are focused tools
-for working with scan results and for interacting with a single target.
+`scan` runs the identify -> checks -> credentials pipeline for each target.
+The remaining commands analyze stored results or perform explicitly selected
+diagnostic and administrative operations. Some manual commands accept multiple
+targets; review the expanded scope before making changes.
 
 ```console
 # Scan and inventory
@@ -34,22 +64,50 @@ $ oobscan version
 $ oobscan convert     # normalize a corpus into oobscan JSONL; redact or audit it
 $ oobscan replay      # re-run the record-pure detection logic over a corpus; diffable table
 $ oobscan report      # build an interactive HTML exposure report (one or many corpora)
-$ oobscan hashcrack   # crack leaked IPMI RAKP hashes offline (SHA1/MD5/SHA256); --show / --import-pot
+$ oobscan hashcrack   # audit disclosed IPMI RAKP hashes offline (SHA1/MD5/SHA256)
 $ oobscan hashdump    # export hashcat / John input files from RAKP hashes
 $ oobscan explain     # render a markdown findings guide from a scan
 
-# Interact with a single target (authenticated / targeted operations)
-$ oobscan ipmi        # ipmitool-like IPMI command runner (mc/chassis/lan/fru/user/sol/raw/...)
+# Authorized diagnostics and administration
+$ oobscan ipmi        # ipmitool-like IPMI command runner (mc/chassis/lan/fru/user/sol/raw/mem/...)
 $ oobscan redfish     # authenticated Redfish OEM operations
 $ oobscan xdp         # Intel ASD / H3C RemoteXDP JTAG client
+
+# Supermicro/ATEN OEM workflows (session-backed commands share `ipmi` flags)
+$ oobscan smc-backup           # export + decrypt the BMC configuration archive
+$ oobscan smc-restore-shell    # stage a certificate-authenticated stunnel break-glass shell
+$ oobscan smc-uninstall        # remove supported shell and legacy service launchers
+$ oobscan smc-shell            # connect to a deployed stunnel shell for investigation
+$ oobscan smc-read             # CVE-2026-65210 read a BMC file over the OEMHW1 file handler
+$ oobscan smc-cdb              # enumerate controllers / send SCSI CDBs
+$ oobscan smc-rakp-bypass      # validate CVE-2026-65219 (ATEN RAKP authentication bypass)
+$ oobscan smc-priv-esc         # validate CVE-2026-65220 (ATEN RAKP privilege escalation)
+$ oobscan smc-x14-cmdinj       # validate CVE-2026-65213 (X14 RestorePSOOBBFile injection)
+$ oobscan smc-alert-cmdinj     # investigate ATEN alert injection (unconfirmed, no CVE)
+$ oobscan smc-kvm              # validate CVE-2026-18451 (Supermicro X13 iKVM token disclosure)
 ```
+
+### Break-glass investigation
+
+`smc-restore-shell` stages a certificate-authenticated stunnel root shell for
+authorized investigation. `--apply` commits the configuration and reboots the
+BMC; staging alone still uploads an archive to the device. The launcher persists
+in the BMC configuration, although the running service uses temporary storage.
+There is no unauthenticated Telnet fallback and no tailnet agent deployment.
+
+The service pins a client certificate. The client does not verify the BMC's
+server certificate and permits legacy TLS for firmware compatibility, so use a
+trusted, restricted management path. Protect the client key, remove access when
+the investigation is complete, and verify cleanup on the device. `smc-uninstall`
+retains cleanup support for recognized legacy launchers; it is not a factory reset
+or a guarantee that every separately installed agent artifact has been removed.
 
 `oobscan convert` rewrites a corpus as native oobscan JSONL. It reads its own
 output (migrating older records to the current rules) and the two runZero export
 shapes (`--format rzsql`, `--format rzservices`), preserving every source
 attribute and deriving the oobscan identity/findings/RAKP view on top. Two
-transforms hang off the same pass: `--redact`, which renumbers addresses and
-strips asset-identifying values to produce a shareable corpus, and `--quality`,
+transforms are available in the same pass: `--redact`, which renumbers addresses
+and removes identifying values to prepare a corpus for review, and `--quality`,
 the contributor-facing QA audit for data-hygiene and coverage regressions
 (formerly the `scanaudit` command).
 
@@ -70,17 +128,16 @@ offline-capable HTML report from one or more oobscan NDJSON corpora. (Point it
 at oobscan output; run a runZero export through `oobscan convert` first.) Naming
 two or more sources (`Internal=a.jsonl External=b.jsonl`) adds a cross-source
 comparison that judges populations on prevalence (% of each source) while
-showing absolute counts, so a small redacted internal fleet and a large internet
-sweep compare cleanly. The report opens on 16:9, deck-ready overview slides
-(arrow-navigable, presentable fullscreen, screenshottable to a 1920x1080 PNG);
-scrollable, interactive detail views -- a per-category exposure heatmap, service
-and port charts, findings, IPMI/RAKP, and a filterable per-host explorer whose
-rows expand to full per-host findings and services -- sit under a per-source
-menu. The payload is gzip-compressed in the page (decompressed via
-`DecompressionStream`), so a 130k-host corpus is a ~12 MB bundle. `--systems`
-caps the explorer rows (default 60k; aggregates always cover the whole corpus),
-`--potfile` marks RAKP hashes already cracked in the pot, and a source produced
-by `convert --redact` is detected and only its anonymized values are carried in.
+showing absolute counts. The HTML contains overview slides and aggregate
+vendor, firmware, service, finding, and IPMI/RAKP views, not per-host rows or
+addresses. Review aggregates before distribution because small populations can
+still disclose sensitive information.
+
+Unless `--no-artifacts` is supplied, the output directory also contains per-source
+hash exports and overview, exposure, IPMI, SNMP, and vendor CSVs. These artifacts
+can include recovered passwords and authentication material. `--potfile` marks
+RAKP hashes recovered by an offline audit. Inputs produced by `convert --redact`
+are identified as redacted; review the full output directory before sharing it.
 
 Beyond the CLI, the scanner's building blocks -- GUID decoding, TLS shared-key
 matching, and the per-protocol probes -- are also importable **library packages**
@@ -97,7 +154,7 @@ a fixed pipeline on each:
 1. **identify** -- probe IPMI/HTTP/TLS/Redfish/iLO/iDRAC/Lantronix/Moxa/..., fuse the
    signals into a device class + vendor + product (`pkg/identify`).
 2. **device-specific checks** -- checks scoped to the identified vendor/class.
-3. **cross-vendor / class checks** -- including the classic exposures: outdated
+3. **cross-vendor / class checks** -- including established exposures: outdated
    libupnp via SSDP (CVE-2012-5958/5959), SNMP default community (`public`), SSH
    banner fingerprint + default-credential login, and the Supermicro `/PSBlock`
    cleartext credential store on TCP/49152 (CVE-2014-8272).
@@ -118,10 +175,12 @@ The interactive view shows progress, finding counts, and active phases.
 `-v`/`--verbose` adds per-target and per-check logging on stderr. Ctrl-C cancels
 the scan, flushes buffered output, and exits.
 
-Default credentials are tried automatically for BMCs: the leaked RAKP-2 hash is
-cracked **offline** (no lockout risk) against the vendor-prioritized knowledge
-base, with a capped **online** RAKP-3/4 fallback for BMCs that don't leak
-(`--disable-logins` disables all active logins).
+Default credentials are checked automatically for BMCs: a disclosed RAKP-2 hash
+is tested **offline** against the vendor-prioritized credential database. That
+offline computation cannot cause account lockouts. A capped **online** RAKP-3/4
+fallback is used when a BMC does not disclose a hash. Online login checks may
+trigger lockouts, alerts, or device-specific side effects; use
+`--disable-logins` to suppress them.
 
 Output is a live lipgloss TUI on a terminal, while newline-delimited JSON is
 written to a file by default (set with `--output/-o`, or auto-created under
@@ -133,7 +192,7 @@ $ oobscan scan 10.0.0.0/24                      # interactive TUI
 $ oobscan scan -o out.jsonl 10.0.0.0/16         # NDJSON to a file
 $ oobscan scan 10.0.0.0/16                      # NDJSON auto file in cache dir
 $ oobscan scan --disable-output 10.0.0.0/16     # no auto NDJSON file
-$ oobscan scan --disable-logins 10.0.0.0/16 # passive-only (no active default login attempts)
+$ oobscan scan --disable-logins 10.0.0.0/16     # active probes, without login checks
 $ oobscan scan --ipmi-full 10.0.0.22            # + full IPMI walk
 $ oobscan scan -v 10.0.0.22                      # -v/--verbose: per-target identity + progress
 ```
@@ -156,7 +215,7 @@ $ oobscan scan 'fe80::dead:beef%en0'             # a link-local host directly
 ```
 
 Two probes go out per interface (`pkg/discover`): an **ICMPv6 echo** to the group,
-which every IPv6 node answers and which carries the sweep, and an **RMCP presence
+whose responses depend on device and network policy, and an **RMCP presence
 ping + session-less Get Channel Auth Caps** on UDP/623, which additionally proves
 a responder is a BMC. Both are read-only. Nodes stagger and rate-limit replies to
 multicast (RFC 4443), so the sweep spreads several probes across the listen
@@ -192,13 +251,14 @@ front-end over them. Highlights:
 | IPv6-safe host:port and URL formatting (zones) | `pkg/netaddr` | `DialHostPort`, `URL`, `URLHostPort` |
 | BMC System GUID decoder (vendor taxonomy) | `pkg/guid` | `Decode`, `DecodeHex` |
 | Remotely-detectable BMC/webapp CVE knowledge base | `pkg/check`, `pkg/ilo` | `check.Register` HTTP CVE checks, `ilo` CVE map |
+| IPMI RMCP+ authentication-bypass validation | `pkg/ipmi`, `pkg/check` | OpenBMC default-userKey (`--openbmc-bmcrand`); HPE iLO4 RAKP-none payload-type confusion (`--ilo-rakp-none`, check `ipmi.ilo.rakpNoneBypass`) |
 | Default/shared TLS cert + SPKI shared-key matching | `pkg/tlscert` | `Inspect`, `ClassifyIdentity` |
 | Registered security-check registry | `pkg/check` | `check.Register`, `check.All` |
 | Device/vendor/product inventory | `pkg/oob` | `oob.Vendors`, `oob.ByVendor` |
 | Per-protocol probes | `pkg/ipmi`, `pkg/redfish`, `pkg/ilo`, `pkg/idrac`, `pkg/tlscert`, `pkg/wsman`, `pkg/amt`, `pkg/snmp`, `pkg/ssdp`, `pkg/slp`, `pkg/lantronix`, `pkg/moxa` | package-level probe funcs |
 
-> Note: these packages are importable but are not a committed-stable public API
-> map and stability notes, and [`examples/`](examples/) for runnable snippets.
+> These packages are importable, but their public APIs are not yet stable.
+> See [`examples/README.md`](examples/README.md) for usage examples.
 
 ## Extending
 
@@ -210,6 +270,10 @@ front-end over them. Highlights:
   `oob.Category` mapping (`pkg/identify/class.go`).
 - **New protocol probe**: add `pkg/<proto>/`, then a collector in
   `pkg/identify/collectors.go` that fuses its signals into identification.
+
+Document each check's evidence, limitations, and remediation guidance. Keep
+credential checks and state-changing diagnostics explicit, and add tests for
+their authorization and operational safeguards.
 
 ## Protocols covered
 
@@ -243,8 +307,8 @@ Implementation coverage is tracked in
 
 ## Capability model
 
-Checks are organized around what an unauthenticated network client can learn or do
-against a BMC:
+Checks distinguish inventory evidence, potential exposure, and confirmed access
+so operators can assess risk and verify remediation:
 
 - **Discovery** -- RMCP ping, Get Channel Auth Caps, Get Device ID, paged
   cipher-suite enumeration, Get System GUID.
@@ -262,13 +326,15 @@ against a BMC:
 
 ## Design notes
 
-- Single static Go binary, zero runtime deps.
+- The scanner builds as a single Go binary. Manual shell staging and generated
+  connection helpers also require local shell/OpenSSL utilities and compatible
+  stunnel binaries on the BMC.
 - Typed `check.Register(Check{...})` registry; checks are selectable via
   `--checks` and `--categories`.
-- NDJSON output is the machine-readable source of truth.
+- NDJSON output is the machine-readable source of truth; see
+  [`docs/data-dictionary.json`](docs/data-dictionary.json).
 - Single IPv6 targets are supported. CIDR and hyphen-range expansion is IPv4-only.
 
 ## License
 
 BSD 2-Clause. See [LICENSE](LICENSE).
-# oobscan

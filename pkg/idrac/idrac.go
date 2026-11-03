@@ -1,3 +1,5 @@
+// Package idrac implements Dell-specific HTTP fingerprinting and a small set of
+// unauthenticated endpoints that can expose device data.
 package idrac
 
 import (
@@ -20,12 +22,13 @@ var (
 	reAboutGen = regexp.MustCompile(`(?i)Integrated Dell Remote Access Controller\s*(\d+)`)
 )
 
+// Info captures pre-auth facts from an iDRAC.
 type Info struct {
 	Host           string
-	Generation     int
+	Generation     int // 6,7,8,9,10 (best guess)
 	Version        string
 	FWVersion      string
-	ServiceTag     string
+	ServiceTag     string // from GUID decode or /sysmgmt leak
 	Model          string
 	Hostname       string
 	OEMHostname    string
@@ -42,28 +45,36 @@ type Info struct {
 	Name           string
 	IsOEMBranded   string
 	ServerBanner   string
-	Endpoints      []string
-
+	Endpoints      []string // endpoints that returned >0 bytes unauth
+	// DefaultCredKnown is true when the non-intrusive default-cred detector
+	// (/data?get=defaultCred_inplace) answered pre-auth. iDRAC6 lacks this
+	// warning logic, so a false here does not prove the credential is changed.
 	DefaultCredKnown bool
-
+	// DefaultCredInPlace is true when the box still ships root:calvin (only
+	// meaningful when DefaultCredKnown is true).
 	DefaultCredInPlace bool
 }
 
+// Probe hits several Dell-specific endpoints.
 func Probe(host string, timeout time.Duration) (*Info, error) {
 	return ProbeAt(host, 443, timeout)
 }
 
+// ProbeAt hits several Dell-specific endpoints on the given web port.
 func ProbeAt(host string, port int, timeout time.Duration) (*Info, error) {
-
+	// IdentifyClient raises the per-phase handshake ceiling to the whole-request
+	// timeout so a slow BMC RSA handshake completes; for the small check-battery
+	// timeout it is identical to httpx.Client (ceiling clamps to timeout/2).
 	client := httpx.IdentifyClient(timeout)
 	info := &Info{Host: host}
 	base := baseURL(host, port)
 
+	// 1. / index -- banner carries "iDRAC" generation.
 	if st, body, hdr, err := httpGet(client, base+"/", timeout); err == nil && st == 200 {
 		info.ServerBanner = hdr.Get("Server")
 		info.Generation = guessGen(hdr.Get("Server"), string(body))
 	}
-
+	// 1a. /public/about.html (legacy iDRAC6/7 page) leaks firmware+generation.
 	if st, body, _, err := httpGet(client, base+"/public/about.html", timeout); err == nil && st == 200 {
 		if fw, gen, ok := parseAboutPage(string(body)); ok {
 			info.Endpoints = append(info.Endpoints, "/public/about.html")
@@ -78,12 +89,14 @@ func ProbeAt(host string, port int, timeout time.Duration) (*Info, error) {
 			}
 		}
 	}
-
+	// 2. /data?get=fwVersion (iDRAC6/7 unauth leak).
 	if st, body, _, err := httpGet(client, base+"/data?get=fwVersion", timeout); err == nil && st == 200 {
 		info.FWVersion = extractTag(string(body), "fwVersion")
 		info.Endpoints = append(info.Endpoints, "/data?get=fwVersion")
 	}
-
+	// 2a. /data?get=defaultCred_inplace -- sessionless allowlisted endpoint on
+	// iDRAC7/8. Non-intrusive default-cred detector: reveals whether root:calvin
+	// is still in place without a login.
 	if st, body, _, err := httpGet(client, base+"/data?get=defaultCred_inplace", timeout); err == nil && st == 200 {
 		info.Endpoints = append(info.Endpoints, "/data?get=defaultCred_inplace")
 		if known, inplace := parseDefaultCredInPlace(string(body)); known {
@@ -91,7 +104,7 @@ func ProbeAt(host string, port int, timeout time.Duration) (*Info, error) {
 			info.DefaultCredInPlace = inplace
 		}
 	}
-
+	// 2b. /session?aimGetProp=... -- sessionless iDRAC7-era metadata endpoint.
 	if st, body, _, err := httpGet(client, base+"/session?aimGetProp=hostname,gui_str_title_bar,OEMHostName,fwVersion,sysDesc,status", timeout); err == nil && st == 200 {
 		if aim, ok := parseAIMBody(body); ok {
 			info.Endpoints = append(info.Endpoints, "/session?aimGetProp=hostname,gui_str_title_bar,OEMHostName,fwVersion,sysDesc,status")
@@ -121,14 +134,14 @@ func ProbeAt(host string, port int, timeout time.Duration) (*Info, error) {
 			}
 		}
 	}
-
+	// 3. /data/login -- iDRAC legacy login challenge (often leaks service tag).
 	if st, body, _, err := httpGet(client, base+"/data/login", timeout); err == nil && st == 200 {
 		info.Endpoints = append(info.Endpoints, "/data/login")
 		if tag := extractTag(string(body), "smServiceTag"); tag != "" {
 			info.ServiceTag = tag
 		}
 	}
-
+	// 4. /sysmgmt/2015/bmc/info -- iDRAC9+ metadata endpoint (JSON on 200).
 	if st, body, hdr, err := httpGet(client, base+"/sysmgmt/2015/bmc/info", timeout); err == nil {
 		if st == 200 || st == 401 {
 			info.Endpoints = append(info.Endpoints, "/sysmgmt/2015/bmc/info")
@@ -183,15 +196,20 @@ func ProbeAt(host string, port int, timeout time.Duration) (*Info, error) {
 			}
 		}
 	}
-
+	// 5. /cgi-bin/login (very old iDRAC6/7) -- used by CVE-2018-1207 shellshock.
 	if st, _, _, err := httpGet(client, base+"/cgi-bin/login", timeout); err == nil && st != 404 {
 		info.Endpoints = append(info.Endpoints, "/cgi-bin/login")
 	}
-
+	// 6. Redfish SessionService typically returns product info even unauth.
 	if st, body, _, err := httpGet(client, base+"/redfish/v1/Managers/iDRAC.Embedded.1", timeout); err == nil {
 		if st == 200 || st == 401 {
 			info.Endpoints = append(info.Endpoints, "/redfish/v1/Managers/iDRAC.Embedded.1")
-
+			// Redfish + the iDRAC.Embedded.1 manager only proves iDRAC7 or newer
+			// (iDRAC6 has no Redfish); iDRAC7/8/9 all expose this exact path, so we
+			// cannot infer generation 9 from it. Leaving Generation at 0 (unknown)
+			// rather than over-claiming "9" avoids mislabeling an iDRAC7/8 and, in
+			// turn, attributing generation-9-specific CVEs to it. The reliable
+			// generation signal is the Server-header banner parsed in guessGen().
 			_ = body
 		}
 	}
@@ -250,6 +268,10 @@ func extractTag(s, tag string) string {
 	return s[a : a+b]
 }
 
+// parseDefaultCredInPlace interprets a /data?get=defaultCred_inplace response.
+// The endpoint returns XML like <root><defaultCred_inplace>1</...></root>.
+// known reports whether the tag was present; inplace reports whether the
+// default root:calvin credential is still active.
 func parseDefaultCredInPlace(body string) (known, inplace bool) {
 	v := extractTag(body, "defaultCred_inplace")
 	if v == "" {
@@ -259,6 +281,8 @@ func parseDefaultCredInPlace(body string) (known, inplace bool) {
 	return true, v == "1" || v == "true"
 }
 
+// parseAIMProp extracts a single property value from a /session?aimGetProp=<p>
+// response, which is XML such as <aimGetProp><fwVersionFull>...</...>.
 func parseAIMProp(body, prop string) string {
 	if aim, ok := parseAIMBody([]byte(body)); ok {
 		switch prop {
@@ -319,7 +343,7 @@ func parseAIMBody(body []byte) (aimFields, bool) {
 			return out, true
 		}
 	}
-
+	// Legacy XML fallback.
 	out := aimFields{
 		Hostname:    strings.TrimSpace(extractTag(string(body), "hostname")),
 		GUITitleBar: strings.TrimSpace(extractTag(string(body), "gui_str_title_bar")),
@@ -375,6 +399,7 @@ func parseAboutPage(body string) (fwVersion, generation string, ok bool) {
 	return fwVersion, generation, fwVersion != "" || generation != ""
 }
 
+// ParseXMLData parses a Dell /data?get=... RackHMC-style response.
 func ParseXMLData(body []byte) (map[string]string, error) {
 	type elem struct {
 		XMLName xml.Name

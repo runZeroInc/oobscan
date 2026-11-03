@@ -1,5 +1,14 @@
 package ipmi
 
+// Self-contained MD2 (RFC 1319 section 3) for the IPMI v1.5 auth-type MD2 (0x01)
+// code: the Go standard library ships no MD2, yet legacy BMCs advertise it in Get
+// Channel Auth Caps (bit1) and some offer nothing else. Used solely to compute the
+// 16-byte AuthCode, never for security.
+//
+// Same construction as the MD5 AuthCode, only the digest differs:
+// MD2( pw16 || sessionID(4 LE) || msgData || sessionSeq(4 LE) || pw16 ).
+
+// md2PiSubst is the digits of pi permutation table from RFC 1319, Appendix.
 var md2PiSubst = [256]byte{
 	41, 46, 67, 201, 162, 216, 124, 1, 61, 54, 84, 161, 236, 240, 6,
 	19, 98, 167, 5, 243, 192, 199, 115, 140, 152, 147, 43, 217, 188,
@@ -21,14 +30,16 @@ var md2PiSubst = [256]byte{
 	31, 26, 219, 153, 141, 51, 159, 17, 131, 20,
 }
 
+// md2Sum returns the 16-byte MD2 digest of data (RFC 1319).
 func md2Sum(data []byte) []byte {
-
+	// 1. Append padding so length == 0 mod 16. Pad value = number of pad bytes.
 	msg := append([]byte(nil), data...)
 	pad := 16 - (len(msg) % 16)
 	for range pad {
 		msg = append(msg, byte(pad))
 	}
 
+	// 2. Append the 16-byte checksum.
 	var checksum [16]byte
 	var l byte
 	for i := 0; i < len(msg)/16; i++ {
@@ -40,6 +51,7 @@ func md2Sum(data []byte) []byte {
 	}
 	msg = append(msg, checksum[:]...)
 
+	// 3. Process each 16-byte block through the 48-byte state buffer.
 	var x [48]byte
 	for i := 0; i < len(msg)/16; i++ {
 		for j := range 16 {

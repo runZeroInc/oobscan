@@ -5,6 +5,7 @@ import (
 	"math/big"
 )
 
+// builtinCharset holds the hashcat/John built-in mask charsets.
 var builtinCharset = map[byte]string{
 	'l': "abcdefghijklmnopqrstuvwxyz",
 	'u': "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -12,24 +13,27 @@ var builtinCharset = map[byte]string{
 	's': " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
 	'h': "0123456789abcdef",
 	'H': "0123456789ABCDEF",
-	'a': "",
+	'a': "", // filled in init (?l?u?d?s)
 }
 
 func init() {
 	builtinCharset['a'] = builtinCharset['l'] + builtinCharset['u'] + builtinCharset['d'] + builtinCharset['s']
 }
 
+// Mask is a parsed hashcat-style mask: one charset per output position.
 type Mask struct {
 	spec string
 	sets [][]byte
 }
 
+// ParseMask parses a hashcat/John mask spec: ?l ?u ?d ?s ?a ?h ?H built-ins,
+// ?1..?4 custom charsets, literal characters, and ?? for a literal '?'.
 func ParseMask(spec string, custom map[byte]string) (*Mask, error) {
 	m := &Mask{spec: spec}
 	for i := 0; i < len(spec); i++ {
 		c := spec[i]
 		if c != '?' {
-			m.sets = append(m.sets, []byte{c})
+			m.sets = append(m.sets, []byte{c}) // literal
 			continue
 		}
 		i++
@@ -60,6 +64,7 @@ func ParseMask(spec string, custom map[byte]string) (*Mask, error) {
 	return m, nil
 }
 
+// Keyspace returns the total number of candidates the mask produces (may be huge).
 func (m *Mask) Keyspace() *big.Int {
 	total := big.NewInt(1)
 	for _, s := range m.sets {
@@ -68,6 +73,9 @@ func (m *Mask) Keyspace() *big.Int {
 	return total
 }
 
+// Stream emits every candidate for the mask (an odometer over positions,
+// rightmost fastest) to out, then closes out so consumers ranging over it
+// terminate. It stops early if stop is closed.
 func (m *Mask) Stream(out chan<- string, stop <-chan struct{}) {
 	defer close(out)
 	idx := make([]int, len(m.sets))
@@ -81,7 +89,7 @@ func (m *Mask) Stream(out chan<- string, stop <-chan struct{}) {
 		case <-stop:
 			return
 		}
-
+		// Increment odometer (rightmost position fastest).
 		pos := len(idx) - 1
 		for pos >= 0 {
 			idx[pos]++
@@ -92,7 +100,7 @@ func (m *Mask) Stream(out chan<- string, stop <-chan struct{}) {
 			pos--
 		}
 		if pos < 0 {
-			return
+			return // wrapped -> exhausted
 		}
 	}
 }

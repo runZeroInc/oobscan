@@ -9,6 +9,15 @@ import (
 	"strings"
 )
 
+// Opengear console-server web-login adapter (modern OM2200 and legacy 5.5.0 --
+// one og-rest-api codebase, two vintages). Login is a JSON POST to
+// /api/v{N}/sessions; the `sid` in the 303 body is carried as `Authorization:
+// Token <sid>`. The 303+sid is necessary but not sufficient: real units answer
+// `GET /api/v{N}/sessions/self` with HTTP 200 even for a bogus token
+// (`state=challenge-in-progress`), so success is gated on that resource
+// returning `state=Authenticated`. See kb/opengear/. v2 is tried first,
+// falling through to v1 only on 404; a 401 is definitive and is not retried on
+// the other version.
 type opengearAdapter struct{}
 
 func (opengearAdapter) mechanism() string { return "httpRest" }
@@ -18,35 +27,38 @@ func (opengearAdapter) login(ctx context.Context, client *http.Client, base, use
 	for _, ver := range []string{"v2", "v1"} {
 		st, sid, e := opengearPostSession(ctx, client, base, ver, user, pass)
 		if e != nil {
-			return false, "", e
+			return false, "", e // transport error: stop
 		}
 		switch {
 		case st == http.StatusSeeOther || st == http.StatusFound:
 			if sid == "" {
-				return false, "", nil
+				return false, "", nil // redirect without a session id: not a clean success
 			}
-
+			// Gate on the authenticated-only self-session resource: the token must
+			// resolve to state=Authenticated. Always tear the minted session down.
 			authed, p := opengearConfirmSession(ctx, client, base, ver, sid, user)
 			opengearLogout(ctx, client, base, ver, sid)
 			if !authed {
-				return false, "", nil
+				return false, "", nil // 303+sid but the session is not authenticated
 			}
 			return true, p, nil
 		case st == http.StatusUnauthorized || st == http.StatusForbidden:
-			return false, "", nil
+			return false, "", nil // definitive rejection; do not probe the other version
 		case st == http.StatusNotFound:
-			continue
+			continue // endpoint not on this API version; try the other
 		default:
 			neither = false
 			continue
 		}
 	}
 	if neither {
-		return false, "", errNotThisDevice
+		return false, "", errNotThisDevice // no /api/v{1,2}/sessions endpoint here
 	}
 	return false, "", nil
 }
 
+// opengearPostSession posts the credential to /api/<ver>/sessions and returns the
+// status and any session id parsed from the JSON body.
 func opengearPostSession(ctx context.Context, client *http.Client, base, ver, user, pass string) (status int, sid string, err error) {
 	reqBody, _ := json.Marshal(map[string]string{"username": user, "password": pass})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/api/"+ver+"/sessions", strings.NewReader(string(reqBody)))
@@ -67,6 +79,13 @@ func opengearPostSession(ctx context.Context, client *http.Client, base, ver, us
 	return resp.StatusCode, env.Sid, nil
 }
 
+// opengearConfirmSession issues the read-only self-session GET with the minted
+// token and reports whether it resolves to an authenticated session. It returns
+// authed=true only when the body reports state=Authenticated; the HTTP status is
+// not trusted on its own because real firmware answers this endpoint 200 even for
+// an invalid token (reporting state=challenge-in-progress). The proof carries the
+// evidence gathered this run -- the sid token length, the endpoint GET'd, its HTTP
+// status, the returned state marker, and the authenticated user.
 func opengearConfirmSession(ctx context.Context, client *http.Client, base, ver, sid, user string) (authed bool, proof string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/"+ver+"/sessions/self", nil)
 	if err != nil {
@@ -102,6 +121,7 @@ func opengearConfirmSession(ctx context.Context, client *http.Client, base, ver,
 	)
 }
 
+// opengearLogout attempts to release the session token created by the check.
 func opengearLogout(ctx context.Context, client *http.Client, base, ver, sid string) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, base+"/api/"+ver+"/sessions/self", nil)
 	if err != nil {

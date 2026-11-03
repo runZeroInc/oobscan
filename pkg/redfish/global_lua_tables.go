@@ -12,6 +12,7 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// GlobalLuaTablesResult captures a probe of AMI's pre-auth GlobalLuaTables endpoint.
 type GlobalLuaTablesResult struct {
 	Host        string
 	Port        int
@@ -25,10 +26,14 @@ type GlobalLuaTablesResult struct {
 	Error       string
 }
 
+// CheckGlobalLuaTables performs a read-only pre-auth probe of
+// /redfish/v1/GlobalLuaTables and confirms that the response belongs to the
+// requested endpoint rather than a login page or generic error body.
 func CheckGlobalLuaTables(host string, port int, scheme string, timeout time.Duration) GlobalLuaTablesResult {
 	return CheckGlobalLuaTablesContext(context.Background(), host, port, scheme, timeout)
 }
 
+// CheckGlobalLuaTablesContext is CheckGlobalLuaTables with cancellation.
 func CheckGlobalLuaTablesContext(ctx context.Context, host string, port int, scheme string, timeout time.Duration) GlobalLuaTablesResult {
 	if port == 0 {
 		port = 443
@@ -75,6 +80,9 @@ func parseGlobalLuaTablesBody(status int, body []byte) (bool, int) {
 		return true, len(resource.Members)
 	}
 
+	// Older builds may return the table object directly instead of a Redfish
+	// collection. Keep recognizing that distinct response shape as endpoint
+	// presence, but do not infer sensitive disclosure from it.
 	var object map[string]json.RawMessage
 	if err := json.Unmarshal(body, &object); err == nil {
 		if raw, ok := object["GlobalLuaTables"]; ok && len(raw) > 0 && string(raw) != "null" {
