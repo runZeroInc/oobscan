@@ -7,9 +7,56 @@ out-of-band management services to identify exposures, validate remediation,
 and support authorized incident investigation. It provides:
 
 - Reproducible implementations of the findings in the "Lights Out" research
-  and accompanying [security advisories](../advisories/README.md).
+  and accompanying [security advisories](#research-and-disclosures).
 - Network inventory and exposure assessment to help operators prioritize fixes.
 - Manual protocol diagnostics for IPMI and vendor-specific management operations.
+
+## Research and disclosures
+
+The [Lights Out: The server in your server, exposed and disclosed](https://www.runzero.com/blog/lights-out-exposed/)
+research post is the main guide to this project and its findings. Related public
+presentations include [Black Hat USA 2026](https://blackhat.com/us-26/briefings/schedule/#lights-out-bmcs-are-still-broken-and-now-we-have-the-receipts-53926)
+and [DEF CON 34](https://defcon.org/html/defcon-34/dc-34-speakers.html#content_66635).
+See also the earlier [BMC research rapid response](https://www.runzero.com/blog/bmc-research/),
+the [Lenovo XCC2 CVE-2024-38508 follow-up](https://www.runzero.com/blog/cve-2024-38508-lenovo/),
+and the complete [runZero advisory index](https://www.runzero.com/advisories/).
+
+CVEs covered by the Lights Out research and follow-up:
+
+- **OpenBMC:** [CVE-2026-16140](https://www.runzero.com/advisories/openbmc-ipmi-privsec-rakp-cve-2026-16140/),
+  [CVE-2026-16141](https://www.runzero.com/advisories/openbmc-ipmi-auth-bypass-rakp-cve-2026-16141/)
+- **Lenovo XCC2:** [CVE-2024-38508](https://www.cve.org/CVERecord?id=CVE-2024-38508)
+- **HPE iLO:** [CVE-2026-65204](https://www.runzero.com/advisories/hpe-ilo-preauth-overflow-ssh-cve-2026-65204/),
+  [CVE-2026-65205](https://www.runzero.com/advisories/hpe-ilo-ipmi-session-injection-cve-2026-65205/),
+  [CVE-2026-65206](https://www.runzero.com/advisories/hpe-ilo-type-confusion-cve-2026-65206/),
+  [CVE-2026-65207](https://www.runzero.com/advisories/hpe-ilo-truncated-json-unicode-escape-dos-cve-2026-65207/),
+  [CVE-2026-65208](https://www.runzero.com/advisories/hpe-ilo-json-dispatcher-mutex-leak-cve-2026-65208/),
+  [CVE-2026-65209](https://www.runzero.com/advisories/hpe-ilo-redfish-nested-json-dos-cve-2026-65209/)
+- **Huawei openUBMC:** [CVE-2026-65198](https://www.runzero.com/advisories/huawei-default-snmpv3-usm-key-cve-2026-65198/),
+  [CVE-2026-65199](https://www.runzero.com/advisories/huawei-openubmc-snmp-privsec-cve-2026-65199/),
+  [CVE-2026-65200](https://www.runzero.com/advisories/huawei-malicious-device-integer-underflow-cve-2026-65200/)
+- **H3C HDM:** [CVE-2026-65197](https://www.runzero.com/advisories/h3c-hdm-firmware-verification-key-replacement-cve-2026-65197/)
+- **Vertiv Avocent:** [CVE-2026-65184](https://www.runzero.com/advisories/avocent-acs8000-wsserver-cmdinj-cve-2026-65184/)
+- **Dell iDRAC:** [CVE-2026-65185](https://www.runzero.com/advisories/dell-idrac-pldm-bof-cve-2026-65185/),
+  [CVE-2026-65186](https://www.runzero.com/advisories/dell-idrac10-sqli-cve-2026-65186/),
+  [CVE-2026-65187](https://www.runzero.com/advisories/dell-idrac9-xrc4-underflow-cve-2026-65187/),
+  [CVE-2026-65188](https://www.runzero.com/advisories/dell-idrac9-ipmi-bof-cve-2026-65188/),
+  [CVE-2026-65189](https://www.runzero.com/advisories/dell-idrac-redfish-sqli-cve-2026-65189/),
+  [CVE-2026-65190](https://www.runzero.com/advisories/dell-idrac9-sso-dos-cve-2026-65190/),
+  [CVE-2026-65191](https://www.runzero.com/advisories/dell-idrac9-ssrf-cve-2026-65191/),
+  [CVE-2026-65192](https://www.runzero.com/advisories/dell-idrac10-telemetry-exposure-cve-2026-65192/),
+  [CVE-2026-65193](https://www.runzero.com/advisories/dell-idrac9-maser-update-cve-2026-65193/),
+  [CVE-2026-65194](https://www.runzero.com/advisories/dell-idrac-tls-key-cve-2026-65194/),
+  [CVE-2026-65195](https://www.runzero.com/advisories/dell-idrac10-predictable-password-cve-2026-65195/),
+  [CVE-2026-65196](https://www.runzero.com/advisories/dell-idrac10-ipv6-ipmi-cve-2026-65196/)
+- **Supermicro:** [CVE-2026-18449](https://www.runzero.com/advisories/smc-rakp-key-cve-2026-18449/),
+  [CVE-2026-18450](https://www.runzero.com/advisories/smc-ipmi-auth-bypass-cve-2026-18450/),
+  [CVE-2026-18451](https://www.runzero.com/advisories/smc-kvm-token-cve-2026-18451/),
+  [CVE-2026-65210](https://www.runzero.com/advisories/smc-fileread-cve-2026-65210/),
+  [CVE-2026-65211](https://www.runzero.com/advisories/smc-memaccess-cve-2026-65211/),
+  [CVE-2026-65213](https://www.runzero.com/advisories/smc-cmdinj-cve-2026-65213/),
+  [CVE-2026-65219](https://www.runzero.com/advisories/smc-rakp-bypass-cve-2026-65219/),
+  [CVE-2026-65220](https://www.runzero.com/advisories/smc-priv-esc-cve-2026-65220/)
 
 ## Status
 
