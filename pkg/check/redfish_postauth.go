@@ -18,7 +18,9 @@ func init() {
 		Description: "Collect post-auth Redfish inventory (vendor/model/firmware/serial) using supplied or scan-recovered credentials",
 		Category:    "creds",
 		Applies:     Applicability{Classes: []engine.DeviceClass{engine.ClassBMC}},
-
+		// Not Authenticated: that flag gates on the operator supplying --creds. Since
+		// suppliedCreds also returns the credentials the scan recovered, the check has its
+		// own source and the gate would only suppress it.
 		Enabled: true,
 		Run:     runRedfishPostAuthEnum,
 	})
@@ -95,6 +97,9 @@ func runRedfishPostAuthEnum(ctx context.Context, t *engine.Target) []engine.Find
 			Info:   info,
 		})
 
+		// Compact finding fields: the full authenticated inventory lives on
+		// the top-level `redfishPostAuth` record; the finding here summarises
+		// what happened so a triage view is self-contained.
 		return []engine.Finding{{
 			Check: "http.redfish.postAuthEnum", Category: "creds", Risk: "info",
 			Port: port, Transport: "tcp", Protocol: "redfish",
@@ -131,13 +136,24 @@ func suppliedCreds(t *engine.Target) []engine.Cred {
 	for _, c := range t.Creds {
 		add(c)
 	}
-
+	// Credentials the scan recovered count too: BMC accounts are shared between the IPMI
+	// and Redfish front ends on essentially every vendor, so a password cracked out of a
+	// RAKP-2 hash is a Redfish credential. Looking only at the operator's --creds list
+	// skips every host whose password the scan itself discovered.
+	//
+	// Ordered after the supplied credentials so an explicit --creds still wins, and
+	// admin-looking accounts first within the discovered set.
 	for _, c := range crackedCreds(t) {
 		add(c)
 	}
 	return out
 }
 
+// credSourceFunc returns a provenance labeller for the credentials suppliedCreds
+// yields: the pairs the operator passed on the command line are "cli", anything else
+// came out of this scan's own IPMI recovery. A recovered credential logging into
+// Redfish is a different result from an operator's own one, so the record has to say
+// which it was.
 func credSourceFunc(t *engine.Target) func(engine.Cred) string {
 	fromCLI := make(map[engine.Cred]struct{}, len(t.Creds)+1)
 	if t.Cred.User != "" {
@@ -154,6 +170,12 @@ func credSourceFunc(t *engine.Target) func(engine.Cred) string {
 	}
 }
 
+// crackedCreds returns the verified credentials this scan recovered,
+// most-privileged account first, excluding the SMCRAKP fixed-key marker (a
+// forged RAKP-2 HMAC, not a real password). The ipmi.auth handle is written by
+// the serial IPMI lane, so this check must run after that lane completes (see
+// the deferred lane in cmd/scan.go) -- scheduled alongside it instead, it
+// samples the handle early and finds nothing.
 func crackedCreds(t *engine.Target) []engine.Cred {
 	v, ok := t.Evidenced("ipmi.auth")
 	if !ok {

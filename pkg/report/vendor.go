@@ -8,6 +8,10 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/scanfile"
 )
 
+// vendorDisplayNames maps the canonical lowercase vendor slug (what oobscan
+// identity records carry, and what CredsFor / the KB key on) to its properly
+// capitalized display form for the report. Ported from bmc-stats so the two
+// tools present the same names.
 var vendorDisplayNames = map[string]string{
 	"hpe": "HPE", "dell": "Dell", "supermicro": "Supermicro", "huawei": "Huawei",
 	"lenovo": "Lenovo", "ibm": "IBM", "cisco": "Cisco", "intel": "Intel",
@@ -33,8 +37,20 @@ var vendorDisplayNames = map[string]string{
 	"honeypot": "Honeypot", "unknown": "Unknown",
 }
 
+// vendorSlug resolves the vendor slug for a record. It prefers the resolved
+// identity vendor; when that is absent it recovers one from the side-channel
+// signals every probe already captured (the IPMI GUID/OEM vendor, the curated
+// bmcfp fingerprints over the TLS subject/issuer, HTTP Server header, SSH banner
+// and HTML title, and finally an organization-name token scan). A classified
+// honeypot with no recoverable vendor is bucketed as "honeypot" -- a known
+// non-device, kept apart from a genuinely unattributed "unknown". This is what
+// pulls the report's unknown-vendor rate down to what bmc-stats produced, which
+// resolved the same side channels rather than trusting identity.vendor alone.
 func vendorSlug(rec *scanfile.Record) string {
-
+	// The honeypot verdict outranks any vendor the record appears to carry: a decoy's
+	// vendor is a costume, and the same decoy answers several vendors' probes at once.
+	// Testing this last believes the emulated identity and counts it as a resolved
+	// vendor, inflating exactly the vendors decoys like to imitate.
 	if recordClass(rec) == "honeypot" {
 		return "honeypot"
 	}
@@ -47,6 +63,10 @@ func vendorSlug(rec *scanfile.Record) string {
 	return "unknown"
 }
 
+// inferVendorSlug recovers a vendor slug from a record's side channels, or "" if
+// none resolve. Signals are consulted strongest-first: the IPMI GUID/OEM vendor
+// (a first-party tell the BMC emits), the curated bmcfp fingerprints, then a
+// broad organization-name token scan over the TLS DN / Server / title blob.
 func inferVendorSlug(rec *scanfile.Record) string {
 	if v := ipmiGUIDVendor(rec); v != "" {
 		return v
@@ -99,6 +119,9 @@ func inferVendorSlug(rec *scanfile.Record) string {
 	return vendorFromOrgTokens(blob)
 }
 
+// vendorFromServiceShape covers high-confidence compound signatures present in
+// service-only inventory records. These deliberately require corroboration: a
+// generic Apache header or a bare IPMI port is never enough by itself.
 func vendorFromServiceShape(rec *scanfile.Record) string {
 	server := strings.ToLower(firstServiceAttr(rec, "http.head.server"))
 	vhost := strings.TrimSpace(firstServiceAttr(rec, "tls.vhost"))
@@ -186,6 +209,10 @@ func recordHasHTMLTitle(rec *scanfile.Record, want string) bool {
 	return strings.EqualFold(strings.TrimSpace(firstServiceAttr(rec, "http.title")), want)
 }
 
+// ipmiGUIDVendor returns the vendor a record's IPMI GUID / OEM signals name, or
+// "" when absent or ambiguous. It reads the ipmi.guid finding's vendor field and
+// the ipmiGuidVendor / ipmiOemName identity attributes -- all first-party tells
+// the BMC returns pre-auth.
 func ipmiGUIDVendor(rec *scanfile.Record) string {
 	for i := range rec.Findings {
 		f := &rec.Findings[i]
@@ -204,6 +231,10 @@ func ipmiGUIDVendor(rec *scanfile.Record) string {
 	return ""
 }
 
+// normalizeVendorSlug lower-cases a vendor tell and rejects the non-committal
+// values the scan uses for "present but unresolved" (empty, unknown, oem, and
+// the "X-or-Y" ambiguous GUID buckets), so an inference never launders a
+// non-answer into a resolved vendor.
 func normalizeVendorSlug(v string) string {
 	v = strings.ToLower(strings.TrimSpace(v))
 	if v == "" || v == "unknown" || v == "oem" || v == "generic" || strings.Contains(v, "-or-") {
@@ -212,8 +243,10 @@ func normalizeVendorSlug(v string) string {
 	return v
 }
 
+// certCN extracts the CommonName value from an X.509 distinguished-name string
+// (e.g. "emailAddress=a@b, CN=Nokia, O=Nokia" -> "Nokia"), or "" if there is none.
 func certCN(dn string) string {
-	for part := range strings.SplitSeq(dn, ",") {
+	for _, part := range strings.Split(dn, ",") {
 		part = strings.TrimSpace(part)
 		if len(part) > 3 && strings.EqualFold(part[:3], "CN=") {
 			return strings.TrimSpace(part[3:])
@@ -222,6 +255,12 @@ func certCN(dn string) string {
 	return ""
 }
 
+// vendorFromOrgTokens maps a lower-cased blob of identity tokens (a TLS DN, a
+// Server header, an HTML title) to a vendor slug by scanning for the vendor's
+// organization name. It complements the curated bmcfp rules with the long tail
+// of BMCs whose only tell is the O=/CN= organization on a self-signed cert.
+// Order matters: the most specific token wins, so an OEM co-brand does not steal
+// a match from the true manufacturer.
 func vendorFromOrgTokens(low string) string {
 	switch {
 	case strings.Contains(low, "super micro"), strings.Contains(low, "supermicro"):
@@ -276,6 +315,8 @@ func vendorFromOrgTokens(low string) string {
 	return ""
 }
 
+// displayVendor maps a slug to its display form; an unknown slug is title-cased
+// (dashes/underscores to spaces) so the report never shows a bare directory slug.
 func displayVendor(slug string) string {
 	if slug == "" {
 		return "Unknown"
@@ -295,6 +336,7 @@ func displayVendor(slug string) string {
 	return "Unknown"
 }
 
+// displayClass maps an oobscan class slug to a readable label.
 func displayClass(class string) string {
 	switch class {
 	case "bmc":

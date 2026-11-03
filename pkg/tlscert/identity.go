@@ -7,6 +7,14 @@ import (
 
 var dellServiceTagCN = regexp.MustCompile(`(?i)^i?drac(?:\d+)?-([a-z0-9]{7})$`)
 
+// ClassifyIdentity derives a vendor hint, an asset identifier, and notes from a
+// leaf certificate's subject/issuer CN. It complements the fingerprint/exact-
+// subject matching in Inspect for:
+//
+//   - per-unit certs whose CN encodes asset info - Dell iDRAC "idrac-<servicetag>"
+//     leaks the service tag in the cert CN.
+//   - default identities not caught by an exact-subject entry - e.g. AMI MegaRAC
+//     units serving CN=ami.com / www.ami.com or issued by megarac.com.
 func ClassifyIdentity(subjectCN, issuerCN string) (vendorHint, serviceTag string, notes []string) {
 	cn := strings.TrimSpace(subjectCN)
 	low := strings.ToLower(cn)

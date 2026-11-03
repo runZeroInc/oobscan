@@ -12,15 +12,25 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
-type preauthProbe struct {
-	id      string
-	vendors []string
-	method  string
-	path    string
-	body    string
-	ctype   string
-	risk    string
+// Table-driven validation of documented pre-auth HTTP info-disclosure
+// endpoints for vendors with a KB-documented marker but no dedicated check:
+// Raritan, TinyPilot, Rittal, Westermo, Tripp Lite, Sierra Wireless. Every
+// probe is read-only: a single unauthenticated GET (or, for Sierra
+// AceManager, the documented status-only POST) against a fixed path, gated on
+// the identified vendor so a generic path (alarm.cgi, /logs/*.xml) cannot
+// fire against an unrelated host. A finding requires a vendor-specific marker
+// in the response; no credential is presented and no state-changing request
+// is ever sent.
 
+type preauthProbe struct {
+	id      string   // canonical check id
+	vendors []string // identified-vendor slugs this row applies to
+	method  string   // "GET" or "POST"
+	path    string
+	body    string // request body for POST (a benign, read-only status query)
+	ctype   string // request Content-Type for POST
+	risk    string
+	// match reports whether the response confirms the pre-auth disclosure.
 	match func(status int, respCT string, body []byte) bool
 }
 
@@ -62,7 +72,12 @@ var preauthProbes = []preauthProbe{
 				return false
 			}
 			s := strings.ToLower(string(b))
-
+			// Guard against a build that session-gates /logs and serves the
+			// PowerAlert login page instead: that page is itself XHTML
+			// ("<?xml?>") and contains "login" (which matches the "log"
+			// substring below), so without this exclusion it would
+			// false-positive as a datalog disclosure. The login form carries
+			// the paun/papwd fields and the logincontainer element.
 			if strings.Contains(s, "papwd") || strings.Contains(s, "logincontainer") {
 				return false
 			}
@@ -73,7 +88,8 @@ var preauthProbes = []preauthProbe{
 		id: "http.tinypilot.hostnameLeak", vendors: []string{"tinypilot"}, method: "GET",
 		path: "/dedicated-window-placeholder", risk: "low",
 		match: func(st int, ct string, b []byte) bool {
-
+			// A short, non-HTML text body carrying the hostname; guard against
+			// a full HTML page or an error.
 			if st != 200 {
 				return false
 			}
@@ -100,7 +116,7 @@ func init() {
 		p := preauthProbes[i]
 		Register(Check{
 			Name:        p.id,
-			Description: "Safe read-only confirmation of a documented pre-auth HTTP disclosure (" + p.path + ")",
+			Description: "Read-only validation of a documented pre-auth HTTP disclosure (" + p.path + ")",
 			Category:    "exposure",
 			Applies:     Applicability{CrossVendor: true},
 			Enabled:     true,
@@ -124,7 +140,9 @@ func runPreauthProbe(ctx context.Context, t *engine.Target, p preauthProbe) []en
 		return nil
 	}
 	t.MarkOpen(port, "tcp", proto)
-
+	// bodyBytes and contentType are recorded unconditionally: engine.F drops empty
+	// values, so a snippet that cleans to "" would leave the finding with no body
+	// evidence at all. A zero-length body is itself worth knowing.
 	fields := engine.F(
 		"url", p.path,
 		"method", p.method,
@@ -140,6 +158,10 @@ func runPreauthProbe(ctx context.Context, t *engine.Target, p preauthProbe) []en
 	}}
 }
 
+// vendorMatches reports whether the identified vendor is one the probe applies
+// to. When the vendor is unknown we do not run these vendor-specific paths, to
+// avoid firing a generic path (alarm.cgi, /logs/*.xml) against an unrelated
+// host.
 func vendorMatches(t *engine.Target, vendors []string) bool {
 	if t.Identity == nil || t.Identity.Vendor == "" {
 		return false
@@ -148,6 +170,8 @@ func vendorMatches(t *engine.Target, vendors []string) bool {
 	return slices.Contains(vendors, v)
 }
 
+// preauthRequest issues one read-only GET or benign status POST and returns the
+// status, response Content-Type, and a bounded body.
 func preauthRequest(ctx context.Context, c *http.Client, method, rawURL, body, ctype string) (int, string, []byte) {
 	var rdr io.Reader
 	if method == http.MethodPost && body != "" {

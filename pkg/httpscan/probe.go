@@ -23,6 +23,7 @@ import (
 
 var defaultMethods = []string{http.MethodGet, http.MethodHead, http.MethodPost}
 
+// RequestResult is the outcome of one HTTP request.
 type RequestResult struct {
 	Method      string `json:"method"`
 	URL         string `json:"url"`
@@ -32,14 +33,23 @@ type RequestResult struct {
 	Location    string `json:"location,omitempty"`
 	BodyBytes   int    `json:"bodyBytes,omitempty"`
 	Snippet     string `json:"snippet,omitempty"`
-
+	// Body is the fuller printable rendering of the response (up to
+	// defaultBodyCap), retained so downstream fingerprinting / a later
+	// offline pass has more than the short Snippet to work with. Snippet stays
+	// the trimmed preview surfaced in the finding output; Body is the "store for
+	// later" copy and is not emitted into the NDJSON finding stream.
 	Body     string   `json:"body,omitempty"`
 	Interest []string `json:"interest,omitempty"`
 	Error    string   `json:"error,omitempty"`
-
+	// Fingerprint carries the structured identity/version data scraped from the
+	// body (decompressed archive contents, Redfish/OData version, model, serial,
+	// firmware, the ATEN/Insyde HTML marker, ...). Empty when nothing matched.
+	// It is populated by doRequest only for endpoints whose path/tags warrant it,
+	// and the http.exposure check turns its fields into finding details.
 	Fingerprint Fingerprint `json:"fingerprint"`
 }
 
+// EndpointResult groups all method attempts for one target path.
 type EndpointResult struct {
 	Path        string          `json:"path"`
 	Match       MatchType       `json:"match"`
@@ -49,6 +59,7 @@ type EndpointResult struct {
 	Requests    []RequestResult `json:"requests,omitempty"`
 }
 
+// Summary is the compact roll-up for a host.
 type Summary struct {
 	EndpointsTested   int `json:"endpointsTested"`
 	RequestsAttempted int `json:"requestsAttempted"`
@@ -56,10 +67,14 @@ type Summary struct {
 	PreAuthReadable   int `json:"preAuthReadable"`
 	HandlerReachable  int `json:"handlerReachable"`
 	UploadSurface     int `json:"uploadSurface"`
-
+	// RequestsFailed counts requests that never got a status line at all (connect
+	// refused/reset, TLS failure, timeout, or local resource exhaustion). Lets the
+	// caller distinguish a sweep that ran and found nothing from one that could not
+	// issue a single request.
 	RequestsFailed int `json:"requestsFailed"`
 }
 
+// Report is the full HTTP surface result for one host/port pair.
 type Report struct {
 	IP           string           `json:"ip"`
 	Port         int              `json:"port"`
@@ -72,10 +87,16 @@ type Report struct {
 	Errors       []string         `json:"errors,omitempty"`
 }
 
+// DefaultGlobalSweepConcurrency bounds how many endpoint-sweep requests may be in
+// flight process-wide. It is a ceiling on outbound sockets, not CPU: a single
+// source address has ~28,000 usable ephemeral ports, shared with every other
+// prober (identify's web/TLS collectors, the KVM and Redfish checks).
 const DefaultGlobalSweepConcurrency = 2048
 
 var sweepGate = make(chan struct{}, DefaultGlobalSweepConcurrency)
 
+// SetGlobalSweepConcurrency resizes the process-wide sweep bound. Call only at
+// startup, before any sweep begins; it is a no-op for n <= 0.
 func SetGlobalSweepConcurrency(n int) {
 	if n <= 0 {
 		return
@@ -86,18 +107,29 @@ func SetGlobalSweepConcurrency(n int) {
 func acquireSweepSlot() { sweepGate <- struct{}{} }
 func releaseSweepSlot() { <-sweepGate }
 
+// ProbeHost sweeps the endpoint list against the supplied host/port pair.
 func ProbeHost(host string, port int, timeout time.Duration) (*Report, error) {
 	return ProbeHostCtx(context.Background(), host, port, timeout)
 }
 
+// ProbeHostCtx is ProbeHost with cancellation: when ctx is cancelled (e.g. a
+// wall-clock deadline) in-flight requests abort and un-probed endpoints are
+// skipped, so the caller still gets the partial results gathered so far rather
+// than nothing.
 func ProbeHostCtx(ctx context.Context, host string, port int, timeout time.Duration) (*Report, error) {
 	return probeHostTargets(ctx, host, port, "", timeout, AggregatedTargets())
 }
 
+// ProbeHostCtxForVendors limits the sweep to paths associated with vendors.
+// An empty vendor list retains the full corpus.
 func ProbeHostCtxForVendors(ctx context.Context, host string, port int, timeout time.Duration, vendors ...string) (*Report, error) {
 	return ProbeHostCtxForVendorsScheme(ctx, host, port, "", timeout, vendors...)
 }
 
+// ProbeHostCtxForVendorsScheme is ProbeHostCtxForVendors with an explicit URL
+// scheme ("http"/"https"). Callers that already know the scheme should pass it;
+// an empty scheme falls back to guessing from the port number (defaultScheme),
+// which is wrong for devices on non-conventional ports.
 func ProbeHostCtxForVendorsScheme(ctx context.Context, host string, port int, scheme string, timeout time.Duration, vendors ...string) (*Report, error) {
 	targets := AggregatedTargets()
 	if len(vendors) > 0 {
@@ -139,8 +171,13 @@ func probeHostTargets(ctx context.Context, host string, port int, scheme string,
 	vendorScore := map[string]int{}
 	report.HTTPSummary.EndpointsTested = len(targets)
 
+	// serverHeader/htmlTitle are the strongest portable signals during the sweep;
+	// use them to fingerprint the BMC vendor via bmcfp when no vendor-unique path hits.
 	var serverHeader, htmlTitle string
 
+	// Probe the endpoint list concurrently. A bounded worker pool caps wall-clock;
+	// results are collected by index and merged in endpoint order so
+	// serverHeader/htmlTitle "first-seen" and HWVendor selection stay deterministic.
 	type targetOutcome struct {
 		er           EndpointResult
 		hasFindings  bool
@@ -158,7 +195,9 @@ func probeHostTargets(ctx context.Context, host string, port int, scheme string,
 	for i := range targets {
 		wg.Add(1)
 		sem <- struct{}{}
-
+		// sem above bounds one host's sweep; sweepGate bounds the sweep across all
+		// hosts, since the per-target pool multiplies by --workers. Acquired after
+		// the per-target slot so ordering is unchanged.
 		acquireSweepSlot()
 		go func(i int) {
 			defer wg.Done()
@@ -173,7 +212,7 @@ func probeHostTargets(ctx context.Context, host string, port int, scheme string,
 				}
 			}()
 			if ctx.Err() != nil {
-				return
+				return // deadline hit: skip this endpoint (partial results kept)
 			}
 			er := EndpointResult{Path: target.Path, Match: target.Match, Vendors: target.Vendors, Tags: target.Tags}
 			interesting := map[string]struct{}{}
@@ -191,13 +230,15 @@ func probeHostTargets(ctx context.Context, host string, port int, scheme string,
 					o.serverHeader = rr.Server
 				}
 				if o.htmlTitle == "" {
-
+					// Extract from the fuller body: a <title> can sit past the
+					// 200-char snippet boundary (long <head> preamble).
 					if t := extractTitle(rr.Body); t != "" {
 						o.htmlTitle = t
 					}
 				}
 				rr.Interest = classify(target, rr)
-
+				// Keep the fuller body only long enough for classify/title extraction
+				// and then drop it before storing report results.
 				rr.Body = ""
 				for _, reason := range rr.Interest {
 					interesting[reason] = struct{}{}
@@ -248,6 +289,9 @@ func probeHostTargets(ctx context.Context, host string, port int, scheme string,
 		report.HTTPFindings = append(report.HTTPFindings, o.er)
 	}
 
+	// Built-in BMC fingerprint over the Server header + HTML title. A
+	// positive vendor/product hit is a stronger tell than the firmware-path score,
+	// so apply it before the score fallback.
 	if report.HWVendor == "" {
 		if v, p, ok := bmcfp.MatchAll(map[bmcfp.Kind]string{
 			bmcfp.HTTPServerHeader: serverHeader,
@@ -275,6 +319,13 @@ func probeHostTargets(ctx context.Context, host string, port int, scheme string,
 	return report, nil
 }
 
+// doRequest issues one probe. path/tags are the endpoint identity: they
+// pick the body read cap (archive/schema/metadata/redfish endpoints get a larger
+// cap so a .tar.xz isn't truncated mid-stream and the decompressor has the full
+// input) and gate the decompress+fingerprint pass. On a GET/POST that returns a
+// body, the body is run through FingerprintBody so a compressed Redfish artifact
+// or an anonymous ATEN 200 OK yields a structured version/fingerprint instead of
+// a truncated blob.
 func doRequest(parent context.Context, client *http.Client, method, url string, timeout time.Duration, path string, tags []string) RequestResult {
 	rr := RequestResult{Method: method, URL: url}
 	var body io.Reader
@@ -297,7 +348,7 @@ func doRequest(parent context.Context, client *http.Client, method, url string, 
 		return rr
 	}
 	defer resp.Body.Close()
-
+	// Read up to the per-endpoint cap. HEAD carries no body, so keep it cheap.
 	readCap := int64(defaultBodyCap)
 	if method != http.MethodHead {
 		readCap = bodyCapFor(path, tags)
@@ -310,7 +361,9 @@ func doRequest(parent context.Context, client *http.Client, method, url string, 
 	rr.BodyBytes = len(bodyBytes)
 	rr.Snippet = trimSnippet(bodyBytes)
 	rr.Body = retainBody(bodyBytes)
-
+	// Derive a structured fingerprint from the full body. Only for 2xx bodies:
+	// a 401/403/404/redirect body is an error/login page, not the artifact, so
+	// fingerprinting it would attribute a schema version to the wrong thing.
 	if len(bodyBytes) > 0 && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		rr.Fingerprint = FingerprintBody(path, tags, rr.ContentType, bodyBytes)
 	}
@@ -322,7 +375,9 @@ func classify(target AggregatedTarget, rr RequestResult) []string {
 		return nil
 	}
 	seen := map[string]struct{}{}
-
+	// Scan the fuller retained body, not just the 200-char snippet: a
+	// firmware/serial/token leak often sits deep in a JSON/XML/HTML reply, well
+	// past the preview. Falls back to the snippet when Body wasn't retained.
 	scanText := rr.Body
 	if scanText == "" {
 		scanText = rr.Snippet
@@ -351,11 +406,18 @@ func classify(target AggregatedTarget, rr RequestResult) []string {
 	if concreteDataLeak(rr, scanText) {
 		seen["possibleDataLeak"] = struct{}{}
 	}
-
+	// staticDisclosure means the schema/metadata/archive/snapshot file was
+	// actually served - which requires a 2xx. Without the status gate a device
+	// that soft-404s with an HTML error body (APC NMC and many PDUs do) can match
+	// endpoint paths accidentally. Match preAuthReadable's 2xx gate.
 	if statusClass == 2 && rr.BodyBytes > 0 && !isHTMLResponse(rr.ContentType, scanText) && hasAny(target.Tags, "schema", "metadata", "archive", "snapshot") {
 		seen["staticDisclosure"] = struct{}{}
 	}
-
+	// KVM / virtual-media launch surface. A live iKVM launcher (JNLP CGI, ClickOnce
+	// manifest, HTML5 entry) is a remote-console fingerprint; if the response body
+	// carries the redirection session token / applet args, that token is a
+	// capture-replay primitive on the stacks that do not source-IP-pin it
+	// (AMI/Fujitsu adviserd, HPE bearer key). See firmware analysis.
 	if hasAny(target.Tags, "ikvm") && rr.Status != http.StatusNotFound && rr.Status != http.StatusNotImplemented {
 		seen["kvm.launchExposed"] = struct{}{}
 	}
@@ -530,14 +592,21 @@ func hasAny(have []string, wants ...string) bool {
 	return false
 }
 
+// titleRE extracts the text of the first <title> element from a (whitespace-
+// collapsed) HTML snippet. Case-insensitive; tolerates attributes on the tag.
+// (?is): case-insensitive, and dot matches newlines so a <title> split across
+// lines still matches now that we scan the newline-preserving retained Body.
 var titleRE = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 
+// extractTitle returns the trimmed <title> text from an HTML snippet, or "" if
+// none is present. Used to feed the BMC HTML-title fingerprints.
 func extractTitle(snippet string) string {
 	m := titleRE.FindStringSubmatch(snippet)
 	if len(m) < 2 {
 		return ""
 	}
-
+	// Collapse internal whitespace/newlines so a title split across lines in the
+	// retained Body still returns as one clean single-line string.
 	return strings.Join(strings.Fields(m[1]), " ")
 }
 
@@ -546,9 +615,15 @@ func trimSnippet(body []byte) string {
 	trimmed = strings.ReplaceAll(trimmed, "\n", " ")
 	trimmed = strings.ReplaceAll(trimmed, "\r", " ")
 	trimmed = strings.Join(strings.Fields(trimmed), " ")
-	return sanitize.TruncateString(trimmed, 200)
+	return sanitize.TruncateString(trimmed, 200) // rune-aware; never splits a multibyte rune
 }
 
+// retainBody renders the fuller response for retention (the "store for later /
+// fingerprint" copy). Unlike trimSnippet it does not collapse to 200 chars: it
+// keeps printable text (control/binary bytes dropped so a .bmp/.jar/.xz body
+// doesn't become mojibake) up to defaultBodyCap, preserving newlines so the
+// stored body stays roughly structural. Callers must not surface this in
+// finding output verbatim - the finding shows the trimmed cleanSnippet instead.
 func retainBody(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -559,13 +634,13 @@ func retainBody(body []byte) string {
 		if c == '\n' || c == '\t' || (c >= 0x20 && c < 0x7f) {
 			b = append(b, c)
 		} else if c == '\r' {
-
+			// normalize CRLF/CR to LF without doubling
 			if i+1 < len(body) && body[i+1] == '\n' {
 				continue
 			}
 			b = append(b, '\n')
 		}
-
+		// other control + high/binary bytes are dropped
 	}
 	if len(b) > defaultBodyCap {
 		b = b[:defaultBodyCap]

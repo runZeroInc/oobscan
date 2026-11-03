@@ -15,12 +15,23 @@ import (
 	"strings"
 )
 
+// Sipeed NanoKVM web-login adapter. Login is JSON POST /api/auth/login with
+// the password wrapped in the fleet-wide "aes-everywhere" scheme (OpenSSL
+// Salted__ AES-256-CBC, MD5 key derivation, base64 then URL-encoded) under a
+// shipped constant key; the server decrypts before comparing. The response is
+// always HTTP 200 -- the JSON code field distinguishes success from a wrong
+// password. The minted JWT (never issued to a rejected credential) is
+// re-presented to an authenticated-only endpoint to prove the session. Web
+// default is admin/admin; root/root is the separate SSH default. See
+// kb/nanokvm/ for the fleet key and firmware detail.
 type nanokvmAdapter struct{}
 
 func (nanokvmAdapter) mechanism() string { return "httpJson" }
 
 const nanokvmFleetKey = "nanokvm-sipeed-2024"
 
+// nanokvmTokenCookie is the cookie the NanoKVM web UI stores the login JWT in and
+// that the server's auth middleware reads on subsequent requests.
 const nanokvmTokenCookie = "nano-kvm-token"
 
 func (nanokvmAdapter) login(ctx context.Context, client *http.Client, base, user, pass string) (ok bool, proof string, err error) {
@@ -48,9 +59,10 @@ func (nanokvmAdapter) login(ctx context.Context, client *http.Client, base, user
 		} `json:"data"`
 	}
 	if json.Unmarshal(body, &env) != nil {
-		return false, "", errNotThisDevice
+		return false, "", errNotThisDevice // not the NanoKVM JSON API
 	}
-
+	// Success requires the minted JWT, not just code==0: a rejected credential
+	// returns code=-2 with data=null, so the non-empty token is the real proof.
 	if env.Code != 0 || env.Data.Token == "" {
 		return false, "", nil
 	}
@@ -61,7 +73,8 @@ func (nanokvmAdapter) login(ctx context.Context, client *http.Client, base, user
 		"cookie", nanokvmTokenCookie,
 		"tokenLen", strconv.Itoa(len(token)),
 	)
-
+	// Prove the token unlocks an authenticated-only resource (/api/auth/account is
+	// 401 "unauthorized" without a valid token) and enrich the proof dynamically.
 	if u, aok := nanokvmAuthedAccount(ctx, client, base, token); aok {
 		proof += " " + proofKV(
 			"authedPath", "/api/auth/account",
@@ -73,6 +86,10 @@ func (nanokvmAdapter) login(ctx context.Context, client *http.Client, base, user
 	return true, proof, nil
 }
 
+// nanokvmAuthedAccount re-presents the login JWT (as the nano-kvm-token cookie) to
+// the authenticated-only /api/auth/account endpoint and reports the account name
+// when it returns the authenticated envelope (code==0). A missing/invalid token
+// yields 401 "unauthorized", so a success here proves the session is real.
 func nanokvmAuthedAccount(ctx context.Context, client *http.Client, base, token string) (username string, ok bool) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/auth/account", nil)
 	if err != nil {
@@ -100,6 +117,9 @@ func nanokvmAuthedAccount(ctx context.Context, client *http.Client, base, token 
 	return env.Data.Username, true
 }
 
+// nanokvmEncrypt reproduces the NanoKVM client's aes-everywhere wrapping:
+// OpenSSL "Salted__" AES-256-CBC with the MD5 EVP_BytesToKey derivation, base64,
+// then URL-encoded (the server url-unescapes then decrypts with the fleet key).
 func nanokvmEncrypt(plain, passphrase string) string {
 	salt := make([]byte, 8)
 	_, _ = rand.Read(salt)
@@ -110,6 +130,7 @@ func nanokvmEncrypt(plain, passphrase string) string {
 	return url.QueryEscape(base64.StdEncoding.EncodeToString(blob))
 }
 
+// nanokvmEVPKDF is OpenSSL's EVP_BytesToKey with MD5 and one iteration.
 func nanokvmEVPKDF(pass, salt []byte, keyLen, ivLen int) (key, iv []byte) {
 	var d, out []byte
 	for len(out) < keyLen+ivLen {

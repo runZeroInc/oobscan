@@ -19,6 +19,9 @@ var (
 	replayOut    string
 )
 
+// replayCmd re-runs the record-pure detection logic over a stored corpus and prints a
+// deterministic table, so a change to that logic can be measured against real data in
+// minutes instead of against a fresh scan.
 var replayCmd = &cobra.Command{
 	Use:   "replay [flags] <corpus>",
 	Short: "Re-run the record-pure detection logic over a stored corpus and print a diffable table.",
@@ -93,6 +96,8 @@ func runReplay(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// The table is the product of this command, so keep stdout clean: move the log to
+	// stderr whenever the table is going to stdout.
 	if replayOut == "-" {
 		noColor := rootNoColor || os.Getenv("NO_COLOR") != "" || !isatty.IsTerminal(os.Stderr.Fd())
 		output.SetDefault(output.NewLogger(os.Stderr, os.Stderr, noColor, rootVerbose))

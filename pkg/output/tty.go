@@ -17,24 +17,34 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/redfish"
 )
 
+// ttyEmitter is the human sink and the single serialization point for all output, so
+// it is safe to drive from many concurrent target workers. Per completed target it
+// prints colored findings and a running tally to stdout, routes --verbose diagnostics
+// and worker panics to stderr, and writes one NDJSON record. The three streams stay
+// independent: JSON never mixes into stdout and stdout never pollutes the JSON file.
+//
+// One mutex serializes every Emit/Log so lines cannot interleave across workers, and
+// the stdout and JSON writers are buffered and flushed once per completed target
+// rather than per line, keeping the terminal live and the JSON file durable without a
+// syscall storm at high fan-out.
 type ttyEmitter struct {
 	mu         sync.Mutex
-	out        *bufio.Writer
-	errw       io.Writer
-	records    *bufio.Writer
+	out        *bufio.Writer // stdout: findings + summary (buffered, flushed per target)
+	errw       io.Writer     // stderr: diagnostics + panics
+	records    *bufio.Writer // NDJSON sink (the --output file)
 	enc        *json.Encoder
 	done       int
-	sev        map[string]int
+	sev        map[string]int // finding count by severity
 	active     map[string]activeState
 	checks     map[string]checkProgress
 	checkDone  int
 	checkTotal int
 	styles     styleSet
-	log        *Logger
+	log        *Logger // shared severity formatter (sentence casing + colorized tag)
 	verbose    bool
 	lastReport time.Time
-	running    map[string]map[string]time.Time
-	emitted    map[string]map[string]struct{}
+	running    map[string]map[string]time.Time // host -> check -> start time
+	emitted    map[string]map[string]struct{}  // host -> finding key(s) already printed
 	writeErr   error
 }
 
@@ -48,7 +58,8 @@ type styleSet struct {
 }
 
 func newStyleSet(noColor bool) styleSet {
-
+	// With noColor every style is bare, so Render is the identity function and no
+	// ANSI bytes are produced (respects --no-color / NO_COLOR).
 	c := func(code string) lipgloss.Style {
 		if noColor {
 			return lipgloss.NewStyle()
@@ -62,6 +73,8 @@ func newStyleSet(noColor bool) styleSet {
 	return styleSet{crit: crit, high: c("208"), med: c("214"), low: c("39"), warn: c("214"), info: c("245"), pass: c("42"), dim: c("248")}
 }
 
+// style returns the lipgloss style for a severity. Unknown severities fall
+// back to the dim style so unexpected labels stay visible without shouting.
 func (s styleSet) style(sev Severity) lipgloss.Style {
 	switch sev {
 	case SevCritical:
@@ -82,6 +95,8 @@ func (s styleSet) style(sev Severity) lipgloss.Style {
 	return s.dim
 }
 
+// newTTYEmitterTo wires the three streams: out (stdout / fancy), errw (stderr /
+// diagnostics), and a records writer (the --output file).
 func newTTYEmitterTo(out, errw, records io.Writer, noColor, verbose bool) *ttyEmitter {
 	styles := newStyleSet(noColor)
 	e := &ttyEmitter{
@@ -152,6 +167,7 @@ func (e *ttyEmitter) Checks(host string, done, total int) {
 	e.checks[host] = checkProgress{done: done, total: total}
 }
 
+// CheckStart marks a check as actively running for a host.
 func (e *ttyEmitter) CheckStart(host, check string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -166,6 +182,7 @@ func (e *ttyEmitter) CheckStart(host, check string) {
 	rh[check] = time.Now()
 }
 
+// CheckDone marks a check as no longer running.
 func (e *ttyEmitter) CheckDone(host, check string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -179,6 +196,7 @@ func (e *ttyEmitter) CheckDone(host, check string) {
 	}
 }
 
+// Log prints a diagnostic line (--verbose) to stderr.
 func (e *ttyEmitter) Log(msg string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -189,7 +207,7 @@ func (e *ttyEmitter) Log(msg string) {
 func (e *ttyEmitter) Emit(t *engine.Target) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if t.Err != "" {
+	if t.Err != "" { // a per-target panic is an error -> stderr
 		fmt.Fprintln(e.errw, e.log.Format(SevCritical, "Panic on "+t.Host+": "+firstLine(t.Err)))
 	}
 	for _, f := range t.FindingsSnapshot() {
@@ -205,7 +223,11 @@ func (e *ttyEmitter) Emit(t *engine.Target) {
 	if line := e.renderFinal(t); line != "" {
 		fmt.Fprintln(e.out, line)
 	}
-
+	// The redfish post-auth snapshot is a raw JSON evidence dump - diagnostic
+	// detail, not a scan result - so it belongs on the --verbose stderr stream in
+	// the debug log format, never inline in stdout results. The full data is
+	// preserved in the NDJSON record regardless. (Emit holds e.mu, so write via
+	// the formatter directly rather than e.Log, which would re-lock and deadlock.)
 	if e.verbose {
 		for _, msg := range postAuthVerboseLines(t) {
 			fmt.Fprintln(e.errw, e.log.Format(SevDebug, msg))
@@ -216,7 +238,9 @@ func (e *ttyEmitter) Emit(t *engine.Target) {
 	delete(e.running, t.Host)
 	delete(e.emitted, t.Host)
 	delete(e.checks, t.Host)
-
+	// Write responsive targets and target errors to the output file. Empty,
+	// non-responsive targets are omitted. Flush immediately so the file is durable
+	// if the scan is killed mid-run and tailable while it runs.
 	if e.enc != nil {
 		result := resultFrom(t)
 		if resultHasResponsiveData(result) {
@@ -224,11 +248,14 @@ func (e *ttyEmitter) Emit(t *engine.Target) {
 			e.rememberWriteError(e.records.Flush())
 		}
 	}
-
+	// Flush the fancy stream once per completed target (keeps a terminal live and
+	// a redirected stdout current, without a per-line syscall).
 	e.rememberWriteError(e.out.Flush())
 	e.lastReport = time.Now()
 }
 
+// EmitFindings prints findings as checks finish (before host completion).
+// The final host Emit still runs for id.final/records and deduplicates these.
 func (e *ttyEmitter) EmitFindings(host string, fs []engine.Finding) {
 	if host == "" || len(fs) == 0 {
 		return
@@ -272,6 +299,12 @@ func (e *ttyEmitter) Status(done, total uint64, force bool) {
 	e.lastReport = time.Now()
 }
 
+// StatusDetailed prints a short, aggregated runtime summary for interactive
+// Enter-triggered status requests. A scan fans the same few checks across
+// hundreds of hosts, so a per-(host,check) list is hundreds of near-identical
+// lines. It stays compact regardless of scan size: a header, the top few checks
+// by fan-out (host count + elapsed range), a one-line rollup of the remaining
+// check variety, and a single "oldest" (host,check) so a stuck host stands out.
 func (e *ttyEmitter) StatusDetailed(done, total uint64) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -291,6 +324,7 @@ func (e *ttyEmitter) StatusDetailed(done, total uint64) {
 		return
 	}
 
+	// Aggregate running checks by name; track the single oldest (host,check).
 	type checkAgg struct {
 		count    int
 		min, max time.Duration
@@ -330,7 +364,7 @@ func (e *ttyEmitter) StatusDetailed(done, total uint64) {
 	for n := range byCheck {
 		names = append(names, n)
 	}
-
+	// Most-fanned-out first, then longest-running, then name.
 	sort.Slice(names, func(i, j int) bool {
 		ai, aj := byCheck[names[i]], byCheck[names[j]]
 		if ai.count != aj.count {
@@ -342,6 +376,8 @@ func (e *ttyEmitter) StatusDetailed(done, total uint64) {
 		return names[i] < names[j]
 	})
 
+	// Only the top few by fan-out; roll the long tail of low-count checks into a
+	// single line so the summary stays short regardless of check variety.
 	const topN = 6
 	omittedChecks, omittedHosts := 0, 0
 	for i, n := range names {
@@ -361,7 +397,7 @@ func (e *ttyEmitter) StatusDetailed(done, total uint64) {
 			"checks", strconv.Itoa(omittedChecks),
 			"hosts", strconv.Itoa(omittedHosts)))
 	}
-
+	// A single oldest (host,check) surfaces a stuck host without a per-host list.
 	fmt.Fprintln(e.errw, e.log.Format(SevInfo, "Oldest check",
 		"host", oldHost,
 		"check", oldCheck,
@@ -369,6 +405,9 @@ func (e *ttyEmitter) StatusDetailed(done, total uint64) {
 	e.lastReport = time.Now()
 }
 
+// printActiveHostPhaseSummaryLocked aggregates hosts that are active but not
+// running a check (post-check/finalize activity) by phase, so hundreds of
+// finalizing hosts collapse to one line per phase instead of one line per host.
 func (e *ttyEmitter) printActiveHostPhaseSummaryLocked() {
 	if len(e.active) == 0 {
 		return
@@ -500,6 +539,9 @@ func (e *ttyEmitter) activeSummaryLocked() string {
 	return fmt.Sprintf("%s %s for %s", host, what, time.Since(state.since).Round(time.Second))
 }
 
+// postAuthVerboseLines returns the redfish post-auth snapshot as --verbose debug
+// message(s), formatted like the pipeline's other per-host verbose lines
+// ("    <host> <detail>"); the caller wraps each in the SevDebug log format.
 func postAuthVerboseLines(t *engine.Target) []string {
 	v, ok := t.Evidenced("redfish.postAuth")
 	if !ok {
@@ -535,19 +577,25 @@ func (e *ttyEmitter) rememberWriteError(err error) {
 	}
 }
 
+// renderFinding returns a colored, column-aligned one-liner for the fancy
+// stream. Findings at risk info and above are shown; "none" (clean/closed)
+// results are omitted from the human view but still present in the NDJSON file.
+// Layout: RISK  host  check  port/transport proto  key=val ... [CVEs]. The same
+// structured fields appear in the NDJSON record - only the encoding differs.
 func (e *ttyEmitter) renderFinding(t *engine.Target, f engine.Finding) string {
 	risk := riskOf(f)
 	if engine.RiskRank(risk) < engine.RiskRank("info") {
-		return ""
+		return "" // "none" (clean/closed) results are omitted from the live view
 	}
 	tag := e.sevStyle(risk).Render(fmt.Sprintf("%-8s", strings.ToUpper(risk)))
-
+	// Location prefix (port/transport proto) when the finding pins one down.
 	msg := ""
 	if loc := locationStr(f); loc != "" {
 		msg = e.styles.dim.Render(loc) + " "
 	}
 	msg += displayFields(f.Fields)
-
+	// Only real CVE identifiers are bracketed; the check name already names any
+	// non-CVE finding, so internal tags never appear as pseudo-CVEs.
 	if cves := realCVEs(f.CVE); len(cves) > 0 {
 		msg = strings.TrimRight(msg, " ")
 		if msg != "" {
@@ -558,6 +606,7 @@ func (e *ttyEmitter) renderFinding(t *engine.Target, f engine.Finding) string {
 	return strings.TrimRight(fmt.Sprintf("%s %-15s %-24s %s", tag, t.Host, f.Check, msg), " ")
 }
 
+// displayFields renders compact finding fields for terminal output.
 func displayFields(fs engine.Fields) string {
 	hasArchive := false
 	isStaticDisclosure := false
@@ -611,7 +660,11 @@ func trimTTYField(key, val string) string {
 	if val == "" {
 		return ""
 	}
-
+	// Keep full payloads in NDJSON but trim terminal rendering for large
+	// serialized blobs (mc_info_full, users_full, chassis_full, lan_full,
+	// fru_full, cipher_matrix_full) and for the always-hex `raw` field.
+	// The `hash` field carries crackable RAKP material and must never be
+	// truncated -- a partial hash is unusable in a cracker.
 	lk := strings.ToLower(key)
 	if lk == "hash" {
 		return val
@@ -644,13 +697,22 @@ func summarizeArchiveContents(s string, keep int) string {
 	return strings.Join(parts[:keep], ",") + ",..."
 }
 
+// renderFinal returns the id.final summary line for a host: the aggregated
+// vendor/product/generation/version identity plus the derived exposure flags. It is
+// shown only for an attributed host, so unreachable targets stay quiet in the live
+// view; those are also omitted from NDJSON when they have no other response data.
+//
+// It renders at info risk with "id.final" in the check-name column, because the line
+// is an identity summary rather than a risk verdict. Per-weakness risk is carried in
+// the flag key=risk pairs.
 func (e *ttyEmitter) renderFinal(t *engine.Target) string {
 	fin := t.Final
 	if fin == nil || (fin.Vendor == "" && fin.Class == engine.ClassUnknown) {
 		return ""
 	}
 	tag := e.sevStyle("info").Render(fmt.Sprintf("%-8s", "INFO"))
-
+	// product prefers the more-specific generation label when present, so a
+	// Supermicro "IPMI" product with an "X10" generation reports product=X10.
 	product := fin.Product
 	if fin.Generation != "" {
 		product = fin.Generation
@@ -670,6 +732,7 @@ func (e *ttyEmitter) renderFinal(t *engine.Target) string {
 	return strings.TrimRight(fmt.Sprintf("%s %-15s %-24s %s", tag, t.Host, "id.final", msg), " ")
 }
 
+// orDashS renders an empty string as a dash for the fancy line.
 func orDashS(s string) string {
 	if s == "" {
 		return "-"
@@ -677,8 +740,10 @@ func orDashS(s string) string {
 	return s
 }
 
+// cveRe matches a real CVE id (CVE-YYYY-NNNN+).
 var cveRe = regexp.MustCompile(`^CVE-\d{4}-\d+$`)
 
+// realCVEs keeps only entries that look like published CVE ids.
 func realCVEs(ids []string) []string {
 	var out []string
 	for _, id := range ids {
@@ -689,6 +754,7 @@ func realCVEs(ids []string) []string {
 	return out
 }
 
+// locationStr renders the finding's port/transport/protocol as a compact prefix.
 func locationStr(f engine.Finding) string {
 	if f.Port == 0 && f.Protocol == "" {
 		return ""
@@ -709,6 +775,7 @@ func locationStr(f engine.Finding) string {
 	return s
 }
 
+// riskOf returns the finding's risk, defaulting to "none".
 func riskOf(f engine.Finding) string {
 	if f.Risk == "" {
 		return "none"
@@ -722,7 +789,7 @@ func (e *ttyEmitter) sevStyle(sev string) lipgloss.Style {
 
 func (e *ttyEmitter) summary() string {
 	kv := make([]string, 0, 10)
-	for _, k := range []string{"critical", "high", "medium", "low", "info"} {
+	for _, k := range []string{"critical", "high", "medium", "low", "info"} { // severity order
 		if n := e.sev[k]; n > 0 {
 			kv = append(kv, k, strconv.Itoa(n))
 		}

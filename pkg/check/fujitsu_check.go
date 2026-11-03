@@ -9,6 +9,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Fujitsu iRMC (S5/S6, MegaRAC SP-X) serves a ServerView "System Report" at
+// GET /report.xml (handler FTS_WebServer EmitHpSimInfo -> Xml_ALLDATAReq,
+// descriptor idx 0x3b, authFlag==0), leaking the System GUID, device/firmware
+// ID, and chassis power state pre-auth. It is gated by the HP-SIM/ServerView-
+// XML config toggle (OID 0x1968), so this only confirms the leak when the
+// report actually comes back unauthenticated. Read-only GET, no login or
+// state change.
 func init() {
 	Register(Check{
 		Name:        "http.fujitsu.irmcReport",
@@ -26,7 +33,7 @@ func runFujitsuXmldata(ctx context.Context, t *engine.Target) []engine.Finding {
 		if ep.port <= 0 {
 			continue
 		}
-
+		// /report.xml is the ServerView system report; /xmldata is the item alias.
 		for _, path := range []string{"/report.xml", "/xmldata"} {
 			st, ctype, body := httpProbe(ctx, client, hostPortURL(ep.scheme, t.Host, ep.port, path), "")
 			if st != 200 || len(body) == 0 {
@@ -62,6 +69,9 @@ func fujitsuReportEndpoints(t *engine.Target) []webPortSpec {
 		out = append(out, webPortSpec{port: port, scheme: scheme})
 	}
 
+	// Probe the identify-chosen web endpoint first (covers HTTP-only iRMC), then
+	// common defaults and conventional alternate management web ports observed in
+	// the scan scope.
 	add(webPort(t), webProto(t))
 	add(httpsPort(t), "https")
 	add(80, "http")
@@ -82,12 +92,15 @@ func fujitsuReportEndpoints(t *engine.Target) []webPortSpec {
 	return out
 }
 
+// looksLikeIRMCReport reports whether a 200 body is the Fujitsu ServerView
+// system report (not an unrelated XML page). Requires an XML shape plus a
+// ServerView/report marker so it does not fire on any XML the server returns.
 func looksLikeIRMCReport(ctype string, body []byte) bool {
 	low := strings.ToLower(string(body))
 	if !strings.Contains(low, "<?xml") && !strings.Contains(strings.ToLower(ctype), "xml") {
 		return false
 	}
-
+	// ServerView report markers observed in FTS_WebServer / Report.xslt output.
 	for _, m := range []string{"report.xslt", "systemreport", "serverview", "hpsim", "<system", "irmc"} {
 		if strings.Contains(low, m) {
 			return true
@@ -96,6 +109,10 @@ func looksLikeIRMCReport(ctype string, body []byte) bool {
 	return false
 }
 
+// firstXMLValue extracts the text of the first <tag>...</tag> whose name contains
+// the given (case-insensitive) needle, e.g. "GUID". Returns "" if not found.
+// A tiny best-effort extractor -- the finding stands on the report presence, the
+// GUID is enrichment only.
 func firstXMLValue(body []byte, needle string) string {
 	low := strings.ToLower(string(body))
 	nl := strings.ToLower(needle)

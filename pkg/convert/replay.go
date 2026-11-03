@@ -10,18 +10,37 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/scanfile"
 )
 
+// Replay re-runs the detection logic that is a pure function of a stored record
+// over an existing corpus, and reports counts that can be diffed between two
+// builds. It exists because the quality audit's own report caps its examples and
+// carries no totals, so it can say a signature exists but not how far it reaches,
+// and because comparing two builds is the only way to tell whether a change to a
+// rule moved anything.
+//
+// Only logic that needs no network is in scope. The findings in a native corpus
+// were emitted by whichever binary produced it, so replaying that corpus exercises
+// the audit rules, the proof predicates and record migration over those findings;
+// it cannot re-derive a finding the scan never made.
+
+// replayDistinctCap bounds the per-slot distinct-value set. Past the cap the count
+// is reported as saturated and the slot is never called constant, which is the
+// safe direction: a slot that overflowed plainly holds more than one value.
 const replayDistinctCap = 1024
 
+// ReplayOptions configures a replay pass.
 type ReplayOptions struct {
 	Format Format
 	Input  string
-
+	// Field selects one check.field slot for exact value frequencies. Empty skips
+	// the extra bookkeeping, which is what makes the default pass cheap.
 	Field string
-
+	// Hosts selects one counter key whose host list should be reported, so two
+	// builds can be compared with comm to see which hosts gained or lost it.
 	Hosts    string
 	Progress func(int)
 }
 
+// FieldSlot is one check-and-field pair's value spread across the corpus.
 type FieldSlot struct {
 	Key       string
 	Findings  int
@@ -31,21 +50,23 @@ type FieldSlot struct {
 	Constant  bool
 }
 
+// ReplayResult is a replay pass's tally.
 type ReplayResult struct {
 	Format    Format
 	Records   int
 	Skipped   int
 	Truncated bool
-
+	// Rows is the counter table, keyed by rule key.
 	Rows   map[string]*ReplayCounter
 	Fields map[string]*FieldSlot
 	Values map[string]int
-
+	// Hosts is the host list for the key named by --hosts, sorted.
 	Hosts    []string
 	Field    string
 	HostsKey string
 }
 
+// ReplayCounter is one key's event and host tally.
 type ReplayCounter struct {
 	Events int
 	Hosts  int
@@ -78,6 +99,7 @@ type fieldTally struct {
 	digest map[uint64]struct{}
 }
 
+// Replay streams the corpus and tallies every rule the harness covers.
 func Replay(opts ReplayOptions) (*ReplayResult, error) {
 	res := &ReplayResult{
 		Format:   opts.Format,
@@ -131,6 +153,7 @@ func Replay(opts ReplayOptions) (*ReplayResult, error) {
 	return res, nil
 }
 
+// replayRecord applies every in-scope rule to one record.
 func replayRecord(rec *scanfile.Record, opts ReplayOptions, bump func(key, host string), fields map[string]*fieldTally, values map[string]int) {
 	host := rec.Host
 
@@ -172,8 +195,8 @@ func replayRecord(rec *scanfile.Record, opts ReplayOptions, bump func(key, host 
 			}
 		}
 	}
-
-	for c := range strings.SplitSeq(rec.AttemptedChecks, ",") {
+	// AttemptedChecks is a sorted comma-separated list, not a slice.
+	for _, c := range strings.Split(rec.AttemptedChecks, ",") {
 		if c = strings.TrimSpace(c); c != "" {
 			bump("attempted/"+sanitizeReplayKey(c), host)
 		}
@@ -190,7 +213,8 @@ func tallyField(fields map[string]*fieldTally, key, host, val string) {
 	if host != "" {
 		ft.hosts[host] = struct{}{}
 	}
-
+	// Hash rather than retain: a corpus holds hundreds of thousands of values and
+	// only their cardinality is wanted here.
 	if len(ft.digest) < replayDistinctCap {
 		h := fnv.New64a()
 		_, _ = h.Write([]byte(val))
@@ -198,6 +222,8 @@ func tallyField(fields map[string]*fieldTally, key, host, val string) {
 	}
 }
 
+// sanitizeReplayKey folds control bytes and tabs so a device-supplied string
+// cannot split a row and silently corrupt a diff of two tables.
 func sanitizeReplayKey(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -212,6 +238,8 @@ func sanitizeReplayKey(s string) string {
 	return b.String()
 }
 
+// WriteReplay renders the tally as one tab-separated, key-sorted table. The
+// ordering is stable so two builds' output can be compared with diff.
 func WriteReplay(w io.Writer, res *ReplayResult) error {
 	if res == nil {
 		return nil

@@ -109,6 +109,13 @@ func runMoxaSerialBanner(ctx context.Context, t *engine.Target) []engine.Finding
 	return out
 }
 
+// moxaSerialBannerFinding reports one raw serial line. Risk gating: empty or
+// non-printable reads stay info, printable banners are medium, and a likely
+// auth prompt is high.
+//
+// The proof is built on every arm, not only where a banner arrived: a line that
+// stays silent is still a measurement, and evidence attached solely to the
+// silent arm would carry one identical value across every host that reaches it.
 func moxaSerialBannerFinding(serialLine, tcpPort int, rawBytes []byte) engine.Finding {
 	bannerClean := sanitizeBanner(string(rawBytes))
 	printable := countPrintableRunes(string(rawBytes))
@@ -163,13 +170,17 @@ func probeMoxaSerialLine(host string, port int, timeout time.Duration) (bool, []
 		return false, nil
 	}
 	defer c.Close()
-
+	// First read: whatever the serial line already had queued.
 	_ = c.SetReadDeadline(time.Now().Add(timeout))
 	buf := make([]byte, 1024)
 	n, _ := c.Read(buf)
 	if n > 0 {
 		return true, append([]byte(nil), buf[:n]...)
 	}
-
+	// Silent raw serial-over-IP passthrough line. Do not send a CRLF wake-up:
+	// port 4001+N is transparent to the ATTACHED device console, so an injected
+	// "\r\n" could wake a pager or confirm a pending [y/N] on that downstream
+	// device (router/switch/PLC/UPS). Report the open line with no banner rather
+	// than injecting input.
 	return true, nil
 }

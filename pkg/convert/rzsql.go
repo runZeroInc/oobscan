@@ -5,11 +5,25 @@ import (
 	"strings"
 )
 
+// rzsql reads the runZero SQL export: one JSON object per line holding an asset
+// and its services, as produced by
+//
+//	SELECT jsonb_build_object('asset', to_jsonb(a), 'services', ...) FROM assets a ...
+//
+// The keys are the database column names, not the API's JSON names (they coincide
+// for everything used here). One line is one asset, so the format streams and
+// memory stays flat regardless of corpus size.
+
+// sqlLine is one line of the SQL export.
 type sqlLine struct {
 	Asset    sqlAsset     `json:"asset"`
 	Services []sqlService `json:"services"`
 }
 
+// sqlAsset mirrors the assets-table columns the projection reads. Both
+// attribute columns are carried: `attributes` is the indexed bag and
+// `unindexed_attributes` holds the values too large to index, and dropping
+// either would lose data the export took the trouble to include.
 type sqlAsset struct {
 	ID             string            `json:"id"`
 	Type           string            `json:"type"`
@@ -32,6 +46,8 @@ type sqlAsset struct {
 	Unindexed      map[string]string `json:"unindexed_attributes"`
 }
 
+// sqlService mirrors the services-table columns plus the service_data bag the
+// export joins in.
 type sqlService struct {
 	Port      int               `json:"port"`
 	Transport string            `json:"transport"`
@@ -79,6 +95,13 @@ func (l *sqlLine) host() *rzHost {
 	return h
 }
 
+// streamRZSQL reads the SQL export at path and invokes fn per asset. The export
+// may be clean NDJSON (psql unaligned / `\g | gzip`) or COPY-text-escaped
+// (`\copy ... FORMAT text`); each line is parsed as-is first and only
+// COPY-unescaped on fallback, so a valid JSON escape (\n, \t, \") is never
+// mangled. Malformed lines are counted and skipped; a truncated input (an
+// interrupted export, a cut-off download) ends the stream without discarding
+// the records already read.
 func streamRZSQL(path string, fn func(*rzHost) error) (stats sourceStats, err error) {
 	stats.Truncated, err = forEachLine(path, func(line []byte) error {
 		var rec sqlLine
@@ -94,6 +117,10 @@ func streamRZSQL(path string, fn func(*rzHost) error) (stats sourceStats, err er
 	return stats, err
 }
 
+// unescapeCopyText reverses PostgreSQL `COPY ... WITH (FORMAT text)` escaping so
+// the remaining bytes are valid JSON. COPY escapes backslash, tab, newline and
+// carriage return; they are restored in a single pass so the doubled
+// backslashes produced for JSON's own escapes (\", \\, \uXXXX) survive intact.
 func unescapeCopyText(s string) string {
 	if !strings.ContainsRune(s, '\\') {
 		return s
@@ -120,7 +147,8 @@ func unescapeCopyText(s string) string {
 			b.WriteByte('\r')
 			i++
 		default:
-
+			// Not a COPY escape (a JSON \" or \uXXXX): keep the backslash and let
+			// the JSON decoder handle the following byte.
 			b.WriteByte(c)
 		}
 	}

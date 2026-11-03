@@ -34,7 +34,10 @@ func runLantronixSetupBanner(ctx context.Context, t *engine.Target) []engine.Fin
 	iacSummary := ""
 	if banner == "" {
 		got, iac, looksLantronix, err := lantronix.ProbeSetupTelnet(t.Host, t.Timeout)
-
+		// Require a positive Lantronix signature (XPort/UDS/"setup mode" banner),
+		// mirroring the identify collector: without this gate, any 9999 banner --
+		// proxies ("ProxyServer is ready"), Moxa HTTP servers, SSH daemons -- would
+		// be misattributed as a Lantronix setup exposure.
 		if err != nil || got == "" || !looksLantronix {
 			return nil
 		}
@@ -42,7 +45,9 @@ func runLantronixSetupBanner(ctx context.Context, t *engine.Target) []engine.Fin
 		iacSummary = iac
 		t.SetEvidence("lantronix.telnet", banner)
 	}
-
+	// Defense in depth: never report an SSH identification string as a Lantronix
+	// setup banner. Some devices run sshd on 9999/tcp, and the identify-time
+	// evidence path can carry that banner here without the looksLantronix gate.
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(banner)), "SSH-") {
 		return nil
 	}

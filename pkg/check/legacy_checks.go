@@ -20,6 +20,9 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ssh"
 )
 
+// These cover well-known older BMC exposures that the protocol pipeline would
+// otherwise miss. They probe their own ports and run on identified BMCs, so
+// they add no cost to non-BMC hosts.
 func init() {
 	Register(Check{
 		Name:        "ssdp.libupnp",
@@ -49,7 +52,7 @@ func init() {
 		Name:        "snmp",
 		Description: "SNMP v1/v2c default communities + v3 engine discovery and factory-default USM credentials",
 		Category:    "snmp",
-		Applies:     Applicability{CrossVendor: true},
+		Applies:     Applicability{CrossVendor: true}, // identify probes SNMP on every target
 		Enabled:     true,
 		Run:         runSNMP,
 	})
@@ -57,7 +60,7 @@ func init() {
 		Name:        "ssh.exposure",
 		Description: "SSH version/banner + weak-algorithm enumeration on every target (default-credential login when online)",
 		Category:    "ssh",
-		Applies:     Applicability{CrossVendor: true},
+		Applies:     Applicability{CrossVendor: true}, // version + weak-crypto are useful on all targets
 		Enabled:     true,
 		Run:         runSSHExposure,
 	})
@@ -71,6 +74,12 @@ func init() {
 	})
 }
 
+// runLibUPnP unicasts an SSDP M-SEARCH and reads the UPnP SDK (libupnp) name and
+// version from the Server header. This reports the SDK version as a FACTUAL
+// disclosure only. It does not flag CVE-2012-5958/5959: those are stack-overflow
+// crashers with no safe non-destructive patched/unpatched differential, so the
+// only remotely observable signal is the banner version -- which is disclosure,
+// not a confirmed vulnerability.
 func runLibUPnP(ctx context.Context, t *engine.Target) []engine.Finding {
 	res, err := ssdp.UnicastSearch(t.Host, "upnp:rootdevice", t.Timeout)
 	if err != nil || res == nil || res.Server == "" {
@@ -230,10 +239,21 @@ func ssdpRedfishFields(res *ssdp.Result) (engine.Fields, bool) {
 		"usn", res.USN), true
 }
 
+// runSNMP renders the SNMP findings from the discovery the identify step already
+// performed on every target (public/private v2c/v1 reads + v3 engine-ID
+// discovery, stashed as "snmp"/"snmp.private"/"snmpv3" evidence), and adds the
+// one active/credential step: testing documented factory SNMPv3 USM credentials.
+// A default community read is a finding; a writable 'private' community is worse;
+// a factory v3 credential that authenticates is a compromise.
 func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 	const port = 161
 	var out []engine.Finding
 
+	// Default 'public' community read (v1/v2c has no user; the community is the
+	// shared secret, reported as pass= to match every other defaultCreds finding).
+	// 'public' is conventionally read-only, but some devices ship it writable
+	// (e.g. Advantech's `etc/snmpd.conf` template and IPv6 `rwcommunity6 public`);
+	// a same-value SET tests write access so those are not mis-labelled RO.
 	if v, ok := t.Evidenced("snmp"); ok {
 		if r, ok := v.(*snmp.Result); ok && r != nil {
 			risk, access := "medium", "readOnly"
@@ -253,7 +273,10 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 			})
 		}
 	}
-
+	// Inventory of the machine the agent is attached to. The neighbour cache and
+	// the managed-machine NIC list are served to the same community that answers
+	// the system group, so a controller reachable with a default community
+	// discloses which host it manages and who its neighbours are.
 	if v, ok := t.Evidenced("snmp.hostinv"); ok {
 		if inv, ok := v.(*snmp.HostInventory); ok && inv != nil && !inv.Empty() {
 			risk := "medium"
@@ -288,7 +311,7 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 			})
 		}
 	}
-
+	// Writable 'private' community.
 	if v, ok := t.Evidenced("snmp.private"); ok {
 		if r, ok := v.(*snmp.Result); ok && r != nil {
 			risk, access := "medium", "readOnly"
@@ -308,7 +331,9 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 			})
 		}
 	}
-
+	// SNMPv3: engine already discovered by identify. When online, try the factory
+	// v3 credentials; the outcome is recorded on the v3 finding so it is always
+	// visible whether we tried.
 	if v, ok := t.Evidenced("snmpv3"); ok {
 		if v3, ok := v.(*snmp.Result); ok && v3 != nil {
 			var hit *snmpV3Hit
@@ -320,7 +345,10 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 				"engineId", v3.EngineID,
 				"engineBoots", fmt.Sprintf("%d", v3.EngineBoots),
 			)
-
+			// Decode the RFC 3411 enterprise number/suffix baked into the engine
+			// ID: many vendors (e.g. HPE iLO) embed a product/serial string in
+			// the format-4/5 suffix, which is a useful pre-auth identifier
+			// alongside the enterprise number itself.
 			if info, derr := snmp.DecodeEngineIDHex(v3.EngineID); derr == nil && info.Enterprise != 0 {
 				v3Fields = append(v3Fields, engine.Field{Key: "engineIdEnterprise", Val: fmt.Sprintf("%d", info.Enterprise)})
 				if info.Vendor != "" {
@@ -342,7 +370,10 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 				Fields: v3Fields,
 			})
 			if hit != nil {
-
+				// Read is confirmed by the authenticated GET; confirm write with the
+				// same idempotent same-value SET used for v1/v2c before lifting the
+				// risk. A read-only v3 user (e.g. Lantronix snmprwuser vs snmpuser)
+				// stays medium; a confirmed write goes high.
 				risk, access := "medium", "readOnly"
 				proof := proofKV("operation", "read", "username", hit.cred.User, "level", hit.res.V3Level, "access", "readOnly")
 				if write, err := verifySNMPV3Write(t.Host, port, hit.cred, min(t.Timeout, 1500*time.Millisecond)); err == nil && write != nil {
@@ -351,7 +382,7 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 				}
 				var cve []string
 				if hit.cred.Name == "huawei-usm-customization" || hit.cred.Name == "huawei-usm-community" {
-					cve = []string{"CVE-2026-65198"}
+					cve = []string{"CVE-2026-65198"} // shared SNMPv3 USM key
 				}
 				out = append(out, engine.Finding{
 					Check: "snmp.v3.defaultCreds", Category: "creds", Risk: risk, CVE: cve,
@@ -364,17 +395,25 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 		}
 	}
 
+	// Vendor-specific default communities beyond public/private (e.g. Intel
+	// intel.public/intel.private). Only when SNMP is confirmed present - a public
+	// read or a v3 engine-ID response, the latter catching devices like Intel
+	// BMCs whose custom community hides the generic public read - and the host was
+	// attributed to a vendor that ships a non-generic community. Active reads
+	// confirm the community; documented-RW communities additionally require a
+	// same-value SET before the finding reports write access.
 	if !t.DisableLogins {
 		_, snmpUp := t.Evidenced("snmp")
 		_, v3Up := t.Evidenced("snmpv3")
 		if snmpUp || v3Up {
 			vend := identityVendor(t)
 			for _, dc := range snmp.DefaultCommunities {
-
+				// "*" is a firmware-level default (e.g. AMI) tried on any SNMP host;
+				// everything else is gated to its own identify vendor slug.
 				if dc.Vendor != "*" && !strings.EqualFold(dc.Vendor, vend) {
 					continue
 				}
-				for _, ver := range []int{1, 0} {
+				for _, ver := range []int{1, 0} { // v2c then v1
 					r, err := snmp.Probe(t.Host, port, dc.Community, ver, min(t.Timeout, 1500*time.Millisecond))
 					if err != nil || r == nil || !r.Responded {
 						continue
@@ -387,7 +426,7 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 							proof = proofKV("operation", "setSameValue", "community", dc.Community, "oid", write.OID, "access", "readWrite")
 						}
 					}
-					vlabel := dc.Vendor
+					vlabel := dc.Vendor // for "*" show the host's identified vendor, not the wildcard
 					if vlabel == "*" {
 						if vlabel = vend; vlabel == "" {
 							vlabel = "unknown"
@@ -411,10 +450,17 @@ func runSNMP(ctx context.Context, t *engine.Target) []engine.Finding {
 
 var verifySNMPWrite = snmp.VerifyWrite
 
+// verifySNMPV3Write confirms a v3 credential's write access; injectable for tests.
 var verifySNMPV3Write = snmp.VerifyWriteV3
 
 func snmpCredentialVendor(t *engine.Target) string {
-
+	// A vendor is "known to the v3 cred pool" if it has a vendor-specific
+	// passphrase profile or raw-localized-key profile (e.g. Huawei, which ships
+	// only a localized key). Recognizing it keeps the passphrase sweep
+	// vendor-scoped instead of falling back to the whole cross-vendor list. This
+	// checks vendor-specific membership directly so it is not perturbed by the
+	// localized creds being tried broadly (regardless of vendor) in the default
+	// sweep.
 	known := func(v string) bool {
 		if v == "" {
 			return false
@@ -444,11 +490,17 @@ func snmpCredentialVendor(t *engine.Target) string {
 	return ""
 }
 
+// snmpV3Hit is a factory v3 credential that authenticated.
 type snmpV3Hit struct {
 	cred snmp.V3Cred
 	res  *snmp.Result
 }
 
+// snmpV3Candidates assembles the SNMPv3 credentials to try for a target: the
+// documented passphrase-derived factory defaults, the built-in raw-localized-key
+// credentials (Huawei openUBMC) -- now tried by default on any v3-responsive
+// host regardless of vendor -- plus (when --snmp-v3-localized-key is set) an
+// operator-supplied raw localized key.
 func snmpV3Candidates(t *engine.Target) []snmp.V3Cred {
 	vendor := snmpCredentialVendor(t)
 	creds := snmp.DefaultV3CredsWithLocalized(vendor)
@@ -458,6 +510,10 @@ func snmpV3Candidates(t *engine.Target) []snmp.V3Cred {
 	return creds
 }
 
+// parseOperatorLocalizedKey parses --snmp-v3-localized-key "user:authHex[:privHex]".
+// The key(s) are raw pre-localized USM keys (hex); auth is assumed SHA-256 and
+// privacy AES (Huawei's algorithms and the common modern default). Returns false
+// when the flag is empty or malformed.
 func parseOperatorLocalizedKey(spec string) (snmp.V3Cred, bool) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
@@ -474,6 +530,9 @@ func parseOperatorLocalizedKey(spec string) (snmp.V3Cred, bool) {
 	return c, true
 }
 
+// snmpV3Secret renders the secret half of a v3 credential for reporting: the
+// passphrase when passphrase-derived, or the raw localized key when the
+// credential ships a pre-localized key (Huawei et al.).
 func snmpV3Secret(c snmp.V3Cred) string {
 	if c.AuthPass != "" {
 		return c.AuthPass
@@ -484,8 +543,11 @@ func snmpV3Secret(c snmp.V3Cred) string {
 	return ""
 }
 
+// tryV3CredsFn is the v3 credential sweep; injectable for tests.
 var tryV3CredsFn = tryV3Creds
 
+// tryV3Creds tries each candidate SNMPv3 credential, returning the first that
+// completes an authenticated GET (nil if none work).
 func tryV3Creds(ctx context.Context, host string, port int, creds []snmp.V3Cred, per time.Duration) *snmpV3Hit {
 	for _, c := range creds {
 		if ctx.Err() != nil {
@@ -509,14 +571,24 @@ func snmpVerName(v int) string {
 	}
 }
 
+// sshProbePorts are the TCP ports ssh.exposure fingerprints, in priority order.
+// 22 is standard; 2222 is by far the most common alt-SSH port on OOB gear per the
+// Shodan census (HPE iLO mpSSH and APC AOS cryptlib frequently listen there). SSH is
+// probed here rather than via --ports because the web collectors would otherwise
+// treat these ports as HTTP.
 var sshProbePorts = []int{22, 2222}
 
+// runSSHExposure fingerprints the SSH banner and, when online logins are
+// permitted, tries a capped set of default credentials.
 func runSSHExposure(ctx context.Context, t *engine.Target) []engine.Finding {
 	banner := ""
 	if v, ok := t.Evidenced("ssh.banner"); ok {
 		banner, _ = v.(string)
 	}
-
+	// sshPort is the port the banner was observed on; drives every follow-up probe
+	// (kex, host key, default creds) and the finding Port. When identify's
+	// collectSSH already grabbed the banner it also stashed the port it used, so
+	// honour that; otherwise default to 22.
 	sshPort := 22
 	if v, ok := t.Evidenced("ssh.port"); ok {
 		if p, ok2 := v.(int); ok2 && p > 0 {
@@ -535,7 +607,9 @@ func runSSHExposure(ctx context.Context, t *engine.Target) []engine.Finding {
 		return nil
 	}
 	t.SetEvidence("ssh.banner", banner)
-
+	// Report the SSH product/banner as info only. Banner-version-inferred CVEs are
+	// not asserted because distro/vendor backports patch them without bumping the
+	// banner.
 	product, _, _ := ssh.FingerprintBanner(banner)
 	t.MarkOpen(sshPort, "tcp", "ssh")
 
@@ -575,6 +649,10 @@ func runSSHExposure(ctx context.Context, t *engine.Target) []engine.Finding {
 		Fields: engine.F(versionKV...),
 	})
 
+	// Enumerate the server's offered algorithms and flag weak KEX / cipher / MAC
+	// / host-key choices (parity with Nessus/GreenBone SSH-hardening checks) as a
+	// single finding, one key=val per weak category. These are weak defaults, not
+	// directly exploitable, so they rate low.
 	if kexInfo != nil {
 		weak := kexInfo.WeakAlgos()
 		var kv []string
@@ -591,6 +669,9 @@ func runSSHExposure(ctx context.Context, t *engine.Target) []engine.Finding {
 		}
 	}
 
+	// Active default-credential login only on identified OOB devices, never on a
+	// truly-unknown host - version/weak-crypto reporting runs everywhere, but we do
+	// not credential-spray arbitrary SSH servers picked up by the all-targets sweep.
 	if !t.DisableLogins && isOOBDevice(t) {
 		vendor := ""
 		if t.Identity != nil {
@@ -612,6 +693,8 @@ func runSSHExposure(ctx context.Context, t *engine.Target) []engine.Finding {
 	return findings
 }
 
+// isOOBDevice reports whether identify attributed the target to a known OOB class
+// or vendor (not a bare unknown host), gating active credential attempts.
 func isOOBDevice(t *engine.Target) bool {
 	if t.Identity == nil {
 		return false
@@ -619,6 +702,12 @@ func isOOBDevice(t *engine.Target) bool {
 	return t.Identity.Vendor != "" || t.Identity.Class != engine.ClassUnknown
 }
 
+// runSMCPSBlock fetches the Supermicro IPMI credential store served (on affected
+// firmware) from TCP/49152 as cleartext. The real /PSBlock (/PSStore) is a small
+// binary blob carrying account names and cleartext/obfuscated passwords at fixed
+// offsets. Some ATEN builds answer an unknown path with "200 OK" wrapping a 404
+// HTML page, so a bare 200 is not sufficient; require the binary credential store
+// before lifting recovered cleartext strings as evidence.
 func runSMCPSBlock(ctx context.Context, t *engine.Target) []engine.Finding {
 	client := httpx.Client(t.Timeout)
 	for _, path := range []string{"/PSBlock", "/PSStore", "/IPMIdevicedesc.xml"} {
@@ -635,7 +724,7 @@ func runSMCPSBlock(ctx context.Context, t *engine.Target) []engine.Finding {
 		}
 		if path == "/IPMIdevicedesc.xml" {
 			fields, ok := smcDeviceDescFields(body)
-			if !ok {
+			if !ok { // reject malformed XML and 200-wrapped error pages
 				continue
 			}
 			return []engine.Finding{{
@@ -644,11 +733,14 @@ func runSMCPSBlock(ctx context.Context, t *engine.Target) []engine.Finding {
 				Fields: append(engine.F("path", path), fields...),
 			}}
 		}
-
+		// Must be the binary credential store, not an HTML/error body served as 200.
 		if !isPSBlockCredStore(body) {
 			continue
 		}
-
+		// No CVE asserted: the Supermicro TCP/49152 plaintext credential-store
+		// exposure (CARISIRT/Rapid7, 2014) has no accurate single CVE - CVE-2014-8272
+		// is a Dell iDRAC6/7 session-ID bug, not this. The finding stands on its own
+		// confirmed evidence (the cleartext store is actually served).
 		fields := engine.F("path", path, "bytes", fmt.Sprintf("%d", len(body)),
 			"sample", printablePrefix(body, 48))
 		if creds := psblockStrings(body); creds != "" {
@@ -666,6 +758,9 @@ func runSMCPSBlock(ctx context.Context, t *engine.Target) []engine.Finding {
 	return nil
 }
 
+// isPSBlockCredStore reports whether a /PSBlock body is the genuine ATEN binary
+// credential store rather than a 200-wrapped HTML/error page. The real store is a
+// small binary blob with embedded NULs and no HTML markup.
 func isPSBlockCredStore(body []byte) bool {
 	head := body
 	if len(head) > 512 {
@@ -674,9 +769,10 @@ func isPSBlockCredStore(body []byte) bool {
 	low := strings.ToLower(string(head))
 	if strings.Contains(low, "<html") || strings.Contains(low, "<head") ||
 		strings.Contains(low, "not found") || strings.Contains(low, "<!doctype") {
-		return false
+		return false // an HTML/error page served with 200
 	}
-
+	// The credential store is binary: it must contain NUL bytes (ATEN fixed-width
+	// records) and be non-trivial in size.
 	return len(body) >= 256 && bytesContainsNUL(body)
 }
 
@@ -735,6 +831,9 @@ func smcDeviceDescFields(body []byte) (engine.Fields, bool) {
 	), true
 }
 
+// psblockStrings pulls the printable ASCII runs (>=3 chars) out of the binary
+// credential store - these are the account names and cleartext passwords - and
+// returns the first several, comma-joined, as recovered evidence.
 func psblockStrings(body []byte) string {
 	var out []string
 	var cur []byte
@@ -758,6 +857,7 @@ func psblockStrings(body []byte) string {
 	return strings.Join(out, ",")
 }
 
+// upnpSDK extracts the UPnP SDK name and version from an SSDP Server header.
 func upnpSDK(server string) (name, version string) {
 	for _, m := range []string{"Portable SDK for UPnP devices/", "Intel SDK for UPnP devices/"} {
 		if _, after, ok := strings.Cut(server, m); ok {
@@ -772,6 +872,7 @@ func upnpSDK(server string) (name, version string) {
 	return "", ""
 }
 
+// versionLess reports whether dotted numeric version a < b (e.g. "1.6.6" < "1.6.18").
 func versionLess(a, b string) bool {
 	as, bs := strings.Split(a, "."), strings.Split(b, ".")
 	for i := 0; i < len(as) || i < len(bs); i++ {
@@ -789,6 +890,8 @@ func versionLess(a, b string) bool {
 	return false
 }
 
+// credPairs converts the credential knowledge base into ordered user:pass pairs
+// (vendor-first) for a capped online spray.
 func credPairs(vendor string, max int) [][2]string {
 	seen := map[[2]string]bool{}
 	var out [][2]string

@@ -9,15 +9,30 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/output"
 )
 
+// runZero stores a captured RAKP-2 exchange collapsed into one string per account
+// (HMAC input plus HMAC); the native schema stores it decomposed into the two
+// session ids, the two nonces, the BMC GUID and the username.
+//
+// The decomposition is recoverable because the salt is exactly the concatenation
+// SIDc(LE) | SIDm(LE) | Rc | Rm | GUIDm | 0x14 | ulen | username (see
+// ipmi.RAKPResult.Salt, the single source of truth for the layout), so a converted
+// record carries real RAKP rows rather than an opaque blob.
+//
+// Exports frequently ship "<redacted>" in place of the salt and HMAC. Those rows
+// are still emitted, flagged Redacted, so the fact that the BMC leaked a hash
+// survives even when the hash does not.
+
+// rakpEntry is one parsed entry of an ipmi.rakp.hashes attribute.
 type rakpEntry struct {
 	Username string
-	Cipher   string
-	Algo     string
-	Salt     string
-	MAC      string
-	Redacted bool
+	Cipher   string // RAKP auth cipher id as reported (may be empty on legacy rows)
+	Algo     string // sha1 / md5 / sha256, derived from the HMAC length
+	Salt     string // hex
+	MAC      string // hex
+	Redacted bool   // the source withheld the salt and HMAC
 }
 
+// authAlgo maps the parsed algorithm name onto the IPMI RAKP auth algorithm id.
 func (e *rakpEntry) authAlgo() byte {
 	switch e.Algo {
 	case "sha1":
@@ -30,6 +45,8 @@ func (e *rakpEntry) authAlgo() byte {
 	return 0
 }
 
+// result reconstructs the oobscan RAKPResult behind this entry, or nil when the
+// salt is absent or does not have the canonical RAKP-2 layout.
 func (e *rakpEntry) result() *ipmi.RAKPResult {
 	if e.Redacted {
 		return nil
@@ -42,7 +59,8 @@ func (e *rakpEntry) result() *ipmi.RAKPResult {
 	if err != nil || len(mac) == 0 {
 		return nil
 	}
-
+	// 4+4 session ids, 16+16 nonces, 16 GUID, the 0x14 role byte and the username
+	// length byte: 58 fixed bytes ahead of the username.
 	const fixed = 58
 	if len(salt) < fixed || salt[56] != 0x14 || int(salt[57]) != len(salt)-fixed {
 		return nil
@@ -59,6 +77,16 @@ func (e *rakpEntry) result() *ipmi.RAKPResult {
 	}
 }
 
+// usesSMCFixedKey reports whether this RAKP-2 HMAC was computed with the known
+// Supermicro/ATEN fixed key rather than the account password, which makes the
+// leaked hash forgeable. Verification is delegated to oobscan's own check.
+func (e *rakpEntry) usesSMCFixedKey() bool {
+	rr := e.result()
+	return rr != nil && rr.UsesSMCRAKPFixedKey()
+}
+
+// rakpRecords projects every captured RAKP-2 exchange on the host onto oobscan
+// RAKP rows.
 func (h *rzHost) rakpRecords() []output.RAKPRecord {
 	var out []output.RAKPRecord
 	for i := range h.services {
@@ -85,10 +113,14 @@ func (h *rzHost) rakpRecords() []output.RAKPRecord {
 				rec.RAKPHash = hex.EncodeToString(rr.RAKPHash)
 				rec.Hashcat = rr.Hashcat()
 			} else if !e.Redacted {
-
+				// The salt did not decompose: keep the HMAC so the row still says
+				// which account leaked, even though it is not re-crackable here.
 				rec.RAKPHash = e.MAC
 			}
-
+			// oobscan's `cracked` holds the recovered password. runZero exports the
+			// password separately from a classification ("default", "common", ...)
+			// and redacts the password by default, so fall back to the class marker
+			// rather than dropping the fact that the account was recovered.
 			if pw, ok := passwords[e.Username]; ok && pw != "" && !strings.Contains(pw, "redacted") {
 				rec.Cracked = pw
 			} else if kind, ok := cracked[e.Username]; ok {
@@ -103,6 +135,15 @@ func (h *rzHost) rakpRecords() []output.RAKPRecord {
 	return out
 }
 
+// parseRAKPHashes parses an ipmi.rakp.hashes attribute (tab joined) into its
+// entries. Each entry looks like:
+//
+//	displayUser:cipher$salthex:machex     (current format)
+//	displayUser:cipher$<redacted>         (secrets withheld at export)
+//	displayUser:salthex:machex            (legacy, no cipher)
+//
+// A username may itself contain ':', so the salt and HMAC are peeled from the
+// right and the cipher from the position just before '$'.
 func parseRAKPHashes(val string) []rakpEntry {
 	var out []rakpEntry
 	for _, entry := range tabValues(val) {
@@ -114,8 +155,8 @@ func parseRAKPHashes(val string) []rakpEntry {
 }
 
 func parseRAKPEntry(entry string) (rakpEntry, bool) {
-	if before, after, ok := strings.Cut(entry, "$"); ok {
-		left, right := before, after
+	if dollar := strings.IndexByte(entry, '$'); dollar >= 0 {
+		left, right := entry[:dollar], entry[dollar+1:]
 		user, cipher := "", ""
 		if c := strings.LastIndexByte(left, ':'); c >= 0 {
 			user, cipher = left[:c], left[c+1:]
@@ -136,6 +177,7 @@ func parseRAKPEntry(entry string) (rakpEntry, bool) {
 		return rakpEntry{Username: user, Cipher: cipher, Algo: algo, Salt: salt, MAC: mac}, true
 	}
 
+	// Legacy "user:salt:mac": peel the HMAC and salt from the right.
 	c2 := strings.LastIndexByte(entry, ':')
 	if c2 < 0 {
 		return rakpEntry{}, false
@@ -156,6 +198,7 @@ func parseRAKPEntry(entry string) (rakpEntry, bool) {
 	return rakpEntry{Username: user, Algo: algo, Salt: salt, MAC: mac}, true
 }
 
+// splitSaltMAC splits a "salthex:machex" body, validating both halves as hex.
 func splitSaltMAC(body string) (salt, mac string, ok bool) {
 	c := strings.LastIndexByte(body, ':')
 	if c < 0 {
@@ -168,6 +211,7 @@ func splitSaltMAC(body string) (salt, mac string, ok bool) {
 	return salt, mac, true
 }
 
+// algoForMAC maps an HMAC hex length to its RAKP authentication algorithm.
 func algoForMAC(machex string) string {
 	switch len(machex) {
 	case 40:
@@ -180,6 +224,8 @@ func algoForMAC(machex string) string {
 	return ""
 }
 
+// algoForCipher maps the reported RAKP auth cipher id to its algorithm. It is
+// the only signal left when the HMAC itself was withheld.
 func algoForCipher(cipher string) string {
 	switch strings.TrimSpace(cipher) {
 	case "1":
@@ -192,6 +238,7 @@ func algoForCipher(cipher string) string {
 	return ""
 }
 
+// isHex reports whether s is a non-empty even-length hex string.
 func isHex(s string) bool {
 	if s == "" || len(s)%2 != 0 {
 		return false
@@ -200,10 +247,12 @@ func isHex(s string) bool {
 	return err == nil
 }
 
+// parseUserMap parses a tab-separated "user:value" attribute into a map.
 func parseUserMap(val string) map[string]string {
 	out := map[string]string{}
 	for _, entry := range tabValues(val) {
-
+		// Split on the last colon, not the first: an IPMI username may contain a
+		// colon, and the value never does.
 		c := strings.LastIndexByte(entry, ':')
 		if c < 0 {
 			out[entry] = ""
@@ -214,6 +263,8 @@ func parseUserMap(val string) map[string]string {
 	return out
 }
 
+// displayUser normalizes runZero's "<empty>" placeholder to an empty string,
+// which is how oobscan spells the IPMI null user.
 func displayUser(u string) string {
 	if u == "<empty>" {
 		return ""

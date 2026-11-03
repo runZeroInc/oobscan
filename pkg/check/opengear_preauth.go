@@ -14,6 +14,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Opengear OM/CM/IM/ACM console servers expose REST endpoints without
+// authentication (model_name, banner, local_password_policy -- see
+// opengearEndpoints below) that disclose the device model and
+// password-hardening policy. The model supports affected-firmware assessment;
+// the policy shows how weak local credentials may be. Eaton OM2200/Gigamon
+// and other Opengear-lineage stacks share this surface, so the check also
+// runs on the serialConsole class, not just the opengear vendor slug. Each
+// request is one benign GET.
 func init() {
 	Register(Check{
 		Name:        "http.opengear.preAuthLeak",
@@ -39,8 +47,11 @@ func init() {
 	})
 }
 
+// opengearEndpoints are the unauth REST paths, tried across the API version
+// prefixes Opengear has shipped (v1 on OM/CM, v2 on newer OM). The bare
+// (prefix-less) forms cover firmware that mounts them without the /api/vN prefix.
 var opengearEndpoints = []struct {
-	key   string
+	key   string // finding field key
 	paths []string
 }{
 	{"model_name", []string{"/api/v2/system/model_name", "/api/v1/system/model_name", "/system/model_name"}},
@@ -65,7 +76,8 @@ func runOpengearPreauth(ctx context.Context, t *engine.Target) []engine.Finding 
 			if st < 200 || st >= 300 {
 				continue
 			}
-
+			// Require a JSON body (the REST API answers JSON); an HTML login page
+			// with a 200 must not be mistaken for a leak.
 			if !strings.Contains(ct, "json") && !looksLikeJSON(body) {
 				continue
 			}
@@ -78,13 +90,15 @@ func runOpengearPreauth(ctx context.Context, t *engine.Target) []engine.Finding 
 				engine.Field{Key: ep.key + "_url", Val: p})
 			answered = append(answered, fmt.Sprintf("%s=%d", p, st))
 			hits++
-			break
+			break // first matching prefix wins for this endpoint
 		}
 	}
 	if hits == 0 {
 		return nil
 	}
-
+	// Record which paths answered and with what status. Without this the finding
+	// only carries evidence when the endpoint whose field key happens to be
+	// spelled "banner" is among the ones that responded.
 	fields = append(fields, engine.Field{Key: "proof", Val: proofKV(
 		"endpoints", strings.Join(answered, " "),
 		"leaked", strconv.Itoa(hits),
@@ -144,12 +158,16 @@ func opengearPostProbe(ctx context.Context, c *http.Client, rawURL string, body 
 	return resp.StatusCode, resp.Header.Get("Content-Type"), b
 }
 
+// opengearExtract pulls a readable value out of the endpoint's JSON body. The
+// REST envelopes vary by firmware ({"model_name":"OM2224-24E"} vs
+// {"system":{"model_name":"..."}} vs a bare JSON string), so try the common
+// shapes and fall back to a bounded snippet of the raw body for banner/policy.
 func opengearExtract(key string, body []byte) string {
 	b := strings.TrimSpace(string(body))
 	if opengearErrorResponse(body) {
 		return ""
 	}
-
+	// Bare JSON string, e.g. "OM2224-24E".
 	var s string
 	if json.Unmarshal([]byte(b), &s) == nil && strings.TrimSpace(s) != "" {
 		return cleanSnippet(s)
@@ -159,7 +177,7 @@ func opengearExtract(key string, body []byte) string {
 		if v := jsonStr(top, key); v != "" {
 			return cleanSnippet(v)
 		}
-
+		// Nested under a wrapper object (e.g. {"system":{"model_name":...}}).
 		for _, raw := range top {
 			var inner map[string]json.RawMessage
 			if json.Unmarshal(raw, &inner) == nil {
@@ -168,12 +186,13 @@ func opengearExtract(key string, body []byte) string {
 				}
 			}
 		}
-
+		// A password-policy object is worth reporting even without a single value:
+		// summarize the JSON keys so the disclosure is captured.
 		if key == "local_password_policy" && len(top) > 0 {
 			return cleanSnippet(b)
 		}
 	}
-
+	// Banner is free-form text; capture a snippet when the body is non-empty.
 	if key == "banner" && b != "" && b != "{}" {
 		return cleanSnippet(b)
 	}
@@ -195,6 +214,7 @@ func opengearErrorResponse(body []byte) bool {
 	return false
 }
 
+// jsonStr returns m[key] as a string when it is a JSON string value.
 func jsonStr(m map[string]json.RawMessage, key string) string {
 	raw, ok := m[key]
 	if !ok {
@@ -207,6 +227,8 @@ func jsonStr(m map[string]json.RawMessage, key string) string {
 	return ""
 }
 
+// looksLikeJSON reports whether a body begins with a JSON object/array/string,
+// allowing REST responses that omit an application/json Content-Type.
 func looksLikeJSON(body []byte) bool {
 	b := strings.TrimSpace(string(body))
 	return strings.HasPrefix(b, "{") || strings.HasPrefix(b, "[") || strings.HasPrefix(b, "\"")

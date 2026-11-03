@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+// Eaton Network-M2/M3 (modern NMC) web-login adapter. Authentication is an
+// OAuth2-style JSON POST to /rest/mbdetnrs/1.0/oauth2/token; the version
+// prefix is required (the bare token path 401s). Outcomes: 200 + access_token
+// = valid credential; 403 = valid but the shipped default is pre-expired and
+// forces a one-time change; 401 = invalid. A 403 alone is not proof (any
+// proxy/WAF can emit it) -- it is confirmed only via the mbdetnrs JSON error
+// envelope. See kb/eaton/ for the shapes.
 type eatonAdapter struct{}
 
 func (eatonAdapter) mechanism() string { return "httpOauth2" }
@@ -36,23 +43,30 @@ func (eatonAdapter) login(ctx context.Context, client *http.Client, base, user, 
 		}
 		_ = json.Unmarshal(body, &env)
 		if env.AccessToken == "" {
-			return false, "", nil
+			return false, "", nil // 200 without a token is not an accepted login
 		}
 		return true, proofKV("endpoint", eatonTokenEndpoint, "status", "200", "accessTokenLen", strconv.Itoa(len(env.AccessToken))), nil
 	case http.StatusForbidden:
-
+		// Credential valid, shipped default pre-expired (forced password change).
+		// Require the mbdetnrs JSON error envelope so a generic 403 (HTML/empty)
+		// from a proxy/WAF is not a false positive.
 		marker, isJSON := eatonErrEnvelope(body)
 		if !isJSON {
 			return false, "", nil
 		}
 		return true, proofKV("endpoint", eatonTokenEndpoint, "status", "403") + " " + marker, nil
 	case http.StatusUnauthorized:
-		return false, "", nil
+		return false, "", nil // invalid credential
 	default:
 		return false, "", errNotThisDevice
 	}
 }
 
+// eatonErrEnvelope reports whether body is the mbdetnrs JSON error envelope and
+// returns a compact server-returned marker (its error code or message) for the
+// proof. A generic proxy/WAF 403 (HTML or empty) is not a JSON object, so
+// isJSON=false and the caller declines to confirm. It accepts both the nested
+// `{"error":{"errorCode":..,"message":..}}` model and a flat `{"errorCode":..}`.
 func eatonErrEnvelope(body []byte) (marker string, isJSON bool) {
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(body, &obj) != nil || len(obj) == 0 {

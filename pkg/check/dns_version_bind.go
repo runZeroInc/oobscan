@@ -13,6 +13,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// A DNS daemon conventionally answers a CHAOS-class TXT query for
+// `version.bind` with its own version string: one read-only UDP datagram,
+// equivalent to `dig +short @host chaos txt version.bind`. dnsmasq gets an
+// affected-range note because several devices bundle a stale copy
+// (kb/vertiv/, kb/_cross-vendor/); it records what the daemon reports, not
+// patch status -- a backport can fix a bug without changing the banner -- so
+// it never asserts a host is vulnerable.
 func init() {
 	Register(Check{
 		Name:        "udp.dns.versionBind",
@@ -29,7 +36,10 @@ const dnsPort = 53
 
 func runDNSVersionBind(ctx context.Context, t *engine.Target) []engine.Finding {
 	_ = ctx
-
+	// UDP port state is rarely known up front (no negative result exists for an
+	// unanswered datagram), so this probes unconditionally the way the other UDP
+	// discovery checks do. One 4-byte-question datagram with a short timeout is
+	// cheap enough not to need a gate, and a non-DNS host simply never replies.
 	timeout := min(t.Timeout, 4*time.Second)
 
 	ver, qname := "", ""
@@ -49,6 +59,10 @@ func runDNSVersionBind(ctx context.Context, t *engine.Target) []engine.Finding {
 	num := dnsVersionNumber(ver)
 	impl := dnsImplementation(ver)
 
+	// The version disclosure itself is informational for every implementation.
+	// Only dnsmasq gets an affected-range comparison, because it is the one whose
+	// bundled-copy staleness we have characterised from firmware; asserting a range
+	// for an implementation we have not looked at would be guesswork.
 	risk := "info"
 	note := "DNS daemon version disclosed pre-auth; recorded for the component inventory. No affected-range comparison is attempted for this implementation."
 	if impl == "dnsmasq" {
@@ -56,7 +70,7 @@ func runDNSVersionBind(ctx context.Context, t *engine.Target) []engine.Finding {
 		case num == "":
 			note = "dnsmasq version disclosed but not parseable; no affected-range comparison attempted."
 		case cmpDottedVersion(num, "2.78") < 0:
-
+			// CVE-2017-14491 was fixed in 2.78. Everything below it is in range.
 			risk = "medium"
 			note = "version predates dnsmasq 2.78 -- inside the CVE-2017-14491 affected range (heap overflow in DNS response parsing). PATCH STATUS NOT ESTABLISHED: a vendor backport would not change this banner. Confirm by inspecting the shipped binary."
 		default:
@@ -78,6 +92,9 @@ func runDNSVersionBind(ctx context.Context, t *engine.Target) []engine.Finding {
 	}}
 }
 
+// dnsChaosTXT sends one CHAOS-class TXT question and returns the first TXT string
+// in the answer section. Read-only: a single well-formed question, no retries
+// beyond the caller's loop, and nothing malformed on the wire.
 func dnsChaosTXT(host string, port int, qname string, timeout time.Duration) (string, error) {
 	var idb [2]byte
 	if _, err := rand.Read(idb[:]); err != nil {
@@ -109,12 +126,14 @@ func dnsChaosTXT(host string, port int, qname string, timeout time.Duration) (st
 	return parseDNSTXTAnswer(buf[:n], id)
 }
 
+// buildDNSQuestion encodes a single question: QTYPE=TXT(16), QCLASS=CHAOS(3),
+// RD set. CHAOS class is what both dnsmasq and BIND answer version queries in.
 func buildDNSQuestion(id uint16, qname string) ([]byte, error) {
 	var b []byte
 	hdr := make([]byte, 12)
 	binary.BigEndian.PutUint16(hdr[0:], id)
-	binary.BigEndian.PutUint16(hdr[2:], 0x0100)
-	binary.BigEndian.PutUint16(hdr[4:], 1)
+	binary.BigEndian.PutUint16(hdr[2:], 0x0100) // standard query, recursion desired
+	binary.BigEndian.PutUint16(hdr[4:], 1)      // QDCOUNT
 	b = append(b, hdr...)
 
 	for label := range strings.SplitSeq(qname, ".") {
@@ -127,14 +146,18 @@ func buildDNSQuestion(id uint16, qname string) ([]byte, error) {
 		b = append(b, byte(len(label)))
 		b = append(b, label...)
 	}
-	b = append(b, 0x00)
+	b = append(b, 0x00) // root
 
 	qt := make([]byte, 4)
-	binary.BigEndian.PutUint16(qt[0:], 16)
-	binary.BigEndian.PutUint16(qt[2:], 3)
+	binary.BigEndian.PutUint16(qt[0:], 16) // TXT
+	binary.BigEndian.PutUint16(qt[2:], 3)  // CHAOS
 	return append(b, qt...), nil
 }
 
+// parseDNSTXTAnswer walks the response far enough to return the first TXT
+// character-string. Every offset is bounds-checked against the datagram, and
+// compression pointers in the answer NAME are skipped rather than followed, so a
+// hostile or malformed reply cannot walk off the buffer or loop.
 func parseDNSTXTAnswer(pkt []byte, wantID uint16) (string, error) {
 	if len(pkt) < 12 {
 		return "", fmt.Errorf("short dns response")
@@ -149,13 +172,13 @@ func parseDNSTXTAnswer(pkt []byte, wantID uint16) (string, error) {
 	}
 
 	off := 12
-
+	// Skip the echoed question section.
 	for range qd {
 		n, err := skipDNSName(pkt, off)
 		if err != nil {
 			return "", err
 		}
-		off = n + 4
+		off = n + 4 // QTYPE + QCLASS
 		if off > len(pkt) {
 			return "", fmt.Errorf("truncated question")
 		}
@@ -177,7 +200,7 @@ func parseDNSTXTAnswer(pkt []byte, wantID uint16) (string, error) {
 			return "", fmt.Errorf("truncated rdata")
 		}
 		if rrType == 16 && rdLen >= 1 {
-
+			// TXT rdata is one or more <length><bytes> character-strings.
 			slen := int(pkt[off])
 			if slen > 0 && off+1+slen <= len(pkt) {
 				return string(pkt[off+1 : off+1+slen]), nil
@@ -188,6 +211,10 @@ func parseDNSTXTAnswer(pkt []byte, wantID uint16) (string, error) {
 	return "", fmt.Errorf("no TXT answer")
 }
 
+// skipDNSName returns the offset just past a wire-format name at off. A
+// compression pointer terminates the name, so it is consumed (2 bytes) and not
+// followed - this parser never needs the expanded name, and refusing to follow
+// pointers makes pointer loops unreachable.
 func skipDNSName(pkt []byte, off int) (int, error) {
 	for {
 		if off >= len(pkt) {
@@ -210,6 +237,10 @@ func skipDNSName(pkt []byte, off int) (int, error) {
 	}
 }
 
+// dnsImplementation names the daemon when the banner identifies itself, and
+// returns "" otherwise. Only a self-identifying banner is trusted: guessing the
+// implementation would put a wrong component in the inventory, and the whole point
+// of reading version.bind is to record what the daemon says rather than infer it.
 func dnsImplementation(s string) string {
 	low := strings.ToLower(s)
 	for _, impl := range []string{"dnsmasq", "powerdns", "unbound", "knot", "bind"} {
@@ -220,6 +251,8 @@ func dnsImplementation(s string) string {
 	return ""
 }
 
+// dnsVersionNumber pulls the dotted version out of a version.bind banner such as
+// "dnsmasq-2.75", "dnsmasq 2.90" or "9.11.4-P2-RedHat".
 func dnsVersionNumber(s string) string {
 	i := strings.IndexAny(s, "0123456789")
 	if i < 0 {
@@ -236,6 +269,9 @@ func dnsVersionNumber(s string) string {
 	return v
 }
 
+// cmpDottedVersion compares two dotted numeric versions, returning -1, 0 or 1.
+// Non-numeric components compare as 0, which keeps a malformed banner from
+// producing a confident verdict.
 func cmpDottedVersion(a, b string) int {
 	as, bs := strings.Split(a, "."), strings.Split(b, ".")
 	for i := 0; i < max(len(as), len(bs)); i++ {

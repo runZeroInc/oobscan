@@ -11,6 +11,9 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/oob"
 )
 
+// coverageCmd prints what oobscan covers: the OOB/BMC device inventory (which
+// vendors/products and which protocol probes map to each), followed by the
+// registered security checks and their applicability.
 var coverageCmd = &cobra.Command{
 	Use:   "coverage",
 	Short: "Show the OOB/BMC vendors, products, and security checks oobscan covers.",
@@ -47,6 +50,9 @@ func runCoverage(cmd *cobra.Command, args []string) {
 	printChecks()
 }
 
+// printChecks lists every registered security check: its category, whether it
+// is enabled by default, whether it needs credentials or is destructive, and
+// which device classes/vendors it applies to.
 func printChecks() {
 	lg := log()
 	checks := check.All()

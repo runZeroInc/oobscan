@@ -1,3 +1,8 @@
+// Package cmd is the cobra entrypoint for the oobscan CLI.
+//
+// The CLI structure mirrors sshamble (runZeroInc/sshamble) so that existing
+// muscle memory carries over: `oobscan scan` probes, `oobscan coverage` shows
+// the device/check inventory.
 package cmd
 
 import (
@@ -16,29 +21,44 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/output"
 )
 
+// rootNoColor and rootVerbose are the persistent flag targets. Every
+// subcommand shares the same --no-color and --verbose semantics so the shared
+// output.Logger (see pkg/output) produces consistent severity-tagged,
+// colorized lines across the whole CLI.
 var (
 	rootNoColor bool
 	rootVerbose bool
 	rootPprof   int
 )
 
+// pprofOnce guards the loopback pprof server so PersistentPreRun (which fires
+// for every command in the chain) starts it at most once.
 var pprofOnce sync.Once
 
 var rootCmd = &cobra.Command{
-	Use:   "oobscan [scan|ipmi|explain|coverage|version]",
-	Short: "An exploration tool for (in)secure out-of-band management services.",
+	Use:   "oobscan [scan|ipmi|smc-*|explain|coverage|version]",
+	Short: "A security assessment and diagnostic tool for out-of-band management.",
 	Long: `oobscan enumerates BMCs, serial-port servers, IP-KVMs, PDUs, and other
-out-of-band management surfaces for protocol exposures, pre-auth information
-leakage, default credentials, and known-vulnerable firmware.
+out-of-band management services to identify exposures, validate remediation,
+and support authorized investigation and reproducible security research.
+
+Use only on systems you own or have explicit permission to assess. Scans send
+active probes and enable login checks by default. To suppress login checks, use
+"oobscan scan --disable-logins"; this does not make scanning passive.
+Manual operations can change device state, interrupt management access, or
+reboot a controller. Review each
+command's help and agree on scope and maintenance windows before production use.
 
 Start a scan (scan is the default command):
 
 	oobscan -o results.jsonl 10.0.0.0/24
 
 Captured RAKP hashes are written into each result's "rakp" records: the
-"hashcat" field holds the ready-to-crack hashcat -m 7300 line when one applies
+"hashcat" field holds the hashcat -m 7300 audit input when one applies
 (HMAC-SHA1); HMAC-MD5/SHA256 records omit it but keep the full reconstruction
-material (sids, nonces, guid, hmac) for offline cracking.
+material (sids, nonces, guid, hmac) for offline password auditing. Scan records,
+backups, potfiles, and reports can contain secrets; restrict access and review
+redacted copies before sharing.
 
 Show the device + security-check coverage:
 
@@ -47,6 +67,14 @@ Show the device + security-check coverage:
 Run direct IPMI validation/remediation commands:
 
 	oobscan ipmi -u ADMIN -P ADMIN 10.0.0.10 user list
+
+The Supermicro/ATEN OEM workflows are separate smc-<tool> commands. Break-glass
+deployment is opt-in. Committing with
+"oobscan smc-restore-shell --apply" changes configuration and reboots the BMC:
+
+	oobscan smc-backup -u ADMIN -P ADMIN 10.0.0.10
+	oobscan smc-restore-shell -u ADMIN -P ADMIN 10.0.0.10 --apply
+	oobscan smc-shell 10.0.0.10 4444
 `,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		initDefaultLogger()
@@ -54,6 +82,12 @@ Run direct IPMI validation/remediation commands:
 	},
 }
 
+// startPprof launches the net/http/pprof server bound to loopback on the port
+// given by --pprof, so a stuck or slow scan can be inspected live with
+// `go tool pprof http://127.0.0.1:<port>/debug/pprof/{goroutine,heap,profile}`.
+// It binds only to 127.0.0.1 (never a routable interface) so the profiling
+// surface is not exposed to the network, and runs at most once regardless of
+// how many commands share the persistent pre-run.
 func startPprof() {
 	if rootPprof <= 0 {
 		return
@@ -88,6 +122,10 @@ func newPprofServer() *http.Server {
 	}
 }
 
+// initDefaultLogger builds the process-wide output.Default() from the
+// persistent --no-color / --verbose flags plus stdout TTY detection so every
+// subcommand routes stdout/stderr through the same colorized, severity-tagged
+// formatter.
 func initDefaultLogger() {
 	noColor := rootNoColor
 	if !noColor && !isatty.IsTerminal(os.Stdout.Fd()) {
@@ -99,8 +137,12 @@ func initDefaultLogger() {
 	output.SetDefault(output.NewLogger(os.Stdout, os.Stderr, noColor, rootVerbose))
 }
 
+// log returns the process-wide default logger. Kept as a short helper so
+// subcommands can call log().Info(...), log().Warnf(...), etc. without the
+// output package prefix.
 func log() *output.Logger { return output.Default() }
 
+// Execute runs the root command.
 func Execute() {
 	rootCmd.SetArgs(defaultScanArgs(os.Args[1:]))
 	if err := rootCmd.Execute(); err != nil {

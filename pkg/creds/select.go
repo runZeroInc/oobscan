@@ -6,6 +6,9 @@ import (
 	"sync"
 )
 
+// VendorPair is a high-signal vendor default (user, pass). It is a compatibility
+// view derived from Table for callers that only need the vendor pairs. Edit
+// Table, not this.
 type VendorPair struct {
 	Vendor   string
 	User     string
@@ -13,6 +16,7 @@ type VendorPair struct {
 	Notes    string
 }
 
+// VendorPairs is derived from Table at init: every row that names a vendor.
 var VendorPairs []VendorPair
 
 var (
@@ -32,6 +36,8 @@ func init() {
 	}
 }
 
+// buildPools merges the flat username/password wordlists with every credential
+// in Table, de-duplicated, preserving first-seen (hit-rate) order.
 func buildPools() {
 	poolOnce.Do(func() {
 		us := dedupeKeepOrder(CommonUsernames)
@@ -52,8 +58,15 @@ func buildPools() {
 	})
 }
 
+// Usernames returns the de-duplicated username pool (flat lists + Table),
+// ordered highest-hit-rate first.
 func Usernames() []string { buildPools(); return usernames }
 
+// UsernamesFor returns the username pool with the given vendor's known default
+// usernames moved to the front, so the highest-signal account is probed first.
+// This matters against rate-limiting BMCs (OpenBMC, iDRAC): the correct username
+// is hit on the first RAKP packet, before drops force the enumeration to bail.
+// With an empty/unknown vendor it is identical to Usernames().
 func UsernamesFor(vendor string) []string {
 	buildPools()
 	if vendor == "" {
@@ -62,7 +75,7 @@ func UsernamesFor(vendor string) []string {
 	var front []string
 	seen := map[string]struct{}{}
 	for _, c := range CredsFor(vendor, ClassIPMI) {
-		if c.Vendor == "" {
+		if c.Vendor == "" { // stop at the generic/spray rows; only vendor-specific
 			break
 		}
 		if c.Username == "" {
@@ -86,8 +99,18 @@ func UsernamesFor(vendor string) []string {
 	return out
 }
 
+// Passwords returns the de-duplicated password pool (defaults + common + Table),
+// ordered highest-hit-rate first.
 func Passwords() []string { buildPools(); return passwords }
 
+// CredsFor returns credentials to try against a target, best-first:
+//  1. exact {vendor, class} rows,
+//  2. {vendor, ClassAny} rows,
+//  3. generic (Vendor=="") rows for that class or ClassAny,
+//  4. the vendor-agnostic cartesian spray (AllCommon).
+//
+// The result is de-duplicated by (Username, Password), preserving order, so the
+// highest-signal vendor pairs are always attempted before the broad spray.
 func CredsFor(vendor string, class DeviceClass) []Credential {
 	vendor = strings.ToLower(vendor)
 	var out []Credential
@@ -103,28 +126,36 @@ func CredsFor(vendor string, class DeviceClass) []Credential {
 	matchClass := func(c DeviceClass) bool { return c == ClassAny || class == ClassAny || c == class }
 
 	if vendor != "" {
-		for _, c := range Table {
+		for _, c := range Table { // 1: exact vendor+class
 			if c.Vendor == vendor && c.Class == class {
 				add(c)
 			}
 		}
-		for _, c := range Table {
+		for _, c := range Table { // 2: vendor, any class
 			if c.Vendor == vendor && matchClass(c.Class) {
 				add(c)
 			}
 		}
 	}
-	for _, c := range Table {
+	for _, c := range Table { // 3: generic rows
 		if c.Vendor == "" && matchClass(c.Class) {
 			add(c)
 		}
 	}
-	for _, c := range AllCommon() {
+	for _, c := range AllCommon() { // 4: broad spray
 		add(c)
 	}
 	return out
 }
 
+// VendorCredsFor returns just the vendor-specific default credentials for the given
+// vendor+class, best-first: exact {vendor, class} rows then {vendor, ClassAny} rows,
+// de-duplicated by (Username, Password). Unlike CredsFor it never falls back to the
+// generic rows or the cartesian spray, and it returns nil for an unknown vendor.
+//
+// This is the targeted set for state-changing logins: a handful of documented
+// defaults stays well below a BMC's account lockout threshold, where the full
+// CredsFor spray would risk locking the account out.
 func VendorCredsFor(vendor string, class DeviceClass) []Credential {
 	vendor = strings.ToLower(vendor)
 	if vendor == "" {
@@ -141,12 +172,12 @@ func VendorCredsFor(vendor string, class DeviceClass) []Credential {
 		out = append(out, c)
 	}
 	matchClass := func(c DeviceClass) bool { return c == ClassAny || class == ClassAny || c == class }
-	for _, c := range Table {
+	for _, c := range Table { // exact vendor+class first
 		if c.Vendor == vendor && c.Class == class {
 			add(c)
 		}
 	}
-	for _, c := range Table {
+	for _, c := range Table { // then vendor, any class
 		if c.Vendor == vendor && matchClass(c.Class) {
 			add(c)
 		}
@@ -154,9 +185,22 @@ func VendorCredsFor(vendor string, class DeviceClass) []Credential {
 	return out
 }
 
+// DocumentedDefaults returns every documented default credential for the given
+// class, vendor-specific and generic rows alike, de-duplicated by (Username,
+// Password). It excludes the vendor-agnostic cartesian spray (AllCommon).
+//
+// The highest-hit-rate cross-vendor pairs (canonicalDefaultOrder) come first so a
+// caller that caps its attempts still exercises the most common credentials; the
+// rest follow in Table order.
+//
+// This is the fallback for a confirmed-present service whose vendor could not be
+// identified: it exercises the well-known cross-vendor defaults without escalating
+// to a spray that would risk account lockout. Callers should still cap their
+// attempt count.
 func DocumentedDefaults(class DeviceClass) []Credential {
 	matchClass := func(c DeviceClass) bool { return c == ClassAny || class == ClassAny || c == class }
-
+	// Index the class-matching rows by (user, pass), keeping the first (highest
+	// priority) Table row for each pair.
 	byPair := map[[2]string]Credential{}
 	var order [][2]string
 	for _, c := range Table {
@@ -182,26 +226,33 @@ func DocumentedDefaults(class DeviceClass) []Credential {
 			out = append(out, c)
 		}
 	}
-	for _, k := range canonicalDefaultOrder {
+	for _, k := range canonicalDefaultOrder { // high-signal cross-vendor first
 		emit(k)
 	}
-	for _, k := range order {
+	for _, k := range order { // then the rest in Table order
 		emit(k)
 	}
 	return out
 }
 
+// canonicalDefaultOrder lists the highest-hit-rate cross-vendor BMC defaults, in
+// priority order, used to front-load DocumentedDefaults so a capped consumer
+// still tries the most common credentials first. Pairs not present in Table for
+// the requested class are simply skipped.
 var canonicalDefaultOrder = [][2]string{
-	{"root", "calvin"},
-	{"root", "0penBmc"},
-	{"USERID", "PASSW0RD"},
-	{"ADMIN", "ADMIN"},
-	{"Administrator", "Administrator"},
-	{"admin", "admin"},
-	{"sysadmin", "superuser"},
-	{"root", "root"},
+	{"root", "calvin"},                 // Dell iDRAC
+	{"root", "0penBmc"},                // OpenBMC / NVIDIA BlueField
+	{"USERID", "PASSW0RD"},             // IBM/Lenovo IMM/XCC
+	{"ADMIN", "ADMIN"},                 // Supermicro / AMI MegaRAC
+	{"Administrator", "Administrator"}, // ancient iLO2 only (modern iLO = per-unit random pw, no universal default)
+	{"admin", "admin"},                 // HPE / Fujitsu / generic
+	{"sysadmin", "superuser"},          // Fujitsu / AMI MegaRAC
+	{"root", "root"},                   // generic
 }
 
+// AllCommon returns the vendor-agnostic cartesian spray (Usernames x Passwords)
+// as generic credentials, used when the vendor is unknown or after vendor
+// pairs miss.
 func AllCommon() []Credential {
 	us, ps := Usernames(), Passwords()
 	out := make([]Credential, 0, len(us)*len(ps))
@@ -234,6 +285,7 @@ func toSet(in []string) map[string]struct{} {
 	return s
 }
 
+// Vendors returns the sorted set of distinct vendor slugs present in Table.
 func Vendors() []string {
 	set := map[string]struct{}{}
 	for _, c := range Table {

@@ -1,3 +1,8 @@
+// Package slp implements just enough of SLPv2 (RFC 2608) to discover WBEM
+// and redfish-rest service URLs advertised by BMCs.
+//
+// Only the unicast Service Request + Service Reply flow is implemented.
+// Multicast is left to the caller (send the same packet to 239.255.255.253).
 package slp
 
 import (
@@ -15,34 +20,41 @@ const (
 	FuncSrvRply byte = 2
 )
 
+// Request builds a SrvRqst for the given service type string. Examples:
+//
+//	"service:wbem"
+//	"service:management-hardware.intel-dcim"
+//	"service:ldap"
+//	"service:service-agent"
 func Request(serviceType string) []byte {
 	if serviceType == "" {
 		serviceType = "service:service-agent"
 	}
 	var pdu bytes.Buffer
-
+	// <prev-respondant-list>
 	writeStr(&pdu, "")
-
+	// <service-type>
 	writeStr(&pdu, serviceType)
-
+	// <scope-list>
 	writeStr(&pdu, "DEFAULT")
-
+	// <predicate>
+	writeStr(&pdu, "")
+	// <slp-spi>
 	writeStr(&pdu, "")
 
-	writeStr(&pdu, "")
-
+	// Header: version(1)=2, function, length(3), flags(2), ext-offset(3), xid(2), lang-len(2), lang(en)
 	var hdr bytes.Buffer
 	hdr.WriteByte(2)
 	hdr.WriteByte(FuncSrvRqst)
-
-	hdr.Write([]byte{0, 0, 0})
-	hdr.Write([]byte{0, 0})
-	hdr.Write([]byte{0, 0, 0})
-	hdr.Write([]byte{0x12, 0x34})
+	// The 24-bit length is patched after assembly.
+	hdr.Write([]byte{0, 0, 0})    // length
+	hdr.Write([]byte{0, 0})       // flags
+	hdr.Write([]byte{0, 0, 0})    // ext offset
+	hdr.Write([]byte{0x12, 0x34}) // xid
 	hdr.Write([]byte{0, 2})
 	hdr.WriteString("en")
 	out := append(hdr.Bytes(), pdu.Bytes()...)
-
+	// Patch 24-bit length field at offset 2.
 	n := len(out)
 	out[2] = byte(n >> 16)
 	out[3] = byte(n >> 8)
@@ -50,6 +62,7 @@ func Request(serviceType string) []byte {
 	return out
 }
 
+// Reply lists the service URLs returned in a SrvRply.
 type Reply struct {
 	From    string
 	ErrCode uint16
@@ -57,6 +70,7 @@ type Reply struct {
 	Raw     []byte
 }
 
+// Probe performs a unicast SrvRqst to host:427.
 func Probe(host, serviceType string, timeout time.Duration) (*Reply, error) {
 	conn, err := net.DialTimeout("udp", fmt.Sprintf("%s:427", host), timeout)
 	if err != nil {
@@ -87,7 +101,7 @@ func parseSrvRply(pkt []byte) (*Reply, error) {
 	if pkt[1] != FuncSrvRply {
 		return nil, fmt.Errorf("not a SrvRply (func=%d)", pkt[1])
 	}
-
+	// skip header: we need to walk past lang-tag-len/lang-tag.
 	langLen := int(binary.BigEndian.Uint16(pkt[12:14]))
 	off := 14 + langLen
 	if off+4 > len(pkt) {
@@ -99,12 +113,12 @@ func parseSrvRply(pkt []byte) (*Reply, error) {
 	urlCount := int(binary.BigEndian.Uint16(pkt[off : off+2]))
 	off += 2
 	for range urlCount {
-
+		// URL entry: reserved(1) | lifetime(2) | url-len(2) | url | #authblocks(1)
 		if off+6 > len(pkt) {
 			return nil, errors.New("truncated SLP URL entry")
 		}
-		off++
-		off += 2
+		off++    // reserved
+		off += 2 // lifetime
 		ulen := int(binary.BigEndian.Uint16(pkt[off : off+2]))
 		off += 2
 		if off+ulen > len(pkt) {
@@ -131,6 +145,7 @@ func parseSrvRply(pkt []byte) (*Reply, error) {
 	return r, nil
 }
 
+// VendorFromURLs tries to guess the BMC vendor from a SrvRply URL list.
 func VendorFromURLs(urls []string) string {
 	for _, u := range urls {
 		low := strings.ToLower(u)

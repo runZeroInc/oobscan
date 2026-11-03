@@ -1,3 +1,9 @@
+// Package engine drives the concurrent scan: it expands targets, runs one
+// panic-isolated goroutine per host, and streams results to an Emitter. It owns
+// the domain types (Target, Identity, Finding) so that the identify and check
+// packages can depend on engine without an import cycle; the per-target
+// pipeline (identify -> checks -> optional IPMI walk) is supplied by the caller
+// as a RunFunc.
 package engine
 
 import (
@@ -13,6 +19,7 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/sanitize"
 )
 
+// Proto is a transport protocol for a probe port.
 type Proto string
 
 const (
@@ -20,13 +27,18 @@ const (
 	ProtoUDP Proto = "udp"
 )
 
+// Port is a candidate service port on a target.
 type Port struct {
 	Num   int   `json:"num"`
 	Proto Proto `json:"proto"`
 }
 
+// OpenPorts maps "port/transport" (e.g. "623/udp") to a comma-joined list of the
+// protocols observed on it (e.g. "ipmi"), so the record shows the real reachable
+// surface of a host instead of the static candidate list.
 type OpenPorts map[string]string
 
+// MarshalJSON keeps protocol lists in the discovered port map as sorted CSV.
 func (op OpenPorts) MarshalJSON() ([]byte, error) {
 	if len(op) == 0 {
 		return []byte("{}"), nil
@@ -38,24 +50,28 @@ func (op OpenPorts) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
+// Cred is a login credential offered to authenticated checks.
 type Cred struct {
 	User string `json:"user"`
 	Pass string `json:"pass"`
 }
 
+// DeviceClass is the coarse family of out-of-band device. New classes are added
+// here and mapped from pkg/oob categories in the identify package.
 type DeviceClass string
 
 const (
-	ClassUnknown       DeviceClass = "unknown"
-	ClassBMC           DeviceClass = "bmc"
-	ClassKVM           DeviceClass = "kvm"
-	ClassSerialConsole DeviceClass = "serial"
-	ClassPDU           DeviceClass = "pdu"
-	ClassAMT           DeviceClass = "amt"
-	ClassFirmware      DeviceClass = "firmware"
-	ClassHoneypot      DeviceClass = "honeypot"
+	ClassUnknown       DeviceClass = "unknown"  // reachable OOB-ish surface, unattributed
+	ClassBMC           DeviceClass = "bmc"      // server baseboard management (iDRAC/iLO/SMC/CIMC/OpenBMC)
+	ClassKVM           DeviceClass = "kvm"      // IP-KVM (Raritan/Avocent/PiKVM/Adder)
+	ClassSerialConsole DeviceClass = "serial"   // serial-over-IP / console server (Lantronix/Moxa/Digi/Opengear)
+	ClassPDU           DeviceClass = "pdu"      // networked power (APC/Raritan PX/Eaton)
+	ClassAMT           DeviceClass = "amt"      // Intel AMT / vPro
+	ClassFirmware      DeviceClass = "firmware" // UEFI/BIOS-side surface
+	ClassHoneypot      DeviceClass = "honeypot" // deception node emulating OOB surfaces; flagged and skipped
 )
 
+// Confidence grades how strongly the identify step attributed a device.
 type Confidence string
 
 const (
@@ -64,22 +80,27 @@ const (
 	ConfLow    Confidence = "low"
 )
 
+// Signal is one piece of evidence that contributed to an Identity.
 type Signal struct {
-	Source string `json:"source"`
+	Source string `json:"source"` // "ipmi.deviceId","guid","http.server","redfish","ilo","idrac","tls","lantronix","lantronix.telnet","moxa","digi.addp","digi.realport","wsman","snmp"
 	Vendor string `json:"vendor,omitempty"`
 	Detail string `json:"detail,omitempty"`
 }
 
+// Identity is the output of the identify step and the join key for selecting
+// device-specific checks.
 type Identity struct {
 	Class      DeviceClass       `json:"class"`
-	Vendor     string            `json:"vendor,omitempty"`
-	Product    string            `json:"product,omitempty"`
+	Vendor     string            `json:"vendor,omitempty"`  // lowercase slug (matches creds/oob vendor keys)
+	Product    string            `json:"product,omitempty"` // e.g. "iDRAC9","iLO5","ATEN IPMI","NPort"
 	Generation string            `json:"generation,omitempty"`
 	Confidence Confidence        `json:"confidence"`
 	Signals    []Signal          `json:"signals,omitempty"`
-	Attributes map[string]string `json:"attributes,omitempty"`
+	Attributes map[string]string `json:"attributes,omitempty"` // fw version, service tag, MAC, GUID family, IANA PEN
 }
 
+// MarshalJSON renders Identity with normalized camelCase attribute keys while
+// leaving the in-memory dotted keys intact for identify/check heuristics.
 func (id Identity) MarshalJSON() ([]byte, error) {
 	type identityJSON struct {
 		Class      DeviceClass       `json:"class"`
@@ -101,13 +122,28 @@ func (id Identity) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// Field is one structured key/value detail of a finding. Order is preserved so
+// text and JSON render the same data in the same order.
 type Field struct {
 	Key string
 	Val string
 }
 
+// Fields is an ordered set of finding details. It marshals to a JSON object
+// (preserving order) and renders as space-separated key=val pairs in text, so
+// the machine and human outputs carry identical data.
 type Fields []Field
 
+// canonicalKeyAliases folds synonym finding-field keys onto a single canonical key
+// so every check speaks one output vocabulary (applied to the NDJSON and the TTY
+// view via CanonicalFieldKey). Lookup is single-level: an entry must point at the
+// final canonical spelling, not an intermediate alias.
+//
+// Canonical concepts: proof (device-reported evidence marker), response (raw
+// response bytes; banner and sysdescr keep their own keys), username/password (the
+// credential; community stays distinct), source (credential provenance), loginVia
+// (the auth mechanism, distinct from source), status (HTTP status; the paired
+// status1/status2 stay distinct).
 var canonicalKeyAliases = map[string]string{
 	"firmware":             "firmwareVersion",
 	"firmware_revision":    "firmwareVersion",
@@ -179,10 +215,15 @@ var canonicalEvidenceAliases = map[string]string{
 	"snmpv3":                  "snmp.v3",
 }
 
+// canonicalCheckIDAliases maps a retired check id to its current spelling, so
+// older scan/convert output keeps matching the same check across a rename.
 var canonicalCheckIDAliases = map[string]string{
 	"ssh.hpe.iloRdpktOverflow": "ssh.hpe.iloSSHOverflow",
 }
 
+// CanonicalFieldKey returns the emitted JSON spelling for dynamic finding keys
+// and identity/flag map keys. It converts dotted/snake names to lower camelCase
+// and applies a few semantic aliases so equivalent concepts use one key.
 func CanonicalFieldKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -194,6 +235,8 @@ func CanonicalFieldKey(key string) string {
 	return lowerCamelKey(key)
 }
 
+// CanonicalFieldValue normalizes emitted values for known multi-value string
+// fields to sorted CSV.
 func CanonicalFieldValue(key, val string) string {
 	val = string(sanitize.Bytes([]byte(val)))
 	key = CanonicalFieldKey(key)
@@ -203,6 +246,9 @@ func CanonicalFieldValue(key, val string) string {
 	return val
 }
 
+// CanonicalEvidenceKey returns the in-memory evidence handle spelling used by
+// probes and checks. Evidence handles keep dotted namespaces, but each segment
+// is normalized to lower camelCase.
 func CanonicalEvidenceKey(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -218,6 +264,10 @@ func CanonicalEvidenceKey(key string) string {
 	return strings.Join(parts, ".")
 }
 
+// CanonicalCheckID returns the canonical in-memory finding/check identifier.
+// Check IDs keep dotted namespaces, while each non-version segment is
+// normalized to lower camelCase so legacy snake_case or dashed spellings map to
+// one internal form.
 func CanonicalCheckID(id string) string {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -244,10 +294,12 @@ func CanonicalCheckID(id string) string {
 	return strings.Join(parts, ".")
 }
 
+// SortedCSV renders values as a deterministic comma-separated string.
 func SortedCSV(values []string) string {
 	return sortedCSVValues(values)
 }
 
+// SortedCSVString normalizes an existing comma-separated string.
 func SortedCSVString(value string) string {
 	return sortedCSVValues(splitCSV(value))
 }
@@ -409,6 +461,8 @@ func mergeFieldValues(key, oldVal, newVal string) string {
 	return newVal
 }
 
+// F builds Fields from alternating key, value arguments. Empty values are
+// dropped so optional details don't clutter the output.
 func F(kv ...string) Fields {
 	var out Fields
 	for i := 0; i+1 < len(kv); i += 2 {
@@ -425,6 +479,7 @@ func F(kv ...string) Fields {
 	return out
 }
 
+// MarshalJSON renders Fields as an ordered JSON object.
 func (fs Fields) MarshalJSON() ([]byte, error) {
 	fs = normalizeFields(fs)
 	var b bytes.Buffer
@@ -443,6 +498,8 @@ func (fs Fields) MarshalJSON() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
+// UnmarshalJSON reads a JSON object back into ordered Fields (order preserved
+// via the token stream), so NDJSON records round-trip through consumers.
 func (fs *Fields) UnmarshalJSON(b []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	tok, err := dec.Token()
@@ -469,13 +526,15 @@ func (fs *Fields) UnmarshalJSON(b []byte) error {
 		}
 		out = append(out, Field{Key: CanonicalFieldKey(key), Val: CanonicalFieldValue(key, val)})
 	}
-	if _, err := dec.Token(); err != nil {
+	if _, err := dec.Token(); err != nil { // closing '}'
 		return err
 	}
 	*fs = out
 	return nil
 }
 
+// String renders Fields as space-separated key=val pairs for text output. A
+// value containing spaces is quoted.
 func (fs Fields) String() string {
 	fs = normalizeFields(fs)
 	parts := make([]string, 0, len(fs))
@@ -489,20 +548,28 @@ func (fs Fields) String() string {
 	return strings.Join(parts, " ")
 }
 
+// Finding is one result emitted by a check. Risk is the single signal (there is
+// no separate status field): critical/high/medium/low/info for actionable-to-
+// informational results, and "none" for a check that ran clean (e.g. a closed
+// port), which the interactive view hides. Address/Port/Transport/Protocol pin
+// down where the result was observed; all other specifics live in Fields, so the
+// text and NDJSON outputs carry identical data.
 type Finding struct {
-	Check     string   `json:"check"`
+	Check     string   `json:"check"` // short stable id, e.g. "ipmi.v20.rakpHash"
 	TS        int64    `json:"timestamp,omitempty"`
 	Category  string   `json:"category,omitempty"`
-	Risk      string   `json:"risk"`
+	Risk      string   `json:"risk"` // critical/high/medium/low/info/none
 	Address   string   `json:"address,omitempty"`
 	Port      int      `json:"port,omitempty"`
-	Transport string   `json:"transport,omitempty"`
-	Protocol  string   `json:"protocol,omitempty"`
+	Transport string   `json:"transport,omitempty"` // tcp/udp
+	Protocol  string   `json:"protocol,omitempty"`  // ipmi/redfish/vnc/ssh/https/...
 	Fields    Fields   `json:"fields,omitempty"`
 	CVE       []string `json:"cves,omitempty"`
 	Duration  float64  `json:"durationSeconds,omitempty"`
 }
 
+// MarshalJSON keeps Finding.CVE as a convenient slice in Go while emitting CVEs
+// as a sorted CSV string in JSON.
 func (f Finding) MarshalJSON() ([]byte, error) {
 	type findingJSON struct {
 		Check           string  `json:"check"`
@@ -532,6 +599,7 @@ func (f Finding) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// UnmarshalJSON accepts both the current CSV cves form and the older array form.
 func (f *Finding) UnmarshalJSON(b []byte) error {
 	var raw struct {
 		Check           string          `json:"check"`
@@ -586,6 +654,7 @@ func cvesFromJSON(raw json.RawMessage) []string {
 	return nil
 }
 
+// RiskRank orders risk from most to least severe for sorting and thresholds.
 func RiskRank(risk string) int {
 	switch risk {
 	case "critical":
@@ -598,36 +667,47 @@ func RiskRank(risk string) int {
 		return 2
 	case "info":
 		return 1
-	default:
+	default: // "none"/unset
 		return 0
 	}
 }
 
+// Target is one host under scan. The pipeline owns scalar fields, while checks
+// may run concurrently and must use the synchronized evidence, finding, and
+// open-port methods. Identity is immutable once the check phase begins.
 type Target struct {
-	Host               string        `json:"host"`
-	Ports              []Port        `json:"-"`
-	WebPort            int           `json:"-"`
-	Open               OpenPorts     `json:"-"`
-	Timeout            time.Duration `json:"-"`
-	Cred               Cred          `json:"-"`
-	Creds              []Cred        `json:"-"`
-	Destructive        bool          `json:"-"`
-	IPMIFull           bool          `json:"-"`
-	IPMINullPriv       bool          `json:"-"`
-	DisableLogins      bool          `json:"-"`
-	SNMPV3LocalizedKey string        `json:"-"`
-	Progress           func(string)  `json:"-"`
-	DebugLog           func(string)  `json:"-"`
+	Host                     string        `json:"host"`
+	Ports                    []Port        `json:"-"` // candidate probe ports (from --ports); not serialized
+	WebPort                  int           `json:"-"` // explicit web port hint from a host:port arg (or --web-port); 0 = none
+	Open                     OpenPorts     `json:"-"` // discovered open ports -> protocols; serialized by the output layer
+	Timeout                  time.Duration `json:"-"` // per-probe I/O timeout
+	Cred                     Cred          `json:"-"`
+	Creds                    []Cred        `json:"-"`
+	Destructive              bool          `json:"-"`
+	IPMIFull                 bool          `json:"-"` // run the full IPMI NetFn/IPMB walk
+	IPMINullPriv             bool          `json:"-"` // open a session as the advertised null/anonymous IPMI account to measure the privilege it actually holds
+	OpenBMCDefaultUserKey    bool          `json:"-"` // run the slow/aggressive OpenBMC default-userKey heap-grooming auth-bypass check
+	OpenBMCUserKeyBMCRand    string        `json:"-"` // optional operator-supplied stale bmcRandomNum (hex) to try first in the OpenBMC default-userKey check
+	OpenBMCUserKeyHeapStart  string        `json:"-"` // optional hex start of the OpenBMC default-userKey heap-pointer sweep range (empty = default)
+	OpenBMCUserKeyHeapEnd    string        `json:"-"` // optional hex end of the OpenBMC default-userKey heap-pointer sweep range (empty = default)
+	OpenBMCUserKeyPageOffset string        `json:"-"` // optional in-page offset(s) (hex, comma-separated) to restrict the blind heap sweep to; empty = step all offsets
+	OpenBMCUserKeySkipFast   bool          `json:"-"` // skip the constant-string/zero residue rounds; isolates the heap-pointer sweep for validation
+	DisableLogins            bool          `json:"-"` // disable active online login attempts (default false)
+	SNMPV3LocalizedKey       string        `json:"-"` // operator-supplied raw localized USM key: "user:authHex[:privHex]" (SHA-256/AES assumed)
+	Progress                 func(string)  `json:"-"` // live progress sink set by the scan pipeline
+	DebugLog                 func(string)  `json:"-"` // debug/progress sink set by the scan pipeline
 
 	Identity *Identity      `json:"identity,omitempty"`
-	Evidence map[string]any `json:"-"`
+	Evidence map[string]any `json:"-"` // raw probe results keyed by source, reused by checks
 	Findings []Finding      `json:"findings,omitempty"`
-	Final    *Final         `json:"-"`
+	Final    *Final         `json:"-"` // post-check aggregate identity (id.final); serialized by the output layer
 	Err      string         `json:"error,omitempty"`
 
 	mu sync.Mutex
 }
 
+// IPMIPort returns the configured UDP/623 port for this target, defaulting to
+// 623 when no UDP port is listed.
 func (t *Target) IPMIPort() int {
 	for _, p := range t.Ports {
 		if p.Proto == ProtoUDP && (p.Num == 623 || p.Num == 664) {
@@ -642,6 +722,8 @@ func (t *Target) IPMIPort() int {
 	return 623
 }
 
+// MarkOpen records that a port/transport was found open, optionally tagging the
+// protocol observed on it. Safe for concurrent use.
 func (t *Target) MarkOpen(port int, transport, protocol string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -658,7 +740,7 @@ func (t *Target) MarkOpen(port int, transport, protocol string) {
 	}
 	for _, p := range strings.Split(cur, ",") {
 		if p == protocol {
-			return
+			return // already recorded
 		}
 	}
 	if cur == "" {
@@ -668,6 +750,9 @@ func (t *Target) MarkOpen(port int, transport, protocol string) {
 	}
 }
 
+// IsOpen reports whether a port/transport was recorded open by an earlier
+// probe. Used by identify's honeypot detector to test for a specific
+// responding-port signature.
 func (t *Target) IsOpen(port int, transport string) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -678,12 +763,15 @@ func (t *Target) IsOpen(port int, transport string) bool {
 	return ok
 }
 
+// OpenLen returns the number of discovered open port entries.
 func (t *Target) OpenLen() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return len(t.Open)
 }
 
+// OpenSnapshot returns a shallow copy of the discovered open port map.
+// Callers may iterate the returned map without holding t.mu.
 func (t *Target) OpenSnapshot() OpenPorts {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -697,6 +785,7 @@ func (t *Target) OpenSnapshot() OpenPorts {
 	return out
 }
 
+// SetEvidence stores a raw probe result for later reuse by checks.
 func (t *Target) SetEvidence(key string, val any) {
 	key = CanonicalEvidenceKey(key)
 	if key == "" {
@@ -710,6 +799,10 @@ func (t *Target) SetEvidence(key string, val any) {
 	t.Evidence[key] = val
 }
 
+// SetEvidenceIfAbsent stores val under key only when key is not already
+// present. It returns true when the value was inserted, false when an existing
+// value was kept. This makes cross-check "emit once" guards race-safe when
+// checks run concurrently.
 func (t *Target) SetEvidenceIfAbsent(key string, val any) bool {
 	key = CanonicalEvidenceKey(key)
 	if key == "" {
@@ -727,6 +820,7 @@ func (t *Target) SetEvidenceIfAbsent(key string, val any) bool {
 	return true
 }
 
+// Evidenced returns a stored probe result.
 func (t *Target) Evidenced(key string) (any, bool) {
 	key = CanonicalEvidenceKey(key)
 	if key == "" {
@@ -738,6 +832,8 @@ func (t *Target) Evidenced(key string) (any, bool) {
 	return v, ok
 }
 
+// AddFindings appends findings from a check, stamping each with the target
+// address (where observed) when the check did not set one.
 func (t *Target) AddFindings(fs ...Finding) {
 	if len(fs) == 0 {
 		return
@@ -756,12 +852,17 @@ func (t *Target) AddFindings(fs ...Finding) {
 	t.Findings = append(t.Findings, fs...)
 }
 
+// FindingsSnapshot returns a copy safe for concurrent iteration.
 func (t *Target) FindingsSnapshot() []Finding {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return append([]Finding(nil), t.Findings...)
 }
 
+// ReplaceFindings swaps every finding whose check matches id for the given
+// replacements, leaving all other findings (and all evidence) intact. Used by the
+// late honeypot reclassification to refresh the `id` finding with the honeypot
+// verdict without discarding the rest of the record.
 func (t *Target) ReplaceFindings(id string, replacement ...Finding) {
 	id = CanonicalCheckID(id)
 	t.mu.Lock()
@@ -785,12 +886,15 @@ func (t *Target) ReplaceFindings(id string, replacement ...Finding) {
 	t.Findings = kept
 }
 
+// Emitter is the sink for scan output. engine calls Start when a target begins
+// and Emit once it finishes; the concrete implementations (JSON / lipgloss TTY)
+// live in pkg/output. Implementations must be safe for concurrent use.
 type Emitter interface {
-	Start(host string)
-	Activity(host, what string)
+	Start(host string)          // a target began processing
+	Activity(host, what string) // the target's current phase (identify / check name), for the live view
 	Checks(host string, done, total int)
-	Emit(t *Target)
-	Log(msg string)
+	Emit(t *Target) // a target finished; render/serialize its result
+	Log(msg string) // diagnostic line (--verbose); never touches stdout NDJSON
 	Status(done, total uint64, force bool)
-	Close() error
+	Close() error // finalize (repaint final bar / flush writer)
 }

@@ -1,3 +1,8 @@
+// Package ssh consumes sshamble scan output (JSONL) and emits OOB/BMC
+// fingerprints. It is input-only: oobscan never re-implements SSH auth --
+// sshamble already does it better. This module turns sshamble's per-host
+// records into entries in the oobscan pipeline, keyed off the vendor slugs
+// from pkg/oob.
 package ssh
 
 import (
@@ -8,6 +13,8 @@ import (
 	"strings"
 )
 
+// SshambleRecord is a subset of sshamble's JSON schema (only the fields we
+// need). sshamble emits one record per host; we parse only what we consume.
 type SshambleRecord struct {
 	Host        string   `json:"host"`
 	Port        int      `json:"port"`
@@ -23,6 +30,7 @@ type SshambleRecord struct {
 	} `json:"checks"`
 }
 
+// BMCHit is an enriched record ready for oobscan's JSONL stream.
 type BMCHit struct {
 	Host        string
 	Port        int
@@ -33,10 +41,12 @@ type BMCHit struct {
 	AuthMethods []string
 	HostKeys    []string
 	Evidence    []string
-
+	// Risk tags derived from the banner (e.g. "ipmi-sol", "legacy-cipher").
 	Tags []string
 }
 
+// ImportFile reads a sshamble JSONL file and returns only records that look
+// like BMCs / OOB appliances.
 func ImportFile(path string) ([]BMCHit, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -46,6 +56,7 @@ func ImportFile(path string) ([]BMCHit, error) {
 	return ImportReader(f)
 }
 
+// ImportReader parses sshamble JSONL from any io.Reader.
 func ImportReader(r io.Reader) ([]BMCHit, error) {
 	var out []BMCHit
 	sc := bufio.NewScanner(r)
@@ -67,6 +78,8 @@ func ImportReader(r io.Reader) ([]BMCHit, error) {
 	return out, sc.Err()
 }
 
+// classify looks at banner / server version and assigns a vendor/product.
+// The mapping table is deliberately conservative: only strong matches.
 func classify(r SshambleRecord) (BMCHit, bool) {
 	banner := strings.ToLower(r.Banner + " " + r.ServerVer)
 	h := BMCHit{
@@ -115,6 +128,7 @@ func classify(r SshambleRecord) (BMCHit, bool) {
 		return h, false
 	}
 
+	// Heuristic risk tags.
 	if strings.Contains(banner, "dropbear") && strings.Contains(banner, "0.") {
 		h.Tags = append(h.Tags, "legacy-dropbear")
 	}

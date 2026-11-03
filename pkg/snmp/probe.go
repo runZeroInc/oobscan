@@ -1,3 +1,8 @@
+// Package snmp fingerprints OOB devices over SNMP v1, v2c, and v3: a GET of the
+// four system-group OIDs with a community string for v1/v2c, and for v3 USM
+// engine-ID discovery (an unauthenticated request elicits a Report PDU disclosing
+// the authoritative engine ID) plus optional testing of known default credentials.
+// USM crypto is delegated to github.com/gosnmp/gosnmp rather than re-derived.
 package snmp
 
 import (
@@ -9,8 +14,11 @@ import (
 	"github.com/gosnmp/gosnmp"
 )
 
+// probeRetries is the number of retransmits per SNMP GET. gosnmp counts this on
+// top of the first send, so 1 means two datagrams and at most two timeouts.
 const probeRetries = 1
 
+// System-group OIDs (string form for gosnmp).
 const (
 	oidSysDescr    = "1.3.6.1.2.1.1.1.0"
 	oidSysObjectID = "1.3.6.1.2.1.1.2.0"
@@ -19,6 +27,8 @@ const (
 	oidSysLocation = "1.3.6.1.2.1.1.6.0"
 )
 
+// VendorByEnterpriseID maps an IANA enterprise number (the arc after
+// 1.3.6.1.4.1.) in sysObjectID to a vendor slug.
 var VendorByEnterpriseID = map[uint32]string{
 	9:     "cisco",
 	232:   "hpe",
@@ -34,7 +44,7 @@ var VendorByEnterpriseID = map[uint32]string{
 	20301: "avocent",
 	21317: "raritan",
 	41112: "ubiquiti",
-
+	// --- KB gap additions ---
 	332:   "digi",
 	8691:  "moxa",
 	2011:  "huawei",
@@ -45,27 +55,33 @@ var VendorByEnterpriseID = map[uint32]string{
 	343:   "intel",
 }
 
+// Result captures what a probe produced.
 type Result struct {
 	Host         string
 	Port         int
 	Community    string
-	Version      int
+	Version      int // 0=v1, 1=v2c, 3=v3
 	SysDescr     string
 	SysObjectID  string
 	SysName      string
 	SysLocation  string
 	EnterpriseID uint32
 	VendorGuess  string
-
+	// Responded records that the agent answered this community at all, which is
+	// the only sound test of whether the community is accepted: a v1/v2c agent
+	// stays silent on a wrong one. Some agents restrict individual system-group
+	// objects, so an empty SysDescr says nothing about whether we are in.
 	Responded bool
-
+	// v3
 	V3Supported bool
-	EngineID    string
+	EngineID    string // hex authoritative engine ID (USM)
 	EngineBoots uint32
-	V3User      string
-	V3Level     string
+	V3User      string // set when a v3 credential authenticated
+	V3Level     string // "noAuthNoPriv" | "authNoPriv" | "authPriv"
 }
 
+// Probe sends GET(sysDescr, sysObjectID, sysName, sysLocation) over v1 or v2c.
+// version: 0=v1, 1=v2c. community defaults to "public".
 func Probe(host string, port int, community string, version int, timeout time.Duration) (*Result, error) {
 	if port == 0 {
 		port = 161
@@ -86,7 +102,9 @@ func Probe(host string, port int, community string, version int, timeout time.Du
 		Community: community,
 		Version:   ver,
 		Timeout:   timeout,
-
+		// One retransmit. This is a single UDP datagram to a host that may be
+		// several thousand miles away, and a dropped reply is indistinguishable
+		// from a refused community, so no retry turns loss into a false negative.
 		Retries: probeRetries,
 		MaxOids: 4,
 	}
@@ -105,7 +123,9 @@ func Probe(host string, port int, community string, version int, timeout time.Du
 		r.Responded = true
 		assignSystemGroup(r, resp.Variables)
 	} else {
-
+		// Under v1 the error status applies to the whole PDU, so one object the
+		// agent does not implement (sysLocation on plenty of BMCs) discards the
+		// three that it does. Ask again one OID at a time.
 		for _, oid := range oids {
 			one, err := g.Get([]string{oid})
 			if err != nil {
@@ -121,10 +141,15 @@ func Probe(host string, port int, community string, version int, timeout time.Du
 	return r, nil
 }
 
+// WriteVerification records a successful idempotent SET of a system-group
+// object back to the exact value and ASN.1 type returned by the preceding GET.
 type WriteVerification struct {
 	OID string
 }
 
+// VerifyWrite tests whether a v1/v2c community can write. It reads
+// sysContact and sysLocation, then SETs one writable OctetString to its current
+// value. The value is preserved, but firmware may still log or apply the write.
 func VerifyWrite(host string, port int, community string, version int, timeout time.Duration) (*WriteVerification, error) {
 	if port == 0 {
 		port = 161
@@ -148,6 +173,10 @@ func VerifyWrite(host string, port int, community string, version int, timeout t
 	return verifySystemWrite(g)
 }
 
+// VerifyWriteV3 is VerifyWrite for an authenticated SNMPv3 USM credential: it
+// GETs sysContact/sysLocation and SETs one writable OctetString back to the
+// exact value the agent returned. No configuration value is changed. The
+// credential shape (passphrase-derived or raw localized key) mirrors TryV3.
 func VerifyWriteV3(host string, port int, c V3Cred, timeout time.Duration) (*WriteVerification, error) {
 	if port == 0 {
 		port = 161
@@ -163,6 +192,8 @@ func VerifyWriteV3(host string, port int, c V3Cred, timeout time.Duration) (*Wri
 	return verifySystemWrite(g)
 }
 
+// verifySystemWrite performs the idempotent same-value SET write confirmation
+// on a connected client (any SNMP version).
 func verifySystemWrite(g *gosnmp.GoSNMP) (*WriteVerification, error) {
 	resp, err := g.Get([]string{oidSysContact, oidSysLocation})
 	if err != nil {
@@ -198,6 +229,10 @@ func writableSystemPDU(resp *gosnmp.SnmpPacket) (gosnmp.SnmpPDU, bool) {
 	return gosnmp.SnmpPDU{}, false
 }
 
+// ProbeV3 performs USM engine discovery: an unauthenticated (noAuthNoPriv)
+// request makes a v3 agent return its authoritative engine ID, which both
+// confirms SNMPv3 is enabled and discloses the engine ID / boot counter without
+// any credential. Returns nil if the host does not speak v3.
 func ProbeV3(host string, port int, timeout time.Duration) (*Result, error) {
 	if port == 0 {
 		port = 161
@@ -215,7 +250,9 @@ func ProbeV3(host string, port int, timeout time.Duration) (*Result, error) {
 		SecurityModel: gosnmp.UserSecurityModel,
 		MsgFlags:      gosnmp.NoAuthNoPriv | gosnmp.Reportable,
 		SecurityParameters: &gosnmp.UsmSecurityParameters{
-
+			// gosnmp requires a non-empty username; the agent still returns its
+			// authoritative engine ID in the usmStats discovery report regardless of
+			// which (unknown) user we name.
 			UserName:               "oobscan",
 			AuthenticationProtocol: gosnmp.NoAuth,
 			PrivacyProtocol:        gosnmp.NoPriv,
@@ -226,6 +263,9 @@ func ProbeV3(host string, port int, timeout time.Duration) (*Result, error) {
 	}
 	defer g.Conn.Close()
 
+	// The first request drives engine discovery; the data GET usually returns a
+	// usmStats Report (which surfaces as an error), but the engine ID is captured
+	// on the security parameters regardless - that is the signal we want.
 	_, _ = g.Get([]string{oidSysDescr})
 	usm, ok := g.SecurityParameters.(*gosnmp.UsmSecurityParameters)
 	if !ok || usm.AuthoritativeEngineID == "" {
@@ -238,25 +278,41 @@ func ProbeV3(host string, port int, timeout time.Duration) (*Result, error) {
 	}, nil
 }
 
+// V3Cred is a candidate SNMPv3 USM credential (a known factory default), in one of
+// two shapes:
+//   - Passphrase-derived: AuthPass/PrivPass hold the documented factory
+//     passphrases, which gosnmp localizes against the target's engine ID.
+//   - Raw localized key: AuthKeyHex/PrivKeyHex hold a pre-localized USM key used
+//     directly as the HMAC/cipher key, bypassing passphrase localization. This is
+//     the only way to exercise a vendor that ships a raw localized key. When a key
+//     is supplied, AuthProto/PrivProto still select the algorithm.
 type V3Cred struct {
-	Name       string
-	Vendor     string
+	Name       string // label for reporting, e.g. "apc-nmc"
+	Vendor     string // identify vendor slug; empty means cross-vendor
 	User       string
-	AuthProto  string
+	AuthProto  string // "SHA" | "SHA256" | "MD5" | "" (noAuth)
 	AuthPass   string
-	PrivProto  string
+	PrivProto  string // "AES" | "AES256" | "DES" | "" (noPriv)
 	PrivPass   string
-	AuthKeyHex string
-	PrivKeyHex string
+	AuthKeyHex string // raw localized auth key (hex); when set, used directly instead of localizing AuthPass
+	PrivKeyHex string // raw localized priv key (hex); when set, used directly instead of localizing PrivPass
 }
 
+// hasRawKey reports whether this credential carries a pre-localized key that
+// must be used directly rather than derived from a passphrase.
 func (c V3Cred) hasRawKey() bool { return c.AuthKeyHex != "" || c.PrivKeyHex != "" }
 
+// TryV3 attempts an authenticated (authNoPriv / authPriv) SNMPv3 GET with a
+// candidate credential. A successful GET of sysDescr proves the credential is
+// valid (the USM auth/priv keys localized against the engine and the agent
+// accepted them). Returns the populated Result on success.
 func TryV3(host string, port int, c V3Cred, timeout time.Duration) (*Result, bool) {
 	if result, ok := tryV3Level(host, port, c, timeout); ok {
 		return result, true
 	}
-
+	// Some agents provision the documented auth and privacy phrases but default
+	// the user to authNoPriv. Retry the same authenticated identity without
+	// privacy rather than treating that posture as an invalid credential.
 	if c.AuthProto != "" && c.PrivProto != "" {
 		c.PrivProto, c.PrivPass, c.PrivKeyHex = "", "", ""
 		return tryV3Level(host, port, c, timeout)
@@ -274,7 +330,8 @@ func tryV3Level(host string, port int, c V3Cred, timeout time.Duration) (*Result
 	if err != nil || resp == nil || len(resp.Variables) == 0 {
 		return nil, false
 	}
-
+	// A usmStats report comes back as a variable under 1.3.6.1.6.3.15 (auth
+	// failure); a real sysDescr means the credential authenticated.
 	v := resp.Variables[0]
 	if strings.HasPrefix(strings.TrimPrefix(v.Name, "."), "1.3.6.1.6.3.15") {
 		return nil, false
@@ -288,11 +345,16 @@ func tryV3Level(host string, port int, c V3Cred, timeout time.Duration) (*Result
 	return r, true
 }
 
+// v3LevelName is the human label for the credential's USM security level.
 func v3LevelName(c V3Cred) string {
 	_, level := v3SecurityLevel(c)
 	return level
 }
 
+// v3Client dials a connected SNMPv3 USM client for the credential (used by both
+// the authenticated read and the write confirmation). maxOids bounds each
+// request. An error is returned for a bad port, malformed raw key hex, or a
+// failed connect.
 func v3Client(host string, port int, c V3Cred, timeout time.Duration, maxOids int) (*gosnmp.GoSNMP, error) {
 	if port == 0 {
 		port = 161
@@ -307,7 +369,9 @@ func v3Client(host string, port int, c V3Cred, timeout time.Duration, maxOids in
 		PrivacyProtocol:          privProto(c.PrivProto),
 		PrivacyPassphrase:        c.PrivPass,
 	}
-
+	// Raw localized keys: setting SecretKey/PrivacyKey makes gosnmp use them
+	// directly as the HMAC/cipher key and skip passphrase key-localization. Bad
+	// hex is an error rather than a scan-aborting panic.
 	if c.AuthKeyHex != "" {
 		key, err := hex.DecodeString(c.AuthKeyHex)
 		if err != nil || len(key) == 0 {
@@ -351,6 +415,8 @@ func v3SecurityLevel(cred V3Cred) (gosnmp.SnmpV3MsgFlags, string) {
 	}
 }
 
+// DefaultV3Creds are documented factory SNMPv3 USM credentials for OOB gear
+// (APC/Schneider NMC, Server Technology PDUs) - the ones the vulndb references.
 var DefaultV3Creds = []V3Cred{
 	{Name: "apc-nmc", Vendor: "apc", User: "APC ASI User", AuthProto: "SHA", AuthPass: "APC ASI auth phrase", PrivProto: "AES", PrivPass: "APC ASI crypt phrase"},
 	{Name: "apc-nmc-md5", Vendor: "apc", User: "APC ASI User", AuthProto: "MD5", AuthPass: "APC ASI auth phrase", PrivProto: "DES", PrivPass: "APC ASI crypt phrase"},
@@ -358,12 +424,21 @@ var DefaultV3Creds = []V3Cred{
 	{Name: "servertech-swcdu", Vendor: "servertech", User: "admn", AuthProto: "SHA", AuthPass: "initial2", PrivProto: "AES", PrivPass: "initial2"},
 	{Name: "eaton-pxg", Vendor: "eaton", User: "admin", AuthProto: "SHA", AuthPass: "adminpass", PrivProto: "AES", PrivPass: "adminpass"},
 	{Name: "eaton-pxg-md5", Vendor: "eaton", User: "admin", AuthProto: "MD5", AuthPass: "adminpass", PrivProto: "DES", PrivPass: "adminpass"},
-
+	// --- KB gap additions ---
 	{Name: "lantronix-snmp", Vendor: "lantronix", User: "snmpuser", AuthProto: "MD5", AuthPass: "SNMPPASS", PrivProto: "DES", PrivPass: "SNMPPASS"},
 	{Name: "lantronix-snmp-rw", Vendor: "lantronix", User: "snmprwuser", AuthProto: "MD5", AuthPass: "SNMPPASS", PrivProto: "DES", PrivPass: "SNMPPASS"},
-	{Name: "redlion-guest", Vendor: "redlion", User: "guest", AuthProto: "", AuthPass: "", PrivProto: "", PrivPass: ""},
+	{Name: "redlion-guest", Vendor: "redlion", User: "guest", AuthProto: "", AuthPass: "", PrivProto: "", PrivPass: ""}, // rwuser guest noauth (noAuthNoPriv)
 }
 
+// LocalizedV3Creds are factory SNMPv3 USM credentials shipped as a raw localized
+// key (hex) rather than a passphrase, so DefaultV3Creds cannot model them. They are
+// tried on any v3-responsive host via DefaultV3CredsWithLocalized, regardless of
+// vendor.
+//
+// The Huawei openUBMC entries reuse one shared 32-byte SHA-256-localized key for
+// both auth and privacy; AES-128 privacy takes its leading 16 bytes. Because the
+// shipped key is already localized against the shared authoritative engine, it is
+// applied directly with no passphrase derivation.
 var LocalizedV3Creds = []V3Cred{
 	{Name: "huawei-usm-customization", Vendor: "huawei", User: "Administrator", AuthProto: "SHA256", PrivProto: "AES",
 		AuthKeyHex: "7df2f29369e3ac3245b2c9d46b67a0ecd055197e41808a34ef325db2f6422581",
@@ -373,10 +448,17 @@ var LocalizedV3Creds = []V3Cred{
 		PrivKeyHex: "7a2f5b86f20233ec7b7bef49643fbf34d86d0cbf6f1f8f5c52d4f30d4536938b"},
 }
 
+// DefaultV3CredsFor returns only the passphrase profiles relevant to a known
+// vendor. An unknown vendor keeps the full list so SNMP itself can still
+// identify devices that had no useful HTTP/IPMI fingerprint.
 func DefaultV3CredsFor(vendor string) []V3Cred {
 	return defaultV3CredsFor(vendor, false)
 }
 
+// DefaultV3CredsWithLocalized is DefaultV3CredsFor plus the raw-localized-key
+// credentials (Huawei et al.). The localized creds are appended in full
+// regardless of vendor -- they are tried broadly on any v3-responsive host, so
+// no vendor fingerprint match is required to reach them.
 func DefaultV3CredsWithLocalized(vendor string) []V3Cred {
 	return defaultV3CredsFor(vendor, true)
 }
@@ -396,26 +478,38 @@ func defaultV3CredsFor(vendor string, includeLocalized bool) []V3Cred {
 	}
 	creds := pick(DefaultV3Creds)
 	if includeLocalized {
-
+		// Localized creds are tried broadly (not vendor-filtered) so any
+		// v3-responsive host gets them regardless of its identify vendor.
 		creds = append(creds, LocalizedV3Creds...)
 	}
 	return creds
 }
 
+// DefaultCommunity is a documented factory SNMP v1/v2c community string beyond
+// the generic public/private the snmp check always tries. Access is "ro" or
+// "rw" (the documented capability; callers still confirm writes with an
+// idempotent SET before reporting read-write access).
 type DefaultCommunity struct {
 	Vendor    string
 	Community string
-	Access    string
+	Access    string // "ro" | "rw"
 	Note      string
 }
 
+// DefaultCommunities are shipped/fleet-shared communities that are not the
+// generic public/private, keyed by the identify vendor slug so the check only
+// tries a vendor's own strings. A Vendor of "*" is tried on every SNMP-confirmed
+// host (for firmware-level defaults like AMI MegaRAC that ship across many OEM
+// boards, so no single identify vendor covers them).
 var DefaultCommunities = []DefaultCommunity{
 	{Vendor: "intel", Community: "intel.public", Access: "ro", Note: "M50CYP BMC 2.94 shipped default, SNMP on by default"},
 	{Vendor: "intel", Community: "intel.private", Access: "rw", Note: "M50CYP BMC 2.94 shipped default RW -> full-tree write"},
 	{Vendor: "tripplite", Community: "tripplite", Access: "rw", Note: "PowerAlert/SNMPWEBCARD loadDefaults community (RW suspected)"},
 	{Vendor: "redlion", Community: "MYCOMMUNITY", Access: "rw", Note: "Sixnet SixTRAK/VersaTRAK factory rwcommunity"},
 	{Vendor: "advantech", Community: "private", Access: "rw", Note: "EKI shipped RW community, un-removable via UI"},
-
+	// Observed in oob post-auth scan data (2026-07). AMI MegaRAC ships an "AMI"
+	// RO community across ASUS/Tyan/Inspur/Celestica/Nedam/Supermicro boards, so
+	// it is tried on any SNMP host; the rest are vendor-name-as-community defaults.
 	{Vendor: "*", Community: "AMI", Access: "ro", Note: "AMI MegaRAC default RO community; 35 hosts across many OEM boards"},
 	{Vendor: "intel", Community: "INTEL", Access: "ro", Note: "bare Intel default community (distinct from intel.public)"},
 	{Vendor: "inspur", Community: "Inspur", Access: "ro", Note: "Inspur BMC vendor-name-as-community default"},
@@ -451,6 +545,7 @@ func privProto(s string) gosnmp.SnmpV3PrivProtocol {
 	}
 }
 
+// assignSystemGroup copies the system-group varbinds into the Result.
 func assignSystemGroup(r *Result, vars []gosnmp.SnmpPDU) {
 	for _, v := range vars {
 		name := strings.TrimPrefix(v.Name, ".")
@@ -467,6 +562,8 @@ func assignSystemGroup(r *Result, vars []gosnmp.SnmpPDU) {
 	}
 }
 
+// pduString renders an SNMP varbind value as a string (OctetString bytes or an
+// ObjectIdentifier), ignoring noSuchObject/noSuchInstance/null.
 func pduString(v gosnmp.SnmpPDU) string {
 	switch val := v.Value.(type) {
 	case string:
@@ -480,6 +577,8 @@ func pduString(v gosnmp.SnmpPDU) string {
 	}
 }
 
+// vendorFromOID extracts the IANA enterprise number from an enterprise
+// sysObjectID (under 1.3.6.1.4.1.) and maps it to a vendor slug.
 func vendorFromOID(oid string, outEnt *uint32) string {
 	const prefix = "1.3.6.1.4.1."
 	if !strings.HasPrefix(oid, prefix) {
@@ -502,6 +601,11 @@ func vendorFromOID(oid string, outEnt *uint32) string {
 	return VendorByEnterpriseID[ent]
 }
 
+// VendorBySysDescr returns a vendor slug when sysDescr (device-reported free
+// text) carries a distinctive product string. This is a stronger tell than the
+// bare enterprise arc (VendorByEnterpriseID), so callers can attribute it at a
+// higher confidence -- used for families whose sysObjectID arc is shared or
+// unregistered (e.g. Red Lion / Sixnet industrial RTUs). Returns "" on no match.
 func VendorBySysDescr(sysDescr string) string {
 	low := strings.ToLower(sysDescr)
 	switch {

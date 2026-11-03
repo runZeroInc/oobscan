@@ -10,28 +10,44 @@ import (
 	"time"
 )
 
+// RemoteXDPManagerPath is the default Redfish NetworkProtocol resource that
+// carries H3C's OEM RemoteXDP toggle. The OEM namespace vendor name is "Public".
 const RemoteXDPManagerPath = "/redfish/v1/Managers/1/NetworkProtocol/"
 
+// RemoteXDPResult reports the outcome of a SetRemoteXDP PATCH.
 type RemoteXDPResult struct {
 	Status int
 	Body   []byte
 	OK     bool
 }
 
+// RemoteXDPConfig is the settable subset of Oem.Public.Services.RemoteXDP. Only
+// non-nil fields are sent in the PATCH, so callers can change one setting
+// (e.g. just the TLS/secure port) without disturbing the rest.
 type RemoteXDPConfig struct {
-	CurrentState       *bool
-	NonsecurePortState *bool
-	NonsecurePort      *int
-	SecurePortState    *bool
-	SecurePort         *int
-	SessionTimeout     *int
+	CurrentState       *bool // master enable for the service
+	NonsecurePortState *bool // plaintext listener on/off
+	NonsecurePort      *int  // plaintext port (default 6868)
+	SecurePortState    *bool // TLS listener on/off
+	SecurePort         *int  // TLS port
+	SessionTimeout     *int  // idle session timeout (seconds)
 }
 
+// Empty reports whether the config would send no fields.
 func (c RemoteXDPConfig) Empty() bool {
 	return c.CurrentState == nil && c.NonsecurePortState == nil && c.NonsecurePort == nil &&
 		c.SecurePortState == nil && c.SecurePort == nil && c.SessionTimeout == nil
 }
 
+// SetRemoteXDP toggles/configures H3C's OEM RemoteXDP (At-Scale-Debug/JTAG)
+// service via a Redfish PATCH to the Manager NetworkProtocol resource. It mirrors
+// the cfgm keys under services.remote-xdp exposed as Oem.Public.Services.RemoteXDP.
+// managerPath may be empty to use RemoteXDPManagerPath. headers must carry an
+// authenticated principal (X-Auth-Token from OpenSession, or an
+// Authorization: Basic header).
+//
+// This is a state-changing request; callers must gate it behind the
+// authorized/online flag.
 func SetRemoteXDP(client *http.Client, base, managerPath string, headers map[string]string, cfg RemoteXDPConfig, timeout time.Duration) (RemoteXDPResult, error) {
 	if managerPath == "" {
 		managerPath = RemoteXDPManagerPath
@@ -92,6 +108,9 @@ func SetRemoteXDP(client *http.Client, base, managerPath string, headers map[str
 	}, nil
 }
 
+// GetRemoteXDP reads the current RemoteXDP state from the Manager
+// NetworkProtocol resource. It returns the decoded Oem.Public.Services.RemoteXDP
+// object (or nil when absent) plus the raw body.
 func GetRemoteXDP(client *http.Client, base, managerPath string, headers map[string]string, timeout time.Duration) (map[string]any, []byte, error) {
 	if managerPath == "" {
 		managerPath = RemoteXDPManagerPath

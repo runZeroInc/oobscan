@@ -1,6 +1,7 @@
+
 module github.com/runZeroInc/oobscan
 
-go 1.26.4
+go 1.27
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0

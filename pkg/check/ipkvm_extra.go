@@ -12,6 +12,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// Vendor-specific IP-KVM exposures kept out of the generic ipkvm.posture
+// sweep since each is a precise, benign GET on a named vendor: JetKVM exposes
+// an unauthenticated Prometheus /metrics endpoint (device telemetry, no
+// auth), and Sipeed NanoKVM serves a fleet-wide universal content-encryption
+// key ("nanokvm-sipeed-2024") in its web assets while defaulting to plain
+// HTTP with brute-force lockout disabled -- the fixed key makes captured
+// "encrypted" content offline-decryptable. Both checks are detection-only
+// GETs; neither logs in nor changes state.
 func init() {
 	Register(Check{
 		Name:        "http.jetkvm.metricsUnauth",
@@ -31,10 +39,13 @@ func init() {
 	})
 }
 
+// nanoKVMUniversalKey is the fixed AES key Sipeed ships in NanoKVM web/server
+// assets; identical across the fleet, so it is not a secret.
 const nanoKVMUniversalKey = "nanokvm-sipeed-2024"
 
 func runJetKVMMetrics(ctx context.Context, t *engine.Target) []engine.Finding {
-
+	// JetKVM is a plain-HTTP device by default; probe the identify-selected web
+	// endpoint first, then common fallbacks.
 	client := insecureWebClient(min(t.Timeout, 5*time.Second))
 	tried := map[string]struct{}{}
 	for _, ep := range []struct {
@@ -76,11 +87,12 @@ func runNanoKVMUniversalKey(ctx context.Context, t *engine.Target) []engine.Find
 	client := insecureWebClient(min(t.Timeout, 5*time.Second))
 	port := webPort(t)
 	httpOnly := false
-
+	// NanoKVM defaults to plain HTTP/80; note it if the HTTP root answers.
 	if st, _, _ := httpProbe(ctx, client, hostPortURL("http", t.Host, port, "/"), ""); st > 0 {
 		httpOnly = true
 	}
-
+	// The universal key appears in served JS/config. Probe the shell first, then
+	// follow script src references so hashed asset names are covered.
 	tried := map[string]struct{}{}
 	for _, ep := range []struct {
 		scheme string
@@ -162,6 +174,9 @@ func extractScriptSrcs(body []byte) []string {
 	return out
 }
 
+// firstPromMetric returns the first metric name from a Prometheus exposition
+// body (the name on a "# HELP <name> ..." line, else the first sample line's
+// name), so the finding quotes a value the server actually returned.
 func firstPromMetric(body []byte) string {
 	for line := range strings.SplitSeq(string(body), "\n") {
 		line = strings.TrimSpace(line)
@@ -186,6 +201,9 @@ func firstPromMetric(body []byte) string {
 	return ""
 }
 
+// looksLikePrometheus reports whether a body looks like a Prometheus exposition
+// (a HELP/TYPE comment or a well-known runtime metric name). Guards against a
+// generic 200 page being mistaken for the metrics endpoint.
 func looksLikePrometheus(body []byte) bool {
 	s := string(body)
 	return strings.Contains(s, "# HELP ") || strings.Contains(s, "# TYPE ") ||

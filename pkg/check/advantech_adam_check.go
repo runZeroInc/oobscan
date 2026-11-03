@@ -9,6 +9,10 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/wire"
 )
 
+// Advantech ADAM/EKI configuration protocol (UDP+TCP 5058): bin/edgserver
+// dispatches the 0x40xx discovery/read block before any token check. The
+// returned device and network metadata is useful for identification but does
+// not establish credential disclosure or a configuration-write primitive.
 func init() {
 	Register(Check{
 		Name:        "udp.advantech.adamConfig",

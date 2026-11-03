@@ -1,17 +1,48 @@
+// Package ilo implements HPE iLO discovery and security probes.
+//
+// The tables here are distilled from static analysis of iLO 4 firmware and describe
+// the iLO-specific pieces the IPMI 2.0 spec does not define: the alternate
+// IPMI-over-LAN port, the per-NetFn bucket layout for the HP OEM NetFns, and named
+// OEM commands with their known metadata. They let the probes fingerprint iLO rather
+// than a generic BMC, and identify OEM commands seen in captures.
+//
+// Firmware references: kb/hpe/notes/.
 package ilo
 
+// ---------------------------------------------------------------------------
+// Network ports
+// ---------------------------------------------------------------------------
+
+// Port constants for iLO management services.
 const (
+	// IPMIPort is the standard IPMI over LAN UDP port (all BMCs).
 	IPMIPort uint16 = 623
 
+	// IPMIAltPort is the alternate port observed on iLO4 / iLO5 in
+	// addition to UDP/623. Firmware strings call it the "private port"
+	// used for IPMI and RIBCL tunneling from host-resident tools (HPONCFG,
+	// HP SUM): "Enable IPMI and RIBCL communication on the private port
+	// 49623" and "This server will use port 49623 to give iLO RIS Access."
+	// Probe both UDP and TCP/49623 when fingerprinting.
 	IPMIAltPort uint16 = 49623
 
+	// VirtualMediaPort is the default TCP port for Virtual Media.
 	VirtualMediaPort uint16 = 17988
 
+	// RemoteConsolePort is the default TCP port for iLO Remote Console.
 	RemoteConsolePort uint16 = 17990
 )
 
+// IPMIScanPorts lists every UDP port oobscan should probe for IPMI when
+// fingerprinting an HP iLO. Order is significant: try 623 first because it
+// is spec-default.
 var IPMIScanPorts = []uint16{IPMIPort, IPMIAltPort}
 
+// ---------------------------------------------------------------------------
+// NetFn catalog
+// ---------------------------------------------------------------------------
+
+// NetFnClass tags a NetFn as standard, DCMI group, or HP OEM.
 type NetFnClass uint8
 
 const (
@@ -20,16 +51,29 @@ const (
 	NetFnClassHPOEM
 )
 
+// NetFnInfo describes a single NetFn bucket supported by iLO.
 type NetFnInfo struct {
+	// NetFn is the raw request NetFn value (even byte). The response value
+	// is NetFn|1.
 	NetFn byte
 
+	// Name is the human-readable label as it appears in the firmware
+	// descriptor table.
 	Name string
 
+	// Class categorizes the NetFn for scanner logic.
 	Class NetFnClass
 
+	// OEMBucket, for HP OEM NetFns, names the internal dispatcher file.
+	//   0x30 -> src\bmc_oem.c   (legacy / general OEM)
+	//   0x32 -> src\bmc_oem.c   (sys-interface session + IPMI config)
+	//   0x34 -> src\bmc_oem2.c  (power / rack / iPDU)
+	//   0x36 -> src\bmc_oem3.c  (blackbox / bulk data)
 	OEMBucket string
 }
 
+// NetFns is the complete NetFn catalog shipped by iLO 4 v2.82, extracted from
+// the firmware's on-disk name table.
 var NetFns = []NetFnInfo{
 	{NetFn: 0x00, Name: "chassis", Class: NetFnClassStandard},
 	{NetFn: 0x02, Name: "bridge", Class: NetFnClassStandard},
@@ -45,47 +89,81 @@ var NetFns = []NetFnInfo{
 	{NetFn: 0x36, Name: "oem_036", Class: NetFnClassHPOEM, OEMBucket: "src\\bmc_oem3.c"},
 }
 
+// ---------------------------------------------------------------------------
+// Command catalog
+// ---------------------------------------------------------------------------
+
+// CmdAccess describes the privilege level usually required for a command.
+// iLO enforces these via an additional per-channel ACL in src\ipmitrk.c
+// (the "ipmitrk_input cmd not allowed" check), so the *effective* access on
+// a given channel may be more restrictive than what is shown here.
 type CmdAccess uint8
 
 const (
-	AccessUnknown CmdAccess = iota
-	AccessCallback
+	AccessUnknown  CmdAccess = iota
+	AccessCallback           // lowest privilege
 	AccessUser
 	AccessOperator
 	AccessAdministrator
-	AccessPreAuth
+	AccessPreAuth // reachable sessionless (e.g. Get Channel Auth Caps)
 )
 
+// CmdSideEffect classifies the scan-time risk of issuing a command.
 type CmdSideEffect uint8
 
 const (
-	SideEffectRead CmdSideEffect = iota
-	SideEffectWrite
-	SideEffectReset
-	SideEffectSession
-	SideEffectDangerous
+	SideEffectRead      CmdSideEffect = iota // read operation, no intended configuration write
+	SideEffectWrite                          // changes BMC state
+	SideEffectReset                          // reboots / resets BMC or host
+	SideEffectSession                        // affects session state
+	SideEffectDangerous                      // destructive: power control, clear logs, FW upload
 )
 
+// Command describes a single IPMI (NetFn, Cmd) pair understood by iLO.
+//
+// Fields marked "best-known" come from firmware string analysis and HP
+// public documentation; they are *not* wire-sniffed from a running iLO and
+// should be treated as hints, not ground truth. Always cross-check against
+// a live device before acting on the metadata.
 type Command struct {
+	// NetFn is the request NetFn byte (even).
 	NetFn byte
 
+	// Cmd is the command byte. Where the command byte is not published by
+	// HP (most OEM commands), Cmd == 0 and the name is used as the lookup
+	// key. Such entries are best-known ordinals, not addressable targets.
 	Cmd byte
 
+	// Name is the label from the firmware descriptor table.
 	Name string
 
+	// Spec is one of "IPMI-1.5", "IPMI-2.0", "DCMI-1.5", "HP-OEM".
 	Spec string
 
+	// Access is the nominal privilege required.
 	Access CmdAccess
 
+	// Side classifies the scan-time side effect.
 	Side CmdSideEffect
 
+	// Preauth is true if the command is known to be answerable without an
+	// authenticated session (e.g. Get Channel Auth Caps).
 	Preauth bool
 
+	// Notes is freeform commentary -- CVEs, quirks, fingerprint value.
 	Notes string
 }
 
-var StdCommands = []Command{
+// ---------------------------------------------------------------------------
+// Standard IPMI commands (App / Chassis / Storage / etc.) -- those iLO
+// explicitly enumerates in its firmware command table.
+// ---------------------------------------------------------------------------
 
+// StdCommands lists the standard IPMI 1.5 / 2.0 commands iLO exposes.
+// Commands are ordered as they appear in the firmware descriptor table to
+// preserve the dispatch ordinal, which is itself a fingerprint.
+var StdCommands = []Command{
+	// --- Chassis (NetFn 0x00) ---
 	{NetFn: 0x00, Cmd: 0x00, Name: "get capabilitieS", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead, Notes: "lowercase 'S' preserved from firmware"},
 	{NetFn: 0x00, Cmd: 0x01, Name: "get status", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x00, Cmd: 0x02, Name: "control", Spec: "IPMI-2.0", Access: AccessOperator, Side: SideEffectDangerous, Notes: "Chassis power on/off/cycle"},
@@ -98,6 +176,7 @@ var StdCommands = []Command{
 	{NetFn: 0x00, Cmd: 0x09, Name: "get system boot options", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x00, Cmd: 0x0F, Name: "get poh counter", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 
+	// --- Sensor / Event (NetFn 0x04) ---
 	{NetFn: 0x04, Cmd: 0x00, Name: "set event receiver", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectWrite},
 	{NetFn: 0x04, Cmd: 0x01, Name: "get event receiver", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x04, Cmd: 0x02, Name: "event message", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectWrite},
@@ -115,6 +194,7 @@ var StdCommands = []Command{
 	{NetFn: 0x04, Cmd: 0x29, Name: "get sensor event enable", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x04, Cmd: 0x2D, Name: "get reading", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead, Notes: "Get Sensor Reading"},
 
+	// --- App (NetFn 0x06) ---
 	{NetFn: 0x06, Cmd: 0x01, Name: "global get device ID", Spec: "IPMI-2.0", Access: AccessPreAuth, Side: SideEffectRead, Preauth: true, Notes: "Fingerprint hook -- iLO returns Mfr ID 11 (0x00000B)"},
 	{NetFn: 0x06, Cmd: 0x02, Name: "global cold reset", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectReset},
 	{NetFn: 0x06, Cmd: 0x03, Name: "global warm reset", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectReset},
@@ -163,6 +243,7 @@ var StdCommands = []Command{
 	{NetFn: 0x06, Cmd: 0x58, Name: "set system info params", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectWrite},
 	{NetFn: 0x06, Cmd: 0x59, Name: "get system info params", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 
+	// --- Storage (NetFn 0x0A) ---
 	{NetFn: 0x0A, Cmd: 0x10, Name: "FRU information", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x0A, Cmd: 0x11, Name: "FRU data read", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x0A, Cmd: 0x12, Name: "FRU data write", Spec: "IPMI-2.0", Access: AccessOperator, Side: SideEffectWrite},
@@ -182,12 +263,13 @@ var StdCommands = []Command{
 	{NetFn: 0x0A, Cmd: 0x47, Name: "SEL clear", Spec: "IPMI-2.0", Access: AccessOperator, Side: SideEffectDangerous, Notes: "Destructive -- wipes event log"},
 	{NetFn: 0x0A, Cmd: 0x48, Name: "SEL get time", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x0A, Cmd: 0x49, Name: "SEL set time", Spec: "IPMI-2.0", Access: AccessOperator, Side: SideEffectWrite},
-
+	// HP iLO also exposes a parallel "PL" log (Platform Event Log) path.
 	{NetFn: 0x0A, Cmd: 0x50, Name: "PL get info", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead, Notes: "HP iLO platform-log info"},
 	{NetFn: 0x0A, Cmd: 0x51, Name: "PL get entry", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x0A, Cmd: 0x52, Name: "PL add entry", Spec: "HP-OEM", Access: AccessOperator, Side: SideEffectWrite},
 	{NetFn: 0x0A, Cmd: 0x53, Name: "PL clear", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectDangerous},
 
+	// --- Transport / LAN / SOL (NetFn 0x0C) ---
 	{NetFn: 0x0C, Cmd: 0x01, Name: "set LAN config", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectWrite},
 	{NetFn: 0x0C, Cmd: 0x02, Name: "get LAN config", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x0C, Cmd: 0x04, Name: "get LAN Stats", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead, Notes: "Capitalization preserved from firmware"},
@@ -195,6 +277,7 @@ var StdCommands = []Command{
 	{NetFn: 0x0C, Cmd: 0x21, Name: "set SOL config", Spec: "IPMI-2.0", Access: AccessAdministrator, Side: SideEffectWrite},
 	{NetFn: 0x0C, Cmd: 0x22, Name: "get SOL config", Spec: "IPMI-2.0", Access: AccessUser, Side: SideEffectRead},
 
+	// --- DCMI (NetFn 0x2C, Group Ext 0xDC) ---
 	{NetFn: 0x2C, Cmd: 0x01, Name: "get caps", Spec: "DCMI-1.5", Access: AccessUser, Side: SideEffectRead, Notes: "DCMI Get Capabilities Info"},
 	{NetFn: 0x2C, Cmd: 0x02, Name: "get power reading", Spec: "DCMI-1.5", Access: AccessUser, Side: SideEffectRead},
 	{NetFn: 0x2C, Cmd: 0x03, Name: "get power limit", Spec: "DCMI-1.5", Access: AccessUser, Side: SideEffectRead},
@@ -207,8 +290,17 @@ var StdCommands = []Command{
 	{NetFn: 0x2C, Cmd: 0x0A, Name: "Set host name", Spec: "DCMI-1.5", Access: AccessAdministrator, Side: SideEffectWrite},
 }
 
-var OEMCommands = []Command{
+// ---------------------------------------------------------------------------
+// HP OEM commands (NetFn 0x30 / 0x32 / 0x34 / 0x36)
+//
+// HP does not publish command-byte numbers for most of these. The Name is
+// taken verbatim from the firmware descriptor table. Cmd==0 means the byte
+// is not known; use the Name as the lookup key.
+// ---------------------------------------------------------------------------
 
+// OEMCommands enumerates the HP-OEM commands shipped by iLO 4 v2.82.
+var OEMCommands = []Command{
+	// --- Management / configuration (NetFn 0x30) ---
 	{NetFn: 0x30, Name: "OEM Power CMD", Spec: "HP-OEM", Access: AccessOperator, Side: SideEffectDangerous, Notes: "Custom power control"},
 	{NetFn: 0x30, Name: "OEM Mgmt Set", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectWrite},
 	{NetFn: 0x30, Name: "OEM Mgmt Get", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead},
@@ -229,9 +321,12 @@ var OEMCommands = []Command{
 	{NetFn: 0x30, Name: "OEM Get Attached iPDU", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead, Notes: "Intelligent PDU topology"},
 	{NetFn: 0x30, Name: "OEM Set Regex pattern", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectWrite, Notes: "Custom event pattern matcher"},
 	{NetFn: 0x30, Name: "OEM Get Regex pattern", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead},
-
+	// NetFn 0x30 also hosts bmc_oem2_get_connected_bl_ipv4:
 	{NetFn: 0x30, Cmd: 0x24, Name: "Get connected BL IPv4", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead, Notes: "Blade enclosure blade IP list (sub-cmd addressed); source: bmc_oem2.c"},
 
+	// --- System-interface session plumbing (NetFn 0x32) ---
+	// These run over the in-band KCS/BT path, not RMCP. They let host-side
+	// code open an IPMI session context without going through RAKP.
 	{NetFn: 0x32, Name: "OEM Activate sys intf sess", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectSession, Notes: "Open IPMI session over system interface -- host-to-BMC"},
 	{NetFn: 0x32, Name: "OEM Set sys intf priv level", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectSession, Notes: "Elevate system-interface session privilege"},
 	{NetFn: 0x32, Name: "OEM Close sys intf session", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectSession},
@@ -243,6 +338,7 @@ var OEMCommands = []Command{
 	{NetFn: 0x32, Name: "OEM Get IPMI Config", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead, Notes: "Passive service enablement enumeration"},
 	{NetFn: 0x32, Name: "test", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectRead, Notes: "Firmware test hook (name is literally 'test')"},
 
+	// --- Hardware / low-level (NetFn 0x34, dispatcher: bmc_oem2.c) ---
 	{NetFn: 0x34, Name: "OEM LED control", Spec: "HP-OEM", Access: AccessOperator, Side: SideEffectWrite, Notes: "Drive LEDs including health / UID"},
 	{NetFn: 0x34, Name: "OEM NVRAM message", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectDangerous, Notes: "Subcommand-dispatched NVRAM read/write"},
 	{NetFn: 0x34, Name: "OEM driver loaded", Spec: "HP-OEM", Access: AccessUser, Side: SideEffectRead},
@@ -255,10 +351,19 @@ var OEMCommands = []Command{
 	{NetFn: 0x34, Name: "OEM IO read", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectRead, Notes: "Arbitrary BMC I/O space read -- powerful"},
 	{NetFn: 0x34, Name: "OEM I2c segment master wr-rd", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectDangerous, Notes: "Arbitrary I2C master on a chosen segment -- hardware pivot"},
 
+	// --- Bulk / BlackBox data (NetFn 0x36, dispatcher: bmc_oem3.c) ---
+	// Inferred from strings 'bmc_oem3: bb desc failed', 'bb data failed',
+	// 'bad packet, bad sequence'. Names are descriptive placeholders.
 	{NetFn: 0x36, Name: "OEM BlackBox descriptor", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectRead, Notes: "bmc_oem3.c 'bb desc' path"},
 	{NetFn: 0x36, Name: "OEM BlackBox data", Spec: "HP-OEM", Access: AccessAdministrator, Side: SideEffectRead, Notes: "bmc_oem3.c 'bb data' path; sequence-checked"},
 }
 
+// ---------------------------------------------------------------------------
+// Lookup helpers
+// ---------------------------------------------------------------------------
+
+// CommandByNetFnCmd returns the catalog entry matching (netFn, cmd). It
+// searches the standard table first, then OEM. ok is false if not found.
 func CommandByNetFnCmd(netFn, cmd byte) (Command, bool) {
 	for _, c := range StdCommands {
 		if c.NetFn == netFn && c.Cmd == cmd {
@@ -273,6 +378,8 @@ func CommandByNetFnCmd(netFn, cmd byte) (Command, bool) {
 	return Command{}, false
 }
 
+// CommandsByNetFn returns every catalog entry for a given NetFn, in the
+// order they appear in the firmware descriptor table.
 func CommandsByNetFn(netFn byte) []Command {
 	var out []Command
 	for _, c := range StdCommands {
@@ -288,6 +395,9 @@ func CommandsByNetFn(netFn byte) []Command {
 	return out
 }
 
+// PreauthCommands returns the subset of commands known to be reachable
+// without an authenticated session. These are the useful fingerprint probes
+// for external scanning.
 func PreauthCommands() []Command {
 	var out []Command
 	for _, c := range StdCommands {

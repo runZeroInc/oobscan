@@ -11,6 +11,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// The pre-auth surface check reports the IPMI 1.5/2.0 exposures the identify step
+// already gathered (auth-caps, cipher suites, GUID, Get Device ID). It reads that
+// stashed evidence and does no probing of its own, so it never re-opens sessions
+// against a rate-limiting BMC; the re-probing variants are deferred to --ipmi-full.
+//
+// The one exception is nullUserPrivProbe, which opens a single session under
+// --ipmi-null-priv. It lives here because it qualifies the ipmi.authNull /
+// ipmi.authAnon findings this check emits.
 func init() {
 	Register(Check{
 		Name:        "ipmi.surface",
@@ -25,6 +33,9 @@ func init() {
 func runIPMISurface(ctx context.Context, t *engine.Target) []engine.Finding {
 	var out []engine.Finding
 
+	// RMCP+ cipher-suite enumeration is a 2.0-only operation, so its presence
+	// proves 2.0 support even when the 1.5 auth-caps 2.0 bit is unset (Supermicro
+	// leaves it clear yet still speaks RMCP+/RAKP).
 	var cipherIDs []int
 	if v, ok := t.Evidenced("ipmi.ciphers"); ok {
 		if ids, ok := v.([]int); ok {
@@ -33,7 +44,10 @@ func runIPMISurface(ctx context.Context, t *engine.Target) []engine.Finding {
 	}
 	if v, ok := t.Evidenced("ipmi.authCaps"); ok {
 		if ac, ok := v.(*ipmi.AuthCaps); ok && ac != nil {
-
+			// The null/anonymous auth-caps bits are a configuration statement, not
+			// an impact statement, so measure the account when the operator opted
+			// in (see nullUserPrivProbe) and report the finding against the
+			// measurement rather than the bit.
 			probe := nullUserPrivProbe(t, ac)
 			out = append(out, authCapsFindings(ac, len(cipherIDs) > 0, probe)...)
 			out = append(out, nullUserSOLFindings(probe)...)
@@ -47,7 +61,9 @@ func runIPMISurface(ctx context.Context, t *engine.Target) []engine.Finding {
 			fields := engine.F("mfr", dev.ManufacturerName(),
 				"fw", ipmi.FormatFirmwareRevision(dev.FirmwareMajor, dev.FirmwareMinor),
 				"productId", fmt.Sprintf("0x%04x", dev.ProductID))
-
+			// Same reasoning as the post-auth mc-info finding: the auxiliary
+			// revision is what makes the version matchable against a vendor
+			// advisory, so carry the reconstruction and the raw bytes.
 			if full := dev.FirmwareRevisionFull(); full != "" {
 				fields = append(fields, engine.Field{Key: "firmwareVersionFull", Val: full})
 			}
@@ -56,7 +72,8 @@ func runIPMISurface(ctx context.Context, t *engine.Target) []engine.Finding {
 					Key: "auxFirmwareRev", Val: hex.EncodeToString(dev.AuxFirmwareVersion[:]),
 				})
 			}
-
+			// The IANA PEN name normalized to a slug, so the identity backfill can
+			// attribute a host whose vendor identify left blank.
 			fields = append(fields, vendorSlugField(dev.ManufacturerName())...)
 			out = append(out, engine.Finding{
 				Check: "ipmi.deviceId", Category: "discovery", Risk: "info", Fields: fields,
@@ -79,7 +96,8 @@ func runIPMISurface(ctx context.Context, t *engine.Target) []engine.Finding {
 	if v, ok := t.Evidenced("guid"); ok {
 		if g, ok := v.(*guid.Result); ok && g != nil && g.Family != "" {
 			fields := engine.F("family", g.Family, "vendor", g.Vendor, "guid", g.Hex)
-
+			// The Supermicro board-code prefix (e.g. "F401MS") is a reliable
+			// pre-auth generation signal; surface it so id.final can map it.
 			if mp := g.Fields["model_prefix"]; mp != "" {
 				fields = append(fields, engine.Field{Key: "modelPrefix", Val: mp})
 			}
@@ -92,6 +110,8 @@ func runIPMISurface(ctx context.Context, t *engine.Target) []engine.Finding {
 	return stampIPMI(out, t.IPMIPort())
 }
 
+// stampIPMI pins each finding to the IPMI RMCP location (UDP/623 ipmi) so every
+// IPMI result carries where it was observed.
 func stampIPMI(fs []engine.Finding, port int) []engine.Finding {
 	for i := range fs {
 		if fs[i].Port == 0 {
@@ -101,6 +121,14 @@ func stampIPMI(fs []engine.Finding, port int) []engine.Finding {
 	return fs
 }
 
+// nullUserPrivProbe measures what an advertised null/anonymous account actually
+// holds, since the advertised bit says nothing about impact: the account can still
+// be clamped to privilege 0 with IPMI messaging off. Returns nil when the probe does
+// not apply.
+//
+// Opt-in via --ipmi-null-priv because it is the one part of this otherwise probe-free
+// check that opens a session, and suppressed by --disable-logins because an
+// empty-username RMCP+ handshake is an active login attempt.
 func nullUserPrivProbe(t *engine.Target, ac *ipmi.AuthCaps) *ipmi.NullUserPrivProbe {
 	if t == nil || ac == nil || !t.IPMINullPriv || t.DisableLogins {
 		return nil
@@ -108,7 +136,8 @@ func nullUserPrivProbe(t *engine.Target, ac *ipmi.AuthCaps) *ipmi.NullUserPrivPr
 	if !ac.NullUser && !ac.AnonLogin {
 		return nil
 	}
-
+	// Both flags describe the same unnamed slot-1 account, so one session answers
+	// for either. The empty username is what makes it the null-user login.
 	var cipherIDs []int
 	if v, ok := t.Evidenced("ipmi.ciphers"); ok {
 		if ids, ok := v.([]int); ok {
@@ -122,13 +151,17 @@ func nullUserPrivProbe(t *engine.Target, ac *ipmi.AuthCaps) *ipmi.NullUserPrivPr
 	return probe
 }
 
+// nullUserPrivFields renders the measurement onto the auth-caps finding. An
+// unprobed finding gets no fields at all, so the absence of a measurement stays
+// visible rather than being reported as a privilege of zero.
 func nullUserPrivFields(probe *ipmi.NullUserPrivProbe) []engine.Field {
 	if probe == nil {
 		return nil
 	}
 	fields := []engine.Field{{Key: "privilegeProbe", Val: probe.Status()}}
 	if !probe.Activated {
-
+		// A session that will not activate is itself the answer: the advertised bit
+		// did not translate into access from this vantage point.
 		if probe.Error != "" {
 			fields = append(fields, engine.Field{Key: "privilegeProbeError", Val: probe.Error})
 		}
@@ -136,7 +169,9 @@ func nullUserPrivFields(probe *ipmi.NullUserPrivProbe) []engine.Field {
 	}
 	fields = append(fields,
 		engine.Field{Key: "privilegeProbeSuite", Val: fmt.Sprintf("%d", probe.Suite)},
-
+		// The Open Session ceiling is recorded next to the measured level because the
+		// gap between them is the trap: the ceiling reads ADMINISTRATOR even on a unit
+		// whose null account holds nothing.
 		engine.Field{Key: "openSessionMaxPrivilege", Val: ipmi.PrivilegeName(probe.OpenSessionMaxPriv)},
 	)
 	if probe.Protection != "" {
@@ -150,7 +185,8 @@ func nullUserPrivFields(probe *ipmi.NullUserPrivProbe) []engine.Field {
 	} else if probe.PrivilegeCC != 0 {
 		fields = append(fields, engine.Field{Key: "privilegeQueryCc", Val: fmt.Sprintf("0x%02x", probe.PrivilegeCC)})
 	}
-
+	// Get Device ID is the cheapest impact witness -- a clamped account is denied
+	// even this, which is the concrete form of "the bit says nothing about impact".
 	if probe.DeviceIDSeen {
 		fields = append(fields,
 			engine.Field{Key: "getDeviceIdCc", Val: fmt.Sprintf("0x%02x", probe.DeviceIDCC)},
@@ -163,6 +199,13 @@ func nullUserPrivFields(probe *ipmi.NullUserPrivProbe) []engine.Field {
 	return fields
 }
 
+// nullUserAuthRisk is the risk for an advertised null/anonymous account.
+//
+// Unmeasured (or measured below USER) it stays low, since an enabled null user can
+// hold no real access at all. Only a measured privilege of USER (2) or above
+// raises it, because that is the level at which the account reads real
+// inventory. OPERATOR (3) and above adds chassis power control, so it goes a
+// step further.
 func nullUserAuthRisk(probe *ipmi.NullUserPrivProbe) string {
 	if !probe.UsableAccess() {
 		return "low"
@@ -173,9 +216,18 @@ func nullUserAuthRisk(probe *ipmi.NullUserPrivProbe) string {
 	return "medium"
 }
 
+// authCapsFindings reports the Get Channel Auth Caps settings. These are weak
+// defaults rather than directly exploitable conditions -- an attacker still needs to
+// sniff the wire or brute force -- so they rate low, and confirmed access (default
+// creds, cipher-0) is reported by the credential check instead. The exception is a
+// null/anonymous account measured at USER or above, which is confirmed
+// unauthenticated access; nullUserAuthRisk raises it.
 func authCapsFindings(ac *ipmi.AuthCaps, rmcpPlus bool, probe *ipmi.NullUserPrivProbe) []engine.Finding {
 	var out []engine.Finding
 
+	// Supported IPMI versions on one informational line. Answering Get Channel Auth Caps at
+	// all proves 1.5; the 2.0 bit (or a working RMCP+ cipher enumeration, which is
+	// a 2.0-only op) adds 2.0.
 	versions := []string{"1.5"}
 	if ac.IPMI20 || rmcpPlus {
 		versions = append(versions, "2.0")
@@ -185,6 +237,8 @@ func authCapsFindings(ac *ipmi.AuthCaps, rmcpPlus bool, probe *ipmi.NullUserPriv
 		Fields: engine.F("versions", strings.Join(versions, ",")),
 	})
 
+	// All accepted IPMI 1.5 authentication types on one low-risk line (they are weak
+	// defaults, not directly exploitable), instead of one finding per method.
 	var methods []string
 	if ac.HasAuthNone() {
 		methods = append(methods, "none")
@@ -205,6 +259,10 @@ func authCapsFindings(ac *ipmi.AuthCaps, rmcpPlus bool, probe *ipmi.NullUserPriv
 		})
 	}
 
+	// Anonymous login and null-user login are distinct account settings, not auth
+	// methods, so they stay on their own lines. Each carries the observed auth-
+	// methods on the channel so the finding is self-contained and consumers do
+	// not have to cross-reference the sibling ipmi.v15.authMethods finding.
 	observedAuth := strings.Join(methods, ",")
 	channel := fmt.Sprintf("%d", ac.Channel)
 	privFields := nullUserPrivFields(probe)
@@ -232,6 +290,13 @@ func authCapsFindings(ac *ipmi.AuthCaps, rmcpPlus bool, probe *ipmi.NullUserPriv
 	return out
 }
 
+// nullUserSOLFindings reports SOL configuration readable from a null/anonymous
+// session holding less than USER privilege. Get SOL Configuration Parameters
+// (0x0c/0x22) answering at privilege 0 is a gate failure -- the command is not among
+// the documented ATEN Privilege::None set -- but it is disclosure only, since
+// activating SOL needs privilege 3, so it rates low and is reported separately
+// because the defect is the missing gate rather than the account. At USER or above
+// the read is within entitlement and nothing is emitted.
 func nullUserSOLFindings(probe *ipmi.NullUserPrivProbe) []engine.Finding {
 	if probe == nil || !probe.Activated || !probe.SOL.Readable() {
 		return nil
@@ -239,7 +304,8 @@ func nullUserSOLFindings(probe *ipmi.NullUserPrivProbe) []engine.Finding {
 	if probe.UsableAccess() {
 		return nil
 	}
-
+	// Without a measured privilege there is no evidence the read happened below
+	// the gate, which is the entire claim.
 	if !probe.PrivilegeOK {
 		return nil
 	}
@@ -274,6 +340,10 @@ func nullUserSOLFindings(probe *ipmi.NullUserPrivProbe) []engine.Finding {
 	}}
 }
 
+// cipherFindings reports the advertised cipher suites as informational and the weak
+// ones as low. Cipher suite 0 being advertised is not a vulnerability on its own; it
+// is a finding only when it actually works, which the credential check confirms
+// separately as ipmi.v20.cipherZero.
 func cipherFindings(ids []int) []engine.Finding {
 	var list, weak []string
 	for _, id := range ids {
@@ -371,6 +441,9 @@ func explainIPMIAuthNull(host string, f engine.Finding) string {
 	return b.String()
 }
 
+// explainNullUserPrivilege renders the measured-privilege section, or the note
+// explaining that the bit alone is not an impact statement when no measurement
+// was taken. Returns the section including its leading blank line.
 func explainNullUserPrivilege(host string, port int, f engine.Finding) string {
 	var b strings.Builder
 	measured := explainField(f, "measuredPrivilege")

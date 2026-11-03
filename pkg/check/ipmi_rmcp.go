@@ -10,6 +10,10 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// The RMCP presence ping is the cheapest BMC-liveness signal: an ASF presence
+// request on UDP/623 whose pong carries the "IPMI supported" bit. It records
+// reachability + RTT + whether IPMI is advertised, and stays quiet when the port
+// does not answer.
 func init() {
 	Register(Check{
 		Name:        "ipmi.rmcpPing",
@@ -26,7 +30,7 @@ func runIPMIRMCPPing(ctx context.Context, t *engine.Target) []engine.Finding {
 	start := time.Now()
 	resp, err := ipmi.ASFPing(t.Host, port, t.Timeout)
 	if err != nil {
-		return nil
+		return nil // no ASF pong; stay quiet (matches the old PASS/closed suppression)
 	}
 	rtt := time.Since(start)
 	f := engine.F("rtt", fmt.Sprintf("%dus", rtt.Microseconds()))
@@ -40,8 +44,10 @@ func runIPMIRMCPPing(ctx context.Context, t *engine.Target) []engine.Finding {
 	}}
 }
 
+// asfIPMISupported reads the "IPMI supported" bit from an ASF presence-pong
+// (supported-entities byte, bit 7). Returns "yes"/"no", or "" if too short.
 func asfIPMISupported(resp []byte) string {
-	const supportedEntitiesOff = 20
+	const supportedEntitiesOff = 20 // RMCP(4)+ASF hdr(8)+OEM(8)
 	if len(resp) <= supportedEntitiesOff {
 		return ""
 	}

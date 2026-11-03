@@ -9,6 +9,7 @@ type progressReporter func(string)
 
 type progressContextKey struct{}
 
+// WithCommandProgress attaches a best-effort progress callback to ctx.
 func WithCommandProgress(ctx context.Context, fn func(string)) context.Context {
 	if fn == nil {
 		return ctx

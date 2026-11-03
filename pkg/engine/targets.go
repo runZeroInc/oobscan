@@ -13,6 +13,13 @@ import (
 
 const maxExpandedTargets = 1 << 20
 
+// ExpandTargets parses target specifiers into a shuffled list of hosts. A
+// specifier may be an IP or hostname, an IPv4 CIDR, an IPv4 hyphen range, or a
+// host:port pair. Expansion is text-only: IPv6 literals (including zoned
+// link-local) and IPv6 multicast sweep specs pass through verbatim for
+// pkg/discover to resolve. A host:port is kept verbatim and the named port becomes
+// a web-port hint (see SplitHostPortHint). Order is randomized so a scan spreads
+// load across a network instead of hammering one subnet first.
 func ExpandTargets(specs []string) ([]string, error) {
 	var out []string
 	for _, raw := range specs {
@@ -39,11 +46,19 @@ func expandOne(tok string) ([]string, error) {
 	case isHyphenRange(tok):
 		return expandHyphenRange(tok)
 	default:
-
+		// A single host or a host:port pair. Keep the token verbatim (including any
+		// :port and bracketed IPv6 literal); consumers split the port off with
+		// SplitHostPortHint - scan turns it into a web-port hint, the IPMI path
+		// discards it.
 		return []string{tok}, nil
 	}
 }
 
+// SplitHostPortHint splits a "host:port" target spec into a bare host and a
+// numeric port hint. A spec without a valid trailing port (a bare IP or
+// hostname, or an unbracketed IPv6 literal) is returned unchanged with port 0.
+// It centralizes the host:port parsing so the scan engine (web-port hint) and
+// the IPMI path (which discards the port) agree on what counts as a port.
 func SplitHostPortHint(spec string) (host string, port int) {
 	h, p, err := net.SplitHostPort(spec)
 	if err != nil {
@@ -76,6 +91,8 @@ func expandCIDR(tok string) ([]string, error) {
 	return out, nil
 }
 
+// isHyphenRange reports whether tok looks like an IPv4 hyphen range and not a
+// hostname that merely contains a dash.
 func isHyphenRange(tok string) bool {
 	lo, _, ok := strings.Cut(tok, "-")
 	if !ok {
@@ -84,6 +101,8 @@ func isHyphenRange(tok string) bool {
 	return net.ParseIP(lo).To4() != nil
 }
 
+// expandHyphenRange expands "10.0.0.1-10.0.0.20" and the shorthand
+// "10.0.0.1-20" (last octet only).
 func expandHyphenRange(tok string) ([]string, error) {
 	loStr, hiStr, _ := strings.Cut(tok, "-")
 	lo := net.ParseIP(strings.TrimSpace(loStr)).To4()
@@ -94,7 +113,7 @@ func expandHyphenRange(tok string) ([]string, error) {
 	var hi net.IP
 	if strings.Contains(hiStr, ".") {
 		hi = net.ParseIP(hiStr).To4()
-	} else {
+	} else { // last-octet shorthand
 		n, err := strconv.Atoi(hiStr)
 		if err != nil || n < 0 || n > 255 {
 			return nil, fmt.Errorf("bad range end %q", hiStr)
@@ -129,6 +148,9 @@ func u32ToIP(v uint32) net.IP {
 	return net.IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
+// ParsePorts turns a comma-delimited "port[/proto]" spec into Ports. A bare
+// port defaults to TCP; ranges (n-m) are supported for TCP. Example:
+// "623/udp,443/tcp,80,16992/tcp".
 func ParsePorts(spec string) ([]Port, error) {
 	var out []Port
 	seen := map[Port]bool{}
@@ -175,6 +197,8 @@ func ParsePorts(spec string) ([]Port, error) {
 
 func validPort(n int) bool { return n > 0 && n <= 65535 }
 
+// ReadTargetLines reads newline-delimited targets from r (a file or stdin),
+// skipping blank lines and # comments. Each line is expanded like a CLI arg.
 func ReadTargetLines(r io.Reader) ([]string, error) {
 	var specs []string
 	sc := bufio.NewScanner(r)

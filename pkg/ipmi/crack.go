@@ -42,25 +42,32 @@ func offlineCrackPasswordCandidates(vendor string, extra []string, permute bool)
 	return out
 }
 
+// CrackResult records a recovered BMC password and how it was found.
 type CrackResult struct {
 	Username       string `json:"username"`
 	Password       string `json:"password"`
-	PasswordType   string `json:"passwordType"`
-	Vendor         string `json:"vendor,omitempty"`
+	PasswordType   string `json:"passwordType"`     // "default" | "common" | "custom" | "permutation" | "online" | "smcrakp-fixed-key"
+	Vendor         string `json:"vendor,omitempty"` // vendor slug whose default list produced the hit
 	Attempts       int    `json:"attempts"`
-	Verified       bool   `json:"verified"`
-	LoginTested    bool   `json:"loginTested"`
-	AcceptsAny     bool   `json:"acceptsAny,omitempty"`
-	CommandCapable bool   `json:"commandCapable,omitempty"`
-	Proof          string `json:"proof,omitempty"`
+	Verified       bool   `json:"verified"`                 // an actual RAKP-3/4 login with this credential completed
+	LoginTested    bool   `json:"loginTested"`              // a login was attempted, so !Verified means it failed rather than untested
+	AcceptsAny     bool   `json:"acceptsAny,omitempty"`     // BMC returns a RAKP-2 for any username (crack username is unreliable)
+	CommandCapable bool   `json:"commandCapable,omitempty"` // SMCRAKP: a forged session executed an unprotected (no-integrity/no-encrypt) command - the H3 bypass is exploitable, not just forgeable
+	Proof          string `json:"proof,omitempty"`          // server-derived proof that the credential worked
 }
 
+// CrackOptions tunes offline RAKP cracking.
 type CrackOptions struct {
-	Vendor         string
-	ExtraPasswords []string
-	Permute        bool
+	Vendor         string   // vendor slug to prioritize (e.g. "dell" tries root:calvin first)
+	ExtraPasswords []string // caller-supplied candidates tried before permutation
+	Permute        bool     // enable the CPU-intensive permutation pass
 }
 
+// CrackRAKP recovers the account password offline by recomputing the RAKP-2 HMAC
+// for candidate passwords against the leaked hash in r, so it does no network I/O
+// and cannot trigger account lockout (CVE-2013-4786). Candidates are tried in
+// order: vendor defaults, the generic default/common spray (both via
+// creds.CredsFor), caller extras, then permutation seeds. Returns nil on no match.
 func CrackRAKP(r *RAKPResult, opts CrackOptions) *CrackResult {
 	if r == nil || len(r.RAKPHash) == 0 {
 		return nil
@@ -93,7 +100,8 @@ func CrackRAKP(r *RAKPResult, opts CrackOptions) *CrackResult {
 			return hit
 		}
 	}
-
+	// 2. Caller-supplied extras are already included in the candidate stream.
+	// 3. Permutation of common seeds (case/leet/affix variants).
 	if opts.Permute {
 		for _, cand := range offlineCrackPasswordCandidates(opts.Vendor, opts.ExtraPasswords, true) {
 			if cand.Kind != "permutation" {

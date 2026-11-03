@@ -13,6 +13,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ssdp"
 )
 
+// Lenovo XClarity Controller (XCC/XCC2) pre-auth exposures, both info-level
+// and gated on the Lenovo vendor slug: (1) POST /api/providers/get_nonce is
+// reachable unauthenticated and returns a uuid5 derived deterministically from
+// a world-readable seed rather than a CSPRNG -- a weak pre-auth login
+// primitive and a reliable fingerprint, no login attempted; (2) XCC answers
+// SSDP on UDP/1900 with a Server string leaking system name, firmware,
+// machine-type-model and serial number, matching the asset tag.
 func init() {
 	Register(Check{
 		Name:        "http.lenovo.xcc.preAuth",
@@ -75,7 +82,9 @@ func runLenovoXCCDeviceInfo(ctx context.Context, t *engine.Target) []engine.Find
 			continue
 		}
 		if v, ok := parseLenovoDeviceInfo(body); ok {
-
+			// The served body is the disclosure, so carry a snippet of it alongside
+			// the parsed fields: which endpoint answered and what it actually
+			// returned, rather than only the subset the parser recognized.
 			return []engine.Finding{{
 				Check: "http.lenovo.xcc.deviceInfo", Category: "exposure", Risk: "info",
 				Port: port, Transport: "tcp", Protocol: proto,
@@ -195,7 +204,8 @@ func runLenovoXCCNonceReplay(ctx context.Context, t *engine.Target) []engine.Fin
 	if !ok1 || !ok2 || n1 == "" || n2 == "" || n1 != n2 || nonceVersion(n1) != 5 {
 		return nil
 	}
-
+	// The repeated nonce is the evidence, so it belongs in the proof; without it the
+	// proof only restates the four constants the guard above already tested.
 	proof := proofKV(
 		"nonceEqual", "true",
 		"repeatedNonce", n1,
@@ -299,6 +309,10 @@ func walkLenovoInfo(m map[string]any, out *lenovoDeviceInfo) {
 	}
 }
 
+// lenovoGetNonce issues the unauthenticated POST /api/providers/get_nonce and,
+// when the distinctive JSON nonce envelope comes back on a 2xx, flags the
+// deterministic pre-auth login nonce. A login page / 401 / 403 proves the
+// endpoint is guarded and yields nothing.
 func lenovoGetNonce(ctx context.Context, t *engine.Target) *engine.Finding {
 	port := webPort(t)
 	proto := webProto(t)
@@ -332,7 +346,8 @@ func lenovoGetNonce(ctx context.Context, t *engine.Target) *engine.Finding {
 		Fields: engine.F(
 			"url", "/api/providers/get_nonce",
 			"nonce", nonce,
-
+			// The served token is the disclosure; the proof pins it to the endpoint
+			// and status that returned it.
 			"proof", proofKV(
 				"url", "/api/providers/get_nonce",
 				"status", strconv.Itoa(resp.StatusCode),
@@ -341,6 +356,10 @@ func lenovoGetNonce(ctx context.Context, t *engine.Target) *engine.Finding {
 	}
 }
 
+// parseXCCNonce extracts the nonce token from the get_nonce JSON envelope. The
+// XCC handler returns {"nonce":"<uuid>"} (some builds wrap it, e.g.
+// {"data":{"nonce":"..."}} or {"authnonce":"..."}); accept the common shapes and
+// require a plausible token so a generic 200/HTML page is not mistaken for one.
 func parseXCCNonce(body []byte) (string, bool) {
 	b := strings.TrimSpace(string(body))
 	if !strings.HasPrefix(b, "{") {
@@ -366,7 +385,7 @@ func parseXCCNonce(body []byte) (string, bool) {
 			return v, true
 		}
 	}
-
+	// Nested {"data":{"nonce":...}} form.
 	if raw, ok := env["data"]; ok {
 		var inner map[string]json.RawMessage
 		if json.Unmarshal(raw, &inner) == nil {
@@ -380,6 +399,9 @@ func parseXCCNonce(body []byte) (string, bool) {
 	return "", false
 }
 
+// lenovoSSDPLeak parses the XCC SSDP Server string for the four leaked
+// identifiers. It reuses the SSDP reply identify already captured on 1900 when
+// present, otherwise sends one unicast M-SEARCH.
 func lenovoSSDPLeak(t *engine.Target) *engine.Finding {
 	var r *ssdp.Result
 	if v, ok := t.Evidenced("ssdp"); ok {
@@ -412,11 +434,17 @@ func lenovoSSDPLeak(t *engine.Target) *engine.Finding {
 			"mtm", mtm,
 			"serial", serial,
 			"server", r.Server,
-
+			// The Server header is the leak itself, so mirror the raw string into
+			// the proof rather than leaving the evidence under a key the audit does
+			// not recognize.
 			"proof", proofKV("ssdpServer", r.Server)),
 	}
 }
 
+// parseXCCServerString parses the XCC SSDP Server header
+// "<SysName>:<FirmwareVersion> UPnP/1.1 <MTM>:<SerialNumber>" into its four
+// fields. It requires the "UPnP/" marker with a "<a>:<b>" token on either side so
+// a generic UPnP Server string ("Linux/x UPnP/1.0 miniupnpd/1.0") does not match.
 func parseXCCServerString(server string) (sysName, fw, mtm, serial string, ok bool) {
 	idx := strings.Index(server, "UPnP/")
 	if idx < 0 {
@@ -424,7 +452,7 @@ func parseXCCServerString(server string) (sysName, fw, mtm, serial string, ok bo
 	}
 	left := strings.TrimSpace(server[:idx])
 	tail := strings.TrimSpace(server[idx:])
-
+	// tail = "UPnP/1.1 <MTM>:<Serial>" -> drop the "UPnP/x.y" token.
 	parts := strings.SplitN(tail, " ", 2)
 	right := ""
 	if len(parts) == 2 {
@@ -445,6 +473,10 @@ func parseXCCServerString(server string) (sysName, fw, mtm, serial string, ok bo
 	return sysName, fw, mtm, serial, true
 }
 
+// readLimited reads at most limit bytes from an io.Reader that has a Close (the
+// http.Response.Body), returning the bytes read. Kept local so the Lenovo/
+// Opengear checks share one bounded reader without touching io imports at call
+// sites.
 func readLimited(r interface{ Read([]byte) (int, error) }, limit int) []byte {
 	buf := make([]byte, 0, 1024)
 	tmp := make([]byte, 4096)

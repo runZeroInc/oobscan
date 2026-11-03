@@ -1,9 +1,14 @@
+// Package output renders scan results. It implements engine.Emitter twice: a
+// mutex-guarded NDJSON emitter (machine mode) and a lipgloss TTY emitter
+// (interactive mode). New auto-selects based on output settings and whether stderr is a
+// terminal. The two streams are kept strictly separate: structured NDJSON goes
+// to the output writer (stdout/file); all TTY chrome goes to stderr, so a
+// piped `oobscan scan --output out.jsonl` never sees an escape sequence.
 package output
 
 import (
 	"encoding/hex"
 	"encoding/json"
-	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,52 +24,85 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/tlscert"
 )
 
-const ndjsonRawFieldMax = 16 << 10
+const ndjsonRawFieldMax = 16 << 10 // 16 KiB
 
+// RawFieldMax is the ceiling for a single raw captured value. It is exported so
+// an importer building records outside the scan pipeline (`oobscan convert`)
+// bounds a preserved attribute bag with the same budget the scanner uses.
 const RawFieldMax = ndjsonRawFieldMax
 
+// Result is one NDJSON record: everything learned about a responsive target or
+// target error. Ports is the discovered open surface
+// ("port/transport" -> "proto,proto").
 type Result struct {
 	Host            string                    `json:"host"`
 	TS              int64                     `json:"timestamp,omitempty"`
 	Ports           engine.OpenPorts          `json:"ports,omitempty"`
 	Identity        *engine.Identity          `json:"identity,omitempty"`
-	Final           *engine.Final             `json:"finalIdentity,omitempty"`
+	Final           *engine.Final             `json:"finalIdentity,omitempty"` // post-check aggregate identity + derived flags
 	Findings        []engine.Finding          `json:"findings,omitempty"`
-	AttemptedChecks string                    `json:"attemptedChecks,omitempty"`
-	Services        []ServiceRecord           `json:"services,omitempty"`
-	Attributes      map[string]string         `json:"attributes,omitempty"`
+	AttemptedChecks string                    `json:"attemptedChecks,omitempty"` // sorted CSV of checks that ran and produced a "none" (clean) result
+	Services        []ServiceRecord           `json:"services,omitempty"`        // raw per-service attributes (TLS/SSH crypto material, ...) for lossless downstream use
+	Attributes      map[string]string         `json:"attributes,omitempty"`      // host-level attributes (class/vendor/product/version + identity attrs)
 	RAKP            []RAKPRecord              `json:"rakp,omitempty"`
-	ILO             *ilo.XMLData              `json:"ilo,omitempty"`
+	ILO             *ilo.XMLData              `json:"ilo,omitempty"` // pre-auth /xmldata RIMP doc, verbatim (server model, MP.PN/MP.ST, NIC MAC/IPs)
 	IPMIPost        *ipmi.PostAuthCollection  `json:"ipmiPostAuth,omitempty"`
 	RFPost          *redfish.PostAuthSnapshot `json:"redfishPostAuth,omitempty"`
-	WebLogin        *httpx.Transcript         `json:"webLogin,omitempty"`
-
+	WebLogin        *httpx.Transcript         `json:"webLogin,omitempty"` // full request/response transcript of the web default-login check (for field debugging)
+	// Evidence carries the probe results that are not otherwise representable in a
+	// finding, keyed by evidence handle. See serializedEvidenceKeys for what is
+	// included and why. Without it these were in-process only and vanished with the
+	// scan -- a confirmed OpenBMC bypass, for instance, discarded the one value needed
+	// to reproduce it.
 	Evidence map[string]json.RawMessage `json:"evidence,omitempty"`
 	Error    string                     `json:"error,omitempty"`
 }
 
+// serializedEvidenceKeys is the allowlist of evidence handles projected into the
+// record, each with the reason it cannot be reconstructed from the rest of the row.
+//
+// An allowlist, not a wholesale dump: `http` holds the full httpscan report with a
+// retained body per endpoint, `ipmi.auth` holds the RAKP material that ships as rakp[]
+// rows, and `tls`/`ssh.*` are what services[].attributes exists for. Adding a probe
+// means adding one line; TestSerializedEvidenceKeysAreCanonical rejects a typo.
 var serializedEvidenceKeys = map[string]string{
+	// The SMC RAKP state-machine probes. Their negative arm (0x0f conformant rejection
+	// for CVE-2026-65219, 0x09/0x0a/0x12 for CVE-2026-65220) and the control-arm statuses only exist
+	// here; the findings carry the positive case. Without them a corpus of all-positive
+	// findings cannot show the discriminator ever discriminated.
+	"ipmi.smc.rakpUnordered":    "CVE-2026-65219 probe: RAKP4 status, echoed SID, spec-conformant flag",
+	"ipmi.smc.rakpReservedRole": "CVE-2026-65220 probe: reserved/control/admin role statuses",
 
-	"ipmi.smc.rakpStateMachine": "SMC RAKP ordering probe: RAKP4 status, echoed SID, spec-conformant flag",
-	"ipmi.smc.privEsc":          "SMC RAKP role probe: reserved/control/admin role statuses",
+	// The OpenBMC chain. The default-userKey probe's winning bmcRandomNum is the only
+	// reusable output of a confirmed bypass -- reopening the session needs it -- and the
+	// sweep bounds/truncation are what separate an exhaustive miss from a timed-out one.
+	"ipmi.openBmcDefaultUserKey":         "OBMC bypass: winning bmcRandomNum, attempts, sweep bounds/truncation",
+	"ipmi.openBmcSetupState":             "OBMC setup-state probe: admin-priv acceptance and the relabel target account",
+	"ipmi.openBmcDisabledSetupOverwrite": "OBMC disabled-account setup-overwrite probe",
 
-	"ipmi.openBmcRakpState":     "OpenBMC RAKP ordering probe: message 2 and message 4 statuses",
-	"ipmi.openBmcSetupState":    "OpenBMC setup-state probe: which session commands answer before authentication completes",
-	"ipmi.openBmcSetupIdentity": "OpenBMC disabled-account setup-slot probe",
-
+	// Pre-auth IPMI surface detail that no finding carries in full.
 	"ipmi.authCaps":     "raw Get Channel Auth Caps reply, so the parse can be re-derived without a re-scan",
 	"ipmi.nullUserPriv": "null/anonymous-user privilege probe (what an unauthenticated session reaches, incl. SOL)",
 	"ipmi.preAuthMap":   "which IPMI commands answer with no session",
 	"ipmi.ipmb":         "IPMB bridging sweep results",
 	"ipmi.v15":          "IPMI 1.5 report: offered auth methods, auth-none result, default credential",
 
+	// The third post-auth snapshot. ipmiPostAuth and redfishPostAuth are already
+	// top-level fields; this one was simply never wired, so authenticated WS-Man
+	// inventory was collected and thrown away.
 	"wsman.postAuth": "post-auth WS-Man inventory (the analogue of ipmiPostAuth/redfishPostAuth)",
 
+	// The Redfish auth-path anomaly pattern: four status codes whose combination is the
+	// signal, of which the finding keeps only a summary.
 	"redfish.authPathError": "Redfish auth-path status pattern (unauth/basic/session/challenge)",
 }
 
+// maxEvidenceBytes caps one serialized evidence blob. A probe that grows unexpectedly
+// large is dropped with a note rather than silently truncated or silently omitted, so
+// the record never implies the probe did not run.
 const maxEvidenceBytes = 256 * 1024
 
+// evidenceForRecord marshals the allowlisted evidence present on t.
 func evidenceForRecord(t *engine.Target) map[string]json.RawMessage {
 	var out map[string]json.RawMessage
 	for key, why := range serializedEvidenceKeys {
@@ -94,6 +132,15 @@ func evidenceForRecord(t *engine.Target) map[string]json.RawMessage {
 	return out
 }
 
+// ServiceRecord is one open service with its raw runZero-style attribute bag. It
+// preserves the crypto material a consumer needs to reason about exposure without
+// re-probing, notably the TLS leaf and SSH host-key badkeys bkhashes that key a
+// shared/default-firmware-key match. Attribute keys mirror the runZero service_data
+// vocabulary so both corpora stay directly comparable.
+//
+// Summary, VHost and Address are never set by a live scan, which probes one address
+// at a time and derives no service summary. They exist so a converted runZero export
+// keeps those per-service columns instead of flattening them into the attribute bag.
 type ServiceRecord struct {
 	Port       int               `json:"port,omitempty"`
 	Transport  string            `json:"transport,omitempty"`
@@ -104,6 +151,14 @@ type ServiceRecord struct {
 	Attributes map[string]string `json:"attributes,omitempty"`
 }
 
+// RAKPRecord carries the raw RAKP-2 material for offline re-cracking. Hashcat
+// holds the ready-to-crack hashcat -m 7300 line when the negotiated algorithm is
+// HMAC-SHA1 (empty for HMAC-MD5/SHA256, which have no hashcat mode -- the sids,
+// nonces, guid, and hmac fields still allow offline cracking).
+//
+// Redacted marks a row whose hash material was withheld by the source rather than
+// never captured; only `convert` sets it. It is what lets a consumer distinguish a
+// BMC that leaked no hash from one whose leaked hash is not being carried.
 type RAKPRecord struct {
 	Username   string `json:"username"`
 	AuthAlgo   byte   `json:"authAlgo"`
@@ -118,9 +173,14 @@ type RAKPRecord struct {
 	Redacted   bool   `json:"redacted,omitempty"`
 }
 
+// resultFrom builds the NDJSON record for a finished target, pulling any RAKP
+// hashes out of the stashed IPMI auth evidence.
 func resultFrom(t *engine.Target) Result {
 	now := time.Now().UnixNano()
-
+	// Split findings: positive (risk >= info) stay in the Findings array;
+	// "none" (clean/negative-result) findings are aggregated into
+	// AttemptedChecks so consumers see "we tried check X and it came back
+	// clean" without a per-check row in the findings list.
 	all := t.FindingsSnapshot()
 	findings := make([]engine.Finding, 0, len(all))
 	attemptedSeen := map[string]struct{}{}
@@ -148,7 +208,7 @@ func resultFrom(t *engine.Target) Result {
 		findings = append(findings, f)
 	}
 	sort.Strings(attempted)
-
+	// Most-severe first, stable within a risk level (preserves discovery order).
 	sort.SliceStable(findings, func(i, j int) bool {
 		return engine.RiskRank(findings[i].Risk) > engine.RiskRank(findings[j].Risk)
 	})
@@ -185,7 +245,11 @@ func resultFrom(t *engine.Target) Result {
 		}
 	}
 	r.Evidence = evidenceForRecord(t)
-
+	// The pre-auth iLO RIMP doc, verbatim. It was previously evidence-only, so
+	// MP.PN/MP.ST -- the two fields Generation() reads -- never reached the
+	// output and a generation fall-through could not be diagnosed without a
+	// re-scan. It also carries the server model and the pre-auth NIC MAC/IP
+	// inventory that no other source provides.
 	if v, ok := t.Evidenced("ilo"); ok {
 		if x, ok := v.(*ilo.XMLData); ok && x != nil {
 			r.ILO = x
@@ -196,6 +260,11 @@ func resultFrom(t *engine.Target) Result {
 	return r
 }
 
+// serviceRecordsFrom projects the discovered open surface plus the stashed raw
+// TLS/SSH evidence onto per-service attribute bags. The attribute keys mirror
+// the runZero service_data vocabulary (tls.fp.bkhash, tls.fp.sha256, tls.*,
+// ssh.hostKey.bkhash, ...) so nothing crypto-relevant is dropped and a consumer
+// can run shared/default-key detection without re-probing the host.
 func serviceRecordsFrom(t *engine.Target) []ServiceRecord {
 	open := t.OpenSnapshot()
 	if len(open) == 0 {
@@ -223,6 +292,9 @@ func serviceRecordsFrom(t *engine.Target) []ServiceRecord {
 		byPort[svcs[i].Port] = &svcs[i]
 	}
 
+	// Attach the served TLS leaf evidence (badkeys bkhash + fingerprint + cert
+	// posture) to its port. This is the primary "record where missing" win: the
+	// bkhash is exactly the shared/default-key detection input.
 	if v, ok := t.Evidenced("tls"); ok {
 		if ci, ok := v.(*tlscert.CertInfo); ok && ci != nil {
 			rec := byPort[ci.Port]
@@ -235,6 +307,7 @@ func serviceRecordsFrom(t *engine.Target) []ServiceRecord {
 		}
 	}
 
+	// Attach captured SSH host-key material (bkhash + fingerprint + key type).
 	if v, ok := t.Evidenced("ssh.hostKeys"); ok {
 		if caps, ok := v.(map[int]ssh.HostKeyCapture); ok {
 			for port, cap := range caps {
@@ -258,6 +331,7 @@ func serviceRecordsFrom(t *engine.Target) []ServiceRecord {
 	return svcs
 }
 
+// tlsCertAttrs renders a served-leaf CertInfo as runZero-style tls.* attributes.
 func tlsCertAttrs(ci *tlscert.CertInfo) map[string]string {
 	a := map[string]string{}
 	putStr := func(k, v string) {
@@ -295,6 +369,7 @@ func tlsCertAttrs(ci *tlscert.CertInfo) map[string]string {
 	return a
 }
 
+// sshHostKeyAttrs renders a captured SSH host key as runZero-style ssh.* attrs.
 func sshHostKeyAttrs(cap ssh.HostKeyCapture) map[string]string {
 	a := map[string]string{}
 	if cap.BKHash != "" {
@@ -315,6 +390,9 @@ func sshHostKeyAttrs(cap ssh.HostKeyCapture) map[string]string {
 	return a
 }
 
+// hostAttributesFrom renders the resolved host identity as a flat attribute map
+// (class/vendor/product/generation/version plus any captured identity
+// attributes), so a consumer has the asset-level context without re-deriving it.
 func hostAttributesFrom(t *engine.Target) map[string]string {
 	a := map[string]string{}
 	put := func(k, v string) {
@@ -346,13 +424,15 @@ func hostAttributesFrom(t *engine.Target) map[string]string {
 	return a
 }
 
+// csvToSortedSlice splits a comma-joined protocol string into a sorted, unique,
+// non-empty slice.
 func csvToSortedSlice(v string) []string {
 	if v == "" {
 		return nil
 	}
 	seen := map[string]struct{}{}
 	var out []string
-	for p := range strings.SplitSeq(v, ",") {
+	for _, p := range strings.Split(v, ",") {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
@@ -367,6 +447,7 @@ func csvToSortedSlice(v string) []string {
 	return out
 }
 
+// splitPortKey parses an OpenPorts key ("623/udp") into its port and transport.
 func splitPortKey(k string) (port int, transport string) {
 	slash := strings.LastIndexByte(k, '/')
 	if slash < 0 {
@@ -382,6 +463,7 @@ func splitPortKey(k string) (port int, transport string) {
 	return n, k[slash+1:]
 }
 
+// mergeAttrs merges src into dst (allocating dst when nil) and returns it.
 func mergeAttrs(dst, src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return dst
@@ -389,10 +471,13 @@ func mergeAttrs(dst, src map[string]string) map[string]string {
 	if dst == nil {
 		dst = make(map[string]string, len(src))
 	}
-	maps.Copy(dst, src)
+	for k, v := range src {
+		dst[k] = v
+	}
 	return dst
 }
 
+// firstNonEmpty returns the first non-empty string.
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
@@ -409,10 +494,19 @@ func resultHasResponsiveData(r Result) bool {
 	return r.Identity != nil && (r.Identity.Class != engine.ClassUnknown || len(r.Identity.Signals) > 0)
 }
 
-const ndjsonFieldMax = 4 << 10
+// ndjsonFieldMax is the universal per-field ceiling in the machine output. It is
+// ~25x the largest legitimate non-raw field observed at internet scale, so it
+// only bites runaway values (signature-DB banner dumps, catalog-prose blobs).
+const ndjsonFieldMax = 4 << 10 // 4 KiB
 
+// uncappedFields are exempt from ndjsonFieldMax because a truncated value is
+// useless: `hash` is crackable RAKP material that must stay byte-complete.
 var uncappedFields = map[string]struct{}{"hash": {}}
 
+// CapFindingFields applies the emitted-record field ceilings to an existing
+// finding's fields. Live scans get this for free through resultFrom; it is
+// exported so a record read back off disk (`oobscan convert`) can be re-bounded
+// under the current rules instead of carrying a blob an older build emitted.
 func CapFindingFields(fields engine.Fields) engine.Fields {
 	return capJSONLargeFields(fields)
 }
@@ -428,7 +522,8 @@ func capJSONLargeFields(fields engine.Fields) engine.Fields {
 		if _, ok := uncappedFields[key]; ok {
 			continue
 		}
-
+		// `response` (raw captured payloads) keeps the larger 16 KiB budget; every
+		// other field is bounded universally so no check can ship an uncapped blob.
 		max := ndjsonFieldMax
 		if key == "response" {
 			max = ndjsonRawFieldMax

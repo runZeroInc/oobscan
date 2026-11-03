@@ -1,5 +1,10 @@
 package cmd
 
+// This file holds the generic value/table/JSON rendering, ASCII sanitizing,
+// color styling, and IPMI protocol label decoders used to present "oobscan
+// ipmi" results. It is pure formatting logic split out of ipmi.go so that
+// file keeps only command wiring and dispatch.
+
 import (
 	"bytes"
 	"encoding/binary"
@@ -7,8 +12,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+
 	"strconv"
 	"strings"
+
+	"github.com/runZeroInc/oobscan/pkg/ipmi"
 
 	"github.com/runZeroInc/oobscan/pkg/output"
 )
@@ -170,6 +178,17 @@ func writeKVMapAny(w interface{ Write([]byte) (int, error) }, m map[string]any) 
 		_, err := fmt.Fprintln(w, "(no data)")
 		return err
 	}
+	// A recovered password list is the point of the command that produces it,
+	// so it gets its own table underneath instead of being folded into one
+	// unreadable cell of the settings table.
+	var creds []ipmi.SMCStoredPassword
+	if v, ok := m["passwords"]; ok {
+		if c, ok := v.([]ipmi.SMCStoredPassword); ok {
+			creds = c
+			delete(m, "passwords")
+			defer func() { m["passwords"] = c }()
+		}
+	}
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
@@ -179,7 +198,20 @@ func writeKVMapAny(w interface{ Write([]byte) (int, error) }, m map[string]any) 
 	for _, k := range keys {
 		rows = append(rows, []string{prettyKey(k), formatAnyTypedValue(k, m[k])})
 	}
-	return writeASCIITable(w, []string{"Setting", "Value"}, rows)
+	if err := writeASCIITable(w, []string{"Setting", "Value"}, rows); err != nil {
+		return err
+	}
+	if len(creds) > 0 {
+		cr := make([][]string, 0, len(creds))
+		for _, c := range creds {
+			cr = append(cr, []string{fmt.Sprintf("%#x", c.Offset), c.Ciphertext, c.Plaintext})
+		}
+		if _, err := fmt.Fprintln(w, "\nStored passwords, decrypted under the firmware-static key:"); err != nil {
+			return err
+		}
+		return writeASCIITable(w, []string{"Offset", "Ciphertext", "Password"}, cr)
+	}
+	return nil
 }
 
 func writeSliceGeneric(w interface{ Write([]byte) (int, error) }, v any) error {
@@ -409,10 +441,26 @@ func isSOLInfoMap(v map[string]string) bool {
 	if len(v) == 0 {
 		return false
 	}
-	_, okA := v["set_in_progress"]
-	_, okB := v["enabled"]
-	_, okC := v["authentication"]
-	return okA || okB || okC
+	// set_in_progress is shared with the LAN print map, so it cannot be used as
+	// a SOL discriminator or a `lan print` result gets misrendered through the
+	// SOL-only table. Require a SOL-exclusive key instead.
+	for _, k := range []string{
+		"enabled",
+		"authentication",
+		"character_accumulate_level",
+		"character_send_threshold",
+		"retry_count",
+		"retry_interval",
+		"non_volatile_bit_rate",
+		"volatile_bit_rate",
+		"payload_channel",
+		"payload_port",
+	} {
+		if _, ok := v[k]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func writeSOLInfoTable(w interface{ Write([]byte) (int, error) }, m map[string]string) error {
@@ -676,6 +724,9 @@ func sanitizeASCIIPreserveANSI(s string) string {
 	return b.String()
 }
 
+// useIPMIColor reports whether IPMI result tables should be ANSI-styled. It
+// defers to the process-wide logger so --no-color, NO_COLOR, and stdout TTY
+// detection are all decided in one place (see output.Default).
 func useIPMIColor() bool {
 	return !output.Default().NoColor()
 }

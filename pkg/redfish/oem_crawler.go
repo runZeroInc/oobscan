@@ -13,32 +13,40 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// OEMEndpoint describes a single Redfish endpoint found during the recursive
+// OEM surface crawl (Track E).
 type OEMEndpoint struct {
+	// Path is the endpoint URI relative to the host, e.g. /redfish/v1/Managers/Self/Oem/Dell/Jobs.
 	Path string
-
+	// AuthRequired is true when an unauthenticated GET returns 401/403.
 	AuthRequired bool
-
+	// Status is the HTTP status code observed without authentication.
 	Status int
-
+	// AllowedMethods is populated from the Allow response header where present.
 	AllowedMethods []string
-
+	// HasPOST / HasPATCH indicate write methods are advertised.
 	HasPOST  bool
 	HasPATCH bool
-
+	// IsOEM is true when the path contains /Oem/ or a vendor-specific prefix.
 	IsOEM bool
-
+	// Vendor is the OEM vendor key (e.g. "Dell", "Hpe", "Ami").
 	Vendor string
-
+	// SampleData holds up to 2 KB of the response body for manual review.
 	SampleData string
 }
 
+// OEMSurface is the full output of CrawlOEMSurface (Track E).
 type OEMSurface struct {
 	Host      string
 	Endpoints []OEMEndpoint
-
+	// HighRisk holds endpoints with unauthenticated write access or sensitive
+	// data exposure (firmware update, user creation, iKVM tokens, factory reset,
+	// virtual media mount).
 	HighRisk []OEMEndpoint
 }
 
+// highRiskKeywords are URI substrings that, when present alongside an
+// unauthenticated write method, constitute a potential critical finding.
 var highRiskKeywords = []string{
 	"update", "firmware", "accounts", "users", "session", "token",
 	"kvm", "media", "virtual", "reset", "factory", "upload", "bios",
@@ -50,6 +58,17 @@ type qitem struct {
 	depth int
 }
 
+// CrawlOEMSurface implements Track E.
+//
+// It authenticates with the supplied credentials and recursively walks the
+// Redfish service tree starting at /redfish/v1/, collecting every OEM-branded
+// path and its unauthenticated accessibility (to identify auth bypass).
+//
+// Crawl is breadth-first with a depth cap of maxDepth (recommended: 6) and
+// a total-endpoints cap of maxNodes (recommended: 500) to bound runtime.
+//
+// Pass an empty username to run fully unauthenticated (useful for probing
+// which endpoints leak data without auth).
 func CrawlOEMSurface(host string, username, password string, timeout time.Duration, maxDepth, maxNodes int) (*OEMSurface, error) {
 	if timeout == 0 {
 		timeout = 10 * time.Second
@@ -116,6 +135,8 @@ func enqueueRedfishLink(queue []qitem, queued, visited map[string]bool, link str
 	return append(queue, qitem{path: link, depth: depth})
 }
 
+// crawlNode fetches a single Redfish node, extracts child links and OEM
+// blocks, and returns (links, endpoint-descriptor, error).
 func crawlNode(
 	authed, anon *http.Client,
 	base, path string,
@@ -125,6 +146,7 @@ func crawlNode(
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
+	// Authenticated fetch to get the full resource body and extract links.
 	authedReq, err := http.NewRequestWithContext(ctx, "GET", base+path, nil)
 	if err != nil {
 		return nil, nil, err
@@ -148,6 +170,7 @@ func crawlNode(
 		Vendor: extractVendor(path, body),
 	}
 
+	// Unauthenticated probe to check access control.
 	anonCtx, anonCancel := context.WithTimeout(context.Background(), timeout)
 	defer anonCancel()
 	anonReq, err := http.NewRequestWithContext(anonCtx, "GET", base+path, nil)
@@ -156,7 +179,7 @@ func crawlNode(
 		if aerr == nil {
 			ep.Status = anonResp.StatusCode
 			ep.AuthRequired = anonResp.StatusCode == 401 || anonResp.StatusCode == 403
-
+			// Collect Allow header for method enumeration.
 			if allow := anonResp.Header.Get("Allow"); allow != "" {
 				for m := range strings.SplitSeq(allow, ",") {
 					m = strings.TrimSpace(strings.ToUpper(m))
@@ -171,7 +194,11 @@ func crawlNode(
 			}
 			anonBody, _ := io.ReadAll(io.LimitReader(anonResp.Body, 2048))
 			anonResp.Body.Close()
-
+			// A 200 with a genuine Redfish body is a real unauth disclosure.
+			// A 200 that is an HTML login page (or a non-Redfish body) is just
+			// a redirect-to-login: treat it as auth-gated and do not record it
+			// as leaked sample data, so login pages are not counted as unauth
+			// info disclosure downstream.
 			if anonResp.StatusCode == 200 && isUnauthLeak(anonBody) {
 				ep.SampleData = string(anonBody)
 			} else if anonResp.StatusCode == 200 && looksLikeLogin(anonBody) {
@@ -180,6 +207,7 @@ func crawlNode(
 		}
 	}
 
+	// Probe for POST/PATCH on the authenticated client if not already known.
 	if !ep.HasPOST && !ep.HasPATCH {
 		optCtx, optCancel := context.WithTimeout(context.Background(), timeout)
 		defer optCancel()
@@ -211,6 +239,7 @@ func crawlNode(
 
 const maxLinkWalkDepth = 64
 
+// extractLinks finds Redfish links without recursing through unbounded JSON.
 func extractLinks(body []byte, currentPath string) []string {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -247,6 +276,7 @@ func extractLinks(body []byte, currentPath string) []string {
 	return links
 }
 
+// isOEMPath reports whether the path contains an OEM-specific segment.
 func isOEMPath(path string) bool {
 	low := strings.ToLower(path)
 	return strings.Contains(low, "/oem/") ||
@@ -262,6 +292,7 @@ func isOEMPath(path string) bool {
 		strings.Contains(low, "huawei")
 }
 
+// extractVendor guesses the OEM vendor from path or body.
 func extractVendor(path string, body []byte) string {
 	low := strings.ToLower(path) + " " + strings.ToLower(string(body[:min(len(body), 512)]))
 	switch {
@@ -285,10 +316,14 @@ func extractVendor(path string, body []byte) string {
 	return ""
 }
 
+// isUnauthLeak reports whether an anonymous 200 body is a genuine Redfish
+// resource disclosure rather than an HTML login page or a non-Redfish stub.
 func isUnauthLeak(b []byte) bool {
 	return len(b) > 0 && looksLikeRedfish(b) && !looksLikeLogin(b)
 }
 
+// isHighRisk returns true for endpoints that have both a write method and a
+// high-risk keyword in the path, or are fully unauthenticated write surfaces.
 func isHighRisk(ep *OEMEndpoint) bool {
 	if ep == nil {
 		return false
@@ -297,11 +332,14 @@ func isHighRisk(ep *OEMEndpoint) bool {
 	low := strings.ToLower(ep.Path)
 	for _, kw := range highRiskKeywords {
 		if strings.Contains(low, kw) {
-
+			// Unauthenticated write = critical; authenticated write on known path = noteworthy
 			if !ep.AuthRequired && hasWrite {
 				return true
 			}
-
+			// Unauthenticated GET of a sensitive path = info disclosure, but
+			// only when the 200 body was a genuine Redfish resource. SampleData
+			// is populated only for real leaks (see crawlNode), so a 200 login
+			// page -- which never sets SampleData -- is not promoted here.
 			if !ep.AuthRequired && ep.Status == 200 && ep.SampleData != "" {
 				return true
 			}
@@ -310,6 +348,8 @@ func isHighRisk(ep *OEMEndpoint) bool {
 	return false
 }
 
+// OEMSurfaceMarkdown returns a per-vendor summary table in Markdown suitable
+// for inclusion in internal analysis.
 func (s *OEMSurface) OEMSurfaceMarkdown() string {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "# Redfish OEM Surface - %s\n\n", s.Host)

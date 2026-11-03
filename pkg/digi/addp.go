@@ -1,3 +1,6 @@
+// Package digi implements Digi's ADDP (Advanced Device Discovery Protocol)
+// discovery over UDP/2362. Digi devices answer one of three supported magic
+// prefixes (DIGI, DVKT, DGDP), so discovery sends all three probes.
 package digi
 
 import (
@@ -11,14 +14,22 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// ADDPPort is Digi ADDP UDP discovery port.
 const ADDPPort = 2362
 
+// addpMagics are the three known request/response prefixes observed in Digi
+// firmware and supported by Metasploit's Rex::Proto::ADDP implementation.
 var addpMagics = [][4]byte{{'D', 'I', 'G', 'I'}, {'D', 'V', 'K', 'T'}, {'D', 'G', 'D', 'P'}}
 
 const addpCmdConfigReq = 1
 
+// maxADDPReads bounds how many datagrams either read loop will consume before
+// returning, so a host (or spoofer) that floods the socket with ADDP-shaped or
+// junk packets cannot keep the loop busy right up to the deadline. Discovery
+// realistically yields at most a handful of replies per appliance.
 const maxADDPReads = 64
 
+// ADDPResponse is the parsed Digi discovery response.
 type ADDPResponse struct {
 	From              string
 	Raw               []byte
@@ -41,6 +52,8 @@ type ADDPResponse struct {
 	DHCP              bool
 }
 
+// Discover broadcasts ADDP probes and returns responses received before
+// timeout. broadcast defaults to 255.255.255.255 when blank.
 func Discover(broadcast string, timeout time.Duration) ([]ADDPResponse, error) {
 	if broadcast == "" {
 		broadcast = "255.255.255.255"
@@ -77,6 +90,8 @@ func Discover(broadcast string, timeout time.Duration) ([]ADDPResponse, error) {
 	return dedupeByHost(out), nil
 }
 
+// Query sends the three magic ADDP probes directly to one host and returns the
+// best parsed response.
 func Query(host string, timeout time.Duration) (*ADDPResponse, error) {
 	conn, err := net.DialTimeout("udp", netaddr.DialHostPort(host, ADDPPort), timeout)
 	if err != nil {

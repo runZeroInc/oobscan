@@ -23,6 +23,11 @@ var (
 	convertWorkers     int
 )
 
+// convertCmd normalizes a scan-adjacent corpus into the native oobscan NDJSON
+// format. It is also where the older `scanaudit` command now lives, as
+// --quality: auditing a file and rewriting it are the same read of the same
+// records, and running them together means the file that gets audited is the
+// file that gets written.
 var convertCmd = &cobra.Command{
 	Use:   "convert [flags] <input-file> [output-file]",
 	Short: "Convert a scan corpus into the native oobscan format, optionally redacting or auditing it.",
@@ -36,7 +41,7 @@ Input formats (--format):
               "none"-risk findings move into attemptedChecks, and oversized
               fields are re-capped.
   rzsql       a runZero SQL export -- one JSON object per line holding an asset
-              and its services (see research/tools/bmc-stats for the query).
+			  and its services.
   rzservices  a runZero services export -- one JSON object per line holding a
               single service with its asset denormalized alongside it. These
               rows are not grouped, or even sorted, by asset, so the whole
@@ -52,13 +57,23 @@ away for the derivation. Captured RAKP-2 material is decomposed back into its
 session ids, nonces and GUID, so a converted runZero corpus is directly usable
 with "oobscan hashdump" and "oobscan hashcrack".
 
+The derivation also retroactively projects oobscan's device-specific exposures
+onto the preserved data, so a converted corpus and a live scan score the same
+fleet and can be compared with "oobscan report": the Supermicro/ATEN SMCRAKP
+fixed-key bypass and predictable session ids (from the captured RAKP hashes and
+managed session ids), the HPE iLO 2/3/4 IPMI RAKP-none auth bypass and the
+iLO <=5 mpSSH pre-auth overflow (from the iLO generation and mpSSH banner), the
+version-gated iLO firmware CVEs, and the OpenBMC phosphor-net-ipmid default
+userKey bypass (from an OpenBMC fingerprint on an IPMI 2.0 channel). Each such
+finding names the observation it was derived from and is marked as a
+generation/fingerprint projection rather than a live confirmation.
 
 Both the input and the output are gzipped transparently when the path ends in
 .gz. The output file is optional: "-" or omitting it writes NDJSON to stdout
 (the log then goes to stderr). With --quality and no output file, nothing is
 written -- the run is an audit only.
 
-  --redact    produce a corpus that can be shared. Addresses are renumbered in
+	--redact    prepare a corpus for sharing review. Addresses are renumbered in
               first-seen order (internal from 10.0.0.0, external from
               224.0.0.0), MACs keep their OUI and zero the last two octets,
               banners and other free-text captures are replaced with a
@@ -66,7 +81,9 @@ written -- the run is an audit only.
               and serials become redacted-N. Every rewrite is a stable mapping,
               so hosts that shared a key or a name still share its stand-in and
               cross-host analysis survives. Credential and RAKP hash material
-              is dropped outright. The post-auth captures are walked too.
+			  is dropped outright. The post-auth captures are walked too.
+			  Review the result before distribution; retained metadata may
+			  still be sensitive or identify a small population.
   --quality   run the data-hygiene, coverage and proof-completeness audit over
               the records as they were read (before any redaction) and report:
               the emitted-check histogram, checks that never fired, findings
@@ -91,7 +108,7 @@ func init() {
 	f.StringVar(&convertFormat, "format", string(convert.FormatOOBScan),
 		"input format ("+convert.FormatList()+")")
 	f.BoolVar(&convertRedact, "redact", false,
-		"renumber addresses and strip asset-identifying values, producing a shareable corpus")
+		"renumber addresses and remove known identifying and credential values; review the result before sharing")
 	f.BoolVar(&convertQuality, "quality", false,
 		"run the data-hygiene, coverage and proof-completeness audit over the input")
 	f.BoolVar(&convertFailOnDirty, "fail-on-dirty", false,
@@ -119,12 +136,15 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	case len(args) > 1:
 		opts.Output = args[1]
 	case convertQuality:
-
+		// A --quality run with no output is an audit-only pass: write nothing.
 	default:
-
+		// No output file given: behave like a filter and write NDJSON to stdout.
 		opts.Output = "-"
 	}
 
+	// The shared logger writes INFO to stdout, which is also where an output of
+	// "-" sends the NDJSON. Move the whole log to stderr in that case so a piped
+	// conversion never has a log line spliced into the record stream.
 	if opts.Output == "-" {
 		noColor := rootNoColor || os.Getenv("NO_COLOR") != "" || !isatty.IsTerminal(os.Stderr.Fd())
 		output.SetDefault(output.NewLogger(os.Stderr, os.Stderr, noColor, rootVerbose))
@@ -132,7 +152,8 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	lg := log()
 
 	if convertMapping != "" && !opts.Redact {
-
+		// Worded to start with a word, not a flag: the logger capitalizes the
+		// first letter of a message and would render "--Redact-mapping".
 		return fmt.Errorf("the --redact-mapping file is only produced by a redacting run: add --redact")
 	}
 
@@ -161,6 +182,7 @@ func runConvert(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// reportConvertStats summarizes what the conversion read and wrote.
 func reportConvertStats(st *convert.Stats, opts convert.Options) {
 	lg := log()
 	fields := []string{"format", string(st.Format), "read", strconv.Itoa(st.Read)}
@@ -189,6 +211,7 @@ func reportConvertStats(st *convert.Stats, opts convert.Options) {
 	}
 }
 
+// reportQuality renders the audit.
 func reportQuality(q *convert.QualityReport) {
 	lg := log()
 	lg.Infof("Quality audit: %d records", q.Records)
@@ -286,6 +309,8 @@ func reportQuality(q *convert.QualityReport) {
 	}
 }
 
+// writeRedactionMapping persists the address mapping, which is the only way to
+// reverse a redaction.
 func writeRedactionMapping(path string, st *convert.Stats) error {
 	if st.Mapping == nil {
 		return fmt.Errorf("no redaction mapping was produced")

@@ -1,43 +1,61 @@
+// Copyright (c) 2026 runZero, Inc.
+// SPDX-License-Identifier: BSD-2-Clause
+
+// Package oob centralises the oobscan inventory of out-of-band management
+// and serial-over-IP devices. Every OOB/BMC vendor referenced anywhere in
+// oobscan must appear here so that scan coverage is auditable.
+//
+// Keep entries in lexical order by Vendor. When adding a new entry also add
+// a probe or fingerprint in pkg/ (or explicitly mark Coverage=none with
+// a reason) so the "completeness" smoke test stays green.
 package oob
 
+// Category groups devices by the kind of OOB access they offer.
 type Category string
 
 const (
-	CatBMC       Category = "bmc"
-	CatIPKVM     Category = "ip-kvm"
-	CatPDU       Category = "pdu"
-	CatSerial    Category = "serial"
-	CatConsole   Category = "console"
-	CatKVMOverIP Category = "kvm"
-	CatAMT       Category = "amt"
-	CatFirmware  Category = "firmware"
+	CatBMC       Category = "bmc"      // full server baseboard management
+	CatIPKVM     Category = "ip-kvm"   // keyboard/video/mouse over IP
+	CatPDU       Category = "pdu"      // power distribution w/ network mgmt
+	CatSerial    Category = "serial"   // serial-over-IP / terminal server
+	CatConsole   Category = "console"  // console server
+	CatKVMOverIP Category = "kvm"      // rackmount KVM
+	CatAMT       Category = "amt"      // Intel AMT / vPro
+	CatFirmware  Category = "firmware" // UEFI / BIOS-side mgmt
 	CatOther     Category = "other"
 )
 
+// Device is an OOB/BMC product entry.
 type Device struct {
-	Vendor      string
-	Product     string
+	Vendor      string // canonical vendor, lowercase slug, e.g. "dell"
+	Product     string // product family, e.g. "iDRAC9", "iLO5", "ATEN IPMI"
 	Category    Category
-	IPMI        bool
-	Redfish     bool
+	IPMI        bool // speaks IPMI 2.0
+	Redfish     bool // Redfish / REST
 	WebUI       bool
 	SSH         bool
 	SNMP        bool
 	SSDP        bool
 	SLP         bool
 	WSMAN       bool
-	Telnet      bool
-	Proprietary []string
-
+	Telnet      bool     // legacy, but still seen
+	Proprietary []string // other proto names (e.g. "vMedia", "Avocent DSView")
+	// Fingerprints is a list of short strings oobscan looks for on the wire
+	// (HTTP Server header, TLS cert CN, banner, SNMP sysDescr, etc.).
 	Fingerprints []string
-
+	// DefaultCreds are vendor-shipped defaults; empty when the vendor uses
+	// per-unit printed factory passwords.
 	DefaultCreds [][2]string
-
+	// Notes capture implementation context.
 	Notes string
 }
 
+// Registry is the canonical list. Edits here feed:
+//   - cmd/coverage.go       -- `oobscan coverage` subcommand
+//   - pkg/creds/*      -- seeded wordlist generation
+//   - vendor table (auto-generated)
 var Registry = []Device{
-
+	// --- server BMCs (top of the pyramid) ---
 	{Vendor: "dell", Product: "iDRAC6", Category: CatBMC, IPMI: true, WebUI: true, SSH: true, SNMP: true, WSMAN: true,
 		Fingerprints: []string{"iDRAC6", "IDRAC-Express", "Dell Remote Access"},
 		DefaultCreds: [][2]string{{"root", "calvin"}},
@@ -52,7 +70,7 @@ var Registry = []Device{
 	{Vendor: "dell", Product: "iDRAC9", Category: CatBMC, IPMI: true, Redfish: true, WebUI: true, SSH: true, SNMP: true, WSMAN: true,
 		Proprietary:  []string{"RACADM"},
 		Fingerprints: []string{"iDRAC9", "/sysmgmt/2012/server"},
-		DefaultCreds: [][2]string{{"root", "calvin"}},
+		DefaultCreds: [][2]string{{"root", "calvin"}}, // pre-2018 hardware
 		Notes:        "Firmware 3.21+ ships per-unit default; service tag printed on bezel."},
 	{Vendor: "dell", Product: "iDRAC10", Category: CatBMC, IPMI: false, Redfish: true, WebUI: true, SSH: true,
 		Fingerprints: []string{"iDRAC10", "IDRAC.2.14.SWC1908", "HGX_BMC_0"},
@@ -145,18 +163,24 @@ var Registry = []Device{
 	{Vendor: "nec", Product: "EXPRESSSCOPE", Category: CatBMC, IPMI: true, WebUI: true, SSH: true,
 		Fingerprints: []string{"EXPRESSSCOPE"}, DefaultCreds: [][2]string{{"administrator", "administrator"}}},
 
+	// --- hyperscale ---
 	{Vendor: "meta", Product: "OpenBMC (Yosemite)", Category: CatBMC, IPMI: true, Redfish: true,
 		Fingerprints: []string{"Yosemite", "Tiogapass"}, Notes: "OCP platforms."},
 	{Vendor: "google", Product: "Hoth / OpenBMC", Category: CatBMC, IPMI: false, Redfish: true,
 		Fingerprints: []string{"Hoth", "gBMC"}},
 
+	// --- IP-KVM / console servers / serial-over-IP ---
 	{Vendor: "avocent", Product: "DSR / ACS console server", Category: CatConsole, SSH: true, Telnet: true, WebUI: true, SNMP: true,
 		Fingerprints: []string{"Avocent", "ACS-"},
 		DefaultCreds: [][2]string{{"admin", "avocent"}, {"root", "linux"}}},
 	{Vendor: "raritan", Product: "Dominion KX/KSX/SX", Category: CatIPKVM, SSH: true, Telnet: true, WebUI: true, SNMP: true,
 		Fingerprints: []string{"Raritan", "Dominion"},
 		DefaultCreds: [][2]string{{"admin", "raritan"}}},
-
+	// Product must be "PX" to exact-match the token bmcfp emits for PX PDUs
+	// (Server/title/demo-cert rules all yield product "PX"); as "PX PDU" it never
+	// matched, so classForVendorProduct fell through to the Dominion KX entry above
+	// and mis-classed PX3 PDUs as kvm. (The shared PX/KX favicon still yields the
+	// genuinely-ambiguous "PX / KX".)
 	{Vendor: "raritan", Product: "PX", Category: CatPDU, SSH: true, Telnet: true, WebUI: true, SNMP: true,
 		Fingerprints: []string{"Raritan PX"}, DefaultCreds: [][2]string{{"admin", "raritan"}}},
 	{Vendor: "vertiv", Product: "Geist / Liebert PDU", Category: CatPDU, SSH: true, WebUI: true, SNMP: true,
@@ -268,6 +292,7 @@ var Registry = []Device{
 	{Vendor: "atento", Product: "Avocent MergePoint Unity", Category: CatIPKVM, WebUI: true, SSH: true,
 		Fingerprints: []string{"MergePoint Unity"}},
 
+	// --- embedded management controllers ---
 	{Vendor: "intel", Product: "AMT / vPro", Category: CatAMT, WebUI: true, WSMAN: true, Redfish: false,
 		Proprietary:  []string{"Intel MEI", "SOL over AMT"},
 		Fingerprints: []string{"Intel(R) Active Management Technology", "Intel(R) AMT"},
@@ -279,6 +304,7 @@ var Registry = []Device{
 	{Vendor: "asmedia", Product: "BMC daughterboard", Category: CatBMC, IPMI: true,
 		Fingerprints: []string{"ASMedia"}},
 
+	// --- storage / blade chassis ---
 	{Vendor: "hpe", Product: "OneView / SIM", Category: CatOther, WebUI: true, SSH: true,
 		Fingerprints: []string{"HPE OneView"}},
 	{Vendor: "hpe", Product: "Onboard Administrator (c7000)", Category: CatBMC, WebUI: true, SSH: true, SNMP: true,
@@ -294,9 +320,11 @@ var Registry = []Device{
 		Fingerprints: []string{"Flex System CMM"},
 		DefaultCreds: [][2]string{{"USERID", "PASSW0RD"}}},
 
+	// --- network gear with OOB ---
 	{Vendor: "cisco", Product: "IMC Supervisor / UCS Manager", Category: CatBMC, WebUI: true, SSH: true,
 		Fingerprints: []string{"UCS Manager", "IMC Supervisor"}},
 
+	// --- infrastructure / misc ---
 	{Vendor: "tplink", Product: "Jetstream OOB", Category: CatOther, WebUI: true, SSH: true, Telnet: true,
 		Fingerprints: []string{"JetStream"}},
 	{Vendor: "mikrotik", Product: "RouterOS (as OOB jump)", Category: CatOther, SSH: true, WebUI: true,
@@ -310,6 +338,7 @@ var Registry = []Device{
 		DefaultCreds: [][2]string{{"admin", "westermo"}},
 		Notes:        "WeOS factory default admin:westermo (UID 0, /bin/clish; md5crypt, fleet-wide in factory.cfg, no forced change); actively sprayed over SSH by ssh.exposure via creds.Table. Recovery accounts (password/factory) are serial-console-only."},
 
+	// --- KVM-over-IP appliances frequently mistaken for BMCs ---
 	{Vendor: "pikvm", Product: "PiKVM v4", Category: CatIPKVM, WebUI: true, SSH: true,
 		Fingerprints: []string{"PiKVM"}, DefaultCreds: [][2]string{{"admin", "admin"}, {"root", "root"}},
 		Notes: "Eclypsium 2026 cohort baseline; no assigned CVE, default-cred posture only"},
@@ -328,11 +357,12 @@ var Registry = []Device{
 	{Vendor: "blikvm", Product: "BliKVM (v1-v4)", Category: CatIPKVM, WebUI: true, SSH: true,
 		Fingerprints: []string{"BliKVM", "Internet Widgits Pty Ltd", "/api/2fa/", "/api/account/create"},
 		DefaultCreds: [][2]string{{"admin", "admin"}},
-		Notes:        "PiKVM/kvmd fork; ships a shared TLS cert+key baked into the .deb (SHA256 CA:97:26:7D..., byte-identical v1-v4) = fleet-wide passive-decrypt/MITM; server_app runs as root; distinguished from upstream kvmd by /api/2fa/* + /api/account/create routes"},
+		Notes:        "PiKVM/kvmd fork; ships a shared TLS cert+key baked into the .deb (SHA256 CA:97:26:7D..., byte-identical v1-v4) = fleet-wide impersonation / non-forward-secret TLS decryption; server_app runs as root; distinguished from upstream kvmd by /api/2fa/* + /api/account/create routes"},
 	{Vendor: "angeet", Product: "Angeet/Yeeso ES3", Category: CatIPKVM, WebUI: true,
 		Fingerprints: []string{"ES3"},
 		Notes:        "CVE-2026-32297 unauth /upload arbitrary file write (9.8, NO FIX) + CVE-2026-32298 os.execute cmd-inj"},
 
+	// --- firmware-side surfaces that often expose BMC too ---
 	{Vendor: "insyde", Product: "H2O UEFI", Category: CatFirmware,
 		Fingerprints: []string{"Insyde H2O"}},
 	{Vendor: "ami", Product: "Aptio V UEFI", Category: CatFirmware,
@@ -341,6 +371,7 @@ var Registry = []Device{
 		Fingerprints: []string{"Phoenix SecureCore"}},
 }
 
+// ByVendor groups the registry.
 func ByVendor() map[string][]Device {
 	m := map[string][]Device{}
 	for _, d := range Registry {
@@ -349,6 +380,7 @@ func ByVendor() map[string][]Device {
 	return m
 }
 
+// Vendors returns a sorted-by-insertion list of unique vendor slugs.
 func Vendors() []string {
 	seen := map[string]bool{}
 	var out []string

@@ -20,6 +20,7 @@ var (
 	redfishTimeout     time.Duration
 	redfishManagerPath string
 
+	// RemoteXDP service-config overrides
 	redfishXDPSecurePort     int
 	redfishXDPTLS            bool
 	redfishXDPNonsecure      bool
@@ -32,7 +33,9 @@ var redfishCmd = &cobra.Command{
 	Long: `redfish drives authenticated Redfish operations (via oobscan's Redfish stack)
 for triage and remediation. Authentication uses the Redfish SessionService with
 an HTTP Basic fallback; TLS certificate verification is disabled for the typical
-self-signed BMC leaf.`,
+self-signed BMC leaf. Use a trusted, restricted management path and only targets
+you are authorized to administer. State-changing operations execute immediately;
+there is no general dry-run mode.`,
 }
 
 var redfishXDPCmd = &cobra.Command{
@@ -111,6 +114,9 @@ func runRedfishXDP(cmd *cobra.Command, host string, enable bool, port int, portS
 		action = "enable"
 	}
 
+	// Build the config: CurrentState always tracks enable/disable. On enable the
+	// nonsecure listener defaults on; other fields are only sent when the caller
+	// specifies them (or provides an explicit positional port).
 	cfg := redfish.RemoteXDPConfig{CurrentState: &enable}
 	if enable {
 		ns := true
@@ -149,7 +155,7 @@ func runRedfishXDP(cmd *cobra.Command, host string, enable bool, port int, portS
 		"httpStatus": patch.Status,
 		"ok":         patch.OK,
 	}
-
+	// Best-effort read-back of the resulting state.
 	if state, _, gerr := redfish.GetRemoteXDP(client, base, redfishManagerPath, headers, timeout); gerr == nil && state != nil {
 		out["state"] = state
 	}

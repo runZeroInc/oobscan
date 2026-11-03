@@ -1,3 +1,8 @@
+// Package check is the unified security-check registry. A Check declares which
+// device identities it applies to (Applicability) and a Run function; the
+// per-target pipeline asks ForIdentity for the ordered set of checks to run
+// (device-specific first, then cross-vendor). New checks register themselves
+// from init(), so adding one is a localized change with no pipeline edits.
 package check
 
 import (
@@ -12,10 +17,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/engine"
 )
 
+// Applicability declares which identities a check targets. A check is
+// device-specific when it names Classes or Vendors and is not CrossVendor;
+// CrossVendor (or a fully empty Applicability) marks a general check.
 type Applicability struct {
-	Classes     []engine.DeviceClass
-	Vendors     []string
-	CrossVendor bool
+	Classes     []engine.DeviceClass // empty = any class
+	Vendors     []string             // lowercase slugs; empty = any vendor
+	CrossVendor bool                 // runs regardless of vendor/class
 }
 
 func (ap Applicability) matches(id *engine.Identity) bool {
@@ -44,6 +52,11 @@ func proofKV(kv ...string) string {
 	return engine.F(kv...).String()
 }
 
+// vendorSlugField normalizes a free-form manufacturer / certificate-organization
+// string ("Super Micro Computer", "Dell Inc.") to a vendor slug, returning the field
+// to append or nothing when no alias matches. Normalizing here rather than in
+// engine.Finalize keeps engine free of the creds dependency and makes the attribution
+// visible in the output.
 func vendorSlugField(manufacturer string) engine.Fields {
 	slug := creds.NormalizeVendor(manufacturer)
 	if slug == "" {
@@ -52,14 +65,15 @@ func vendorSlugField(manufacturer string) engine.Fields {
 	return engine.Fields{engine.Field{Key: "vendor", Val: slug}}
 }
 
+// Check is one registered security check.
 type Check struct {
-	Name          string
+	Name          string // stable unique id, protocol-first, e.g. "http.idrac.defaultCreds"
 	Description   string
 	Category      string
 	Applies       Applicability
-	Authenticated bool
-	Destructive   bool
-	Enabled       bool
+	Authenticated bool // needs a credential to fire
+	Destructive   bool // may crash/reset the target
+	Enabled       bool // in the default set
 	Run           func(ctx context.Context, t *engine.Target) []engine.Finding
 }
 
@@ -71,6 +85,7 @@ var (
 	explainRegistry = map[string]func(host string, f engine.Finding) string{}
 )
 
+// Register adds a check, panicking on a duplicate Name (a programming error).
 func Register(c Check) {
 	canonical := engine.CanonicalCheckID(c.Name)
 	if canonical == "" {
@@ -87,6 +102,13 @@ func Register(c Check) {
 	registry[c.Name] = c
 }
 
+// RegisterExplain registers a markdown explainer for a specific finding name.
+// Called from init() in each check file, directly next to the Register call
+// that emits that finding. Panics on duplicate registration (programming error).
+// The finding name is the Check field on engine.Finding -- it often differs from
+// the registered check name because one check can emit several finding types
+// (e.g. "ipmi.defaultCreds" emits "ipmi.v20.cipherZero", "ipmi.v20.rakpHash",
+// "ipmi.v20.defaultCreds", etc.).
 func RegisterExplain(findingName string, fn func(host string, f engine.Finding) string) {
 	canonical := engine.CanonicalCheckID(findingName)
 	if canonical == "" {
@@ -103,6 +125,10 @@ func RegisterExplain(findingName string, fn func(host string, f engine.Finding) 
 	explainRegistry[findingName] = fn
 }
 
+// GetExplainer returns the explainer registered for a finding name, if any.
+// The confirmed web default-cred family emits per-vendor names
+// (http.<vendor>.defaultCreds) that render from the vendor field, so an exact
+// miss on that pattern falls back to the shared http.web.defaultCreds explainer.
 func GetExplainer(findingName string) (func(host string, f engine.Finding) string, bool) {
 	findingName = engine.CanonicalCheckID(findingName)
 	explainMu.RLock()
@@ -118,6 +144,7 @@ func GetExplainer(findingName string) (func(host string, f engine.Finding) strin
 	return nil, false
 }
 
+// All returns every registered check, sorted by category then name.
 func All() []Check {
 	mu.RLock()
 	defer mu.RUnlock()
@@ -134,6 +161,7 @@ func All() []Check {
 	return out
 }
 
+// Categories returns the sorted set of distinct categories.
 func Categories() []string {
 	seen := map[string]struct{}{}
 	for _, c := range All() {
@@ -147,22 +175,26 @@ func Categories() []string {
 	return out
 }
 
+// Selector folds the CLI knobs that decide whether a check runs.
 type Selector struct {
-	Checks      []string
-	Categories  []string
-	Destructive bool
-	HasCreds    bool
+	Checks      []string // --checks allow-list (name, category, or dotted prefix)
+	Categories  []string // --categories allow-list
+	Destructive bool     // --destructive
+	HasCreds    bool     // a credential was supplied
 }
 
 var selectionAliases = map[string][]string{
-
+	// These are emitted by the IPMI default-credential/auth pipeline rather than
+	// standalone registered checks. Let --checks on the leaf finding IDs select
+	// the producer that gathers the required RAKP/auth/setup evidence.
 	"ipmi.defaultCreds": {
 		"ipmi.openBmc.rakp1SetupCommands",
 		"ipmi.rakp.state.setupLocalPreRakp3",
-		"ipmi.rakp.state.setupIdentity",
+		"ipmi.rakp.state.activeRelabelLowToAdmin",
 	},
 }
 
+// checkIDTokenMatch reports exact check/finding-name or dotted-prefix matches.
 func checkIDTokenMatch(c Check, tokens []string) bool {
 	name := engine.CanonicalCheckID(c.Name)
 	for _, t := range tokens {
@@ -185,6 +217,7 @@ func checkIDTokenMatch(c Check, tokens []string) bool {
 	return false
 }
 
+// tokenMatch mirrors audit.Select: exact name, exact category, or dotted prefix.
 func tokenMatch(c Check, tokens []string) bool {
 	for _, t := range tokens {
 		t = strings.TrimSpace(t)
@@ -213,6 +246,8 @@ func (s Selector) hasExplicitTokens() bool {
 	return len(s.Checks) > 0 || len(s.Categories) > 0
 }
 
+// allow decides whether a check is eligible under the selector, independent of
+// the target identity.
 func (s Selector) allow(c Check) bool {
 	if c.Destructive && !s.Destructive {
 		return false
@@ -220,15 +255,20 @@ func (s Selector) allow(c Check) bool {
 	if c.Authenticated && !s.HasCreds && !s.explicitCheckRequest(c) {
 		return false
 	}
-
+	// An explicit --checks/--categories list overrides the default Enabled set.
 	if s.hasExplicitTokens() {
 		return s.explicitTokenMatch(c)
 	}
 	return c.Enabled
 }
 
+// ForIdentity returns the checks to run against a target, device-specific first
+// (vendor/class matches) then cross-vendor, filtered by the selector.
 func ForIdentity(id *engine.Identity, sel Selector) []Check {
-
+	// A host identify flagged as a honeypot/deception node runs only the identity
+	// reporter, which records the honeypot verdict; the whole credential/exposure
+	// battery is skipped. Exercising checks against a decoy wastes scan budget and
+	// manufactures bogus findings from its emulated services.
 	if id != nil && id.Class == engine.ClassHoneypot {
 		var only []Check
 		for _, c := range All() {

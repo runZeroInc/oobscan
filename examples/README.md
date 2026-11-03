@@ -22,3 +22,8 @@ In a real contribution:
 - A **device** is a literal appended to `oob.Registry` in
   `pkg/oob/registry.go`; a genuinely new `oob.Category` also needs a case in
   `pkg/identify/class.go`.
+
+Follow the [assessment safety guidance](../README.md#authorized-use-and-operational-safety).
+Describe each check's evidence, limitations, and remediation, and test that
+credential checks honor the login opt-out. Document every state-changing request
+and keep disruptive diagnostics explicitly selected by the operator.

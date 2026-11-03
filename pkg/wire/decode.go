@@ -1,3 +1,11 @@
+// Package wire holds small, dependency-free helpers shared by the
+// proprietary UDP/TCP protocol probes (Advantech ADAM, Red Lion UDR, Moxa
+// DSCI, Avocent adsap, ServerTech JAWS, Vertiv Velocity).
+//
+// The generic extractors (Printable/IPv4s/MACs) let a probe report every
+// human-meaningful token in a device response even when the exact byte
+// offsets of a proprietary reply were not reverse-engineered. A probe should
+// always also carry the raw hex so nothing in the response is lost.
 package wire
 
 import (
@@ -10,6 +18,9 @@ import (
 	"time"
 )
 
+// UDPQuery sends one datagram to host:port and returns the first datagram
+// read back. A connected UDP socket surfaces an ICMP port-unreachable as a
+// read error, which lets a caller distinguish closed from open|filtered.
 func UDPQuery(host string, port int, payload []byte, timeout time.Duration) ([]byte, error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -33,6 +44,9 @@ func UDPQuery(host string, port int, payload []byte, timeout time.Duration) ([]b
 	return append([]byte(nil), buf[:n]...), nil
 }
 
+// TCPQuery connects to host:port. It reports whether the connection opened.
+// If payload is non-nil it is written; then one read is attempted. A silent
+// server (open, no banner) returns open=true with a nil response.
 func TCPQuery(host string, port int, payload []byte, timeout time.Duration) (open bool, resp []byte, err error) {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
@@ -63,12 +77,16 @@ var (
 	reMAC       = regexp.MustCompile(`(?i)\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b`)
 )
 
+// Printable returns the unique printable-ASCII runs (length >= 3) found in
+// raw, in first-seen order.
 func Printable(raw []byte) []string {
 	return uniq(rePrintable.FindAllString(string(raw), -1))
 }
 
+// IPv4s returns the unique dotted-quad tokens found in raw.
 func IPv4s(raw []byte) []string { return uniq(reIPv4.FindAllString(string(raw), -1)) }
 
+// MACs returns the unique ASCII-form MAC tokens found in raw.
 func MACs(raw []byte) []string {
 	out := reMAC.FindAllString(string(raw), -1)
 	for i := range out {
@@ -77,6 +95,8 @@ func MACs(raw []byte) []string {
 	return uniq(out)
 }
 
+// MACFromBytes formats 6 raw bytes as a colon MAC, or "" if the slice is the
+// all-zero or all-0xFF placeholder (not a real address).
 func MACFromBytes(b []byte) string {
 	if len(b) < 6 {
 		return ""
@@ -97,6 +117,7 @@ func MACFromBytes(b []byte) string {
 	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x", b[0], b[1], b[2], b[3], b[4], b[5])
 }
 
+// Join renders a token list as a comma-separated field value.
 func Join(xs []string) string { return strings.Join(xs, ",") }
 
 func uniq(xs []string) []string {
@@ -113,6 +134,7 @@ func uniq(xs []string) []string {
 	return out
 }
 
+// SortedUniq is uniq with a stable sort, for fingerprint-style fields.
 func SortedUniq(xs []string) []string {
 	out := uniq(xs)
 	sort.Strings(out)

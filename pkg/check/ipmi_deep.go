@@ -10,6 +10,16 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// Most deep IPMI checks are higher-volume, session-opening RMCP+/RAKP probes
+// (SID client-correlation, OEM NetFn pre-session reachability, RAKP
+// rate-limit absence) that reopen many sessions against a (often
+// rate-limiting) BMC, so each gates on --ipmi-full and never runs by default;
+// a clean or unreachable result returns nil rather than a finding. The
+// exception is ipmi.sidEntropy/ipmi.sidPredictable, which runs by default
+// using a bounded, self-cleaning Open Session sampler (closes every session
+// it opens) and is ordered last in the serial IPMI lane (cmd/scan.go) so it
+// never takes a session slot an earlier, more important check -- RAKP hash
+// capture, default creds -- needs.
 func init() {
 	Register(Check{
 		Name:        "ipmi.sidEntropy",
@@ -45,6 +55,8 @@ func init() {
 	})
 }
 
+// deepIPMIUser resolves the username for RAKP probes: the configured credential
+// user, or "admin" when none is set. (Inlined from the audit auditUser helper.)
 func deepIPMIUser(t *engine.Target) string {
 	if t.Cred.User != "" {
 		return t.Cred.User
@@ -52,6 +64,8 @@ func deepIPMIUser(t *engine.Target) string {
 	return "admin"
 }
 
+// minP returns the smallest per-bit p-value across the 32 SID bits. (Inlined
+// from the audit minP helper.)
 func minP(xs [32]float64) float64 {
 	m := 1.0
 	for _, x := range xs {
@@ -62,6 +76,12 @@ func minP(xs [32]float64) float64 {
 	return m
 }
 
+// runIPMISIDEntropy samples the BMC-assigned managed session ID a handful of
+// times and flags a predictable or low-entropy assignment (static, fixed-step,
+// or confined to a tiny window). Unlike the other deep IPMI checks it runs in
+// the default scan -- the sampler (ipmi.SampleSessionIDs) opens and immediately
+// closes each session, so it cannot exhaust the BMC's session table -- and takes
+// a few more samples under --ipmi-full for extra confidence.
 func runIPMISIDEntropy(ctx context.Context, t *engine.Target) []engine.Finding {
 	_ = ctx
 	if !t.IsOpen(t.IPMIPort(), "udp") {
@@ -82,6 +102,9 @@ func runIPMISIDEntropy(ctx context.Context, t *engine.Target) []engine.Finding {
 	return stampIPMI([]engine.Finding{*finding}, t.IPMIPort())
 }
 
+// sidFinding classifies sampled managed SIDs and builds the finding, or nil when
+// the sample is too small or well-distributed. A Supermicro/ATEN box (whose
+// small-SID-space defect is the archetype) is scored critical; others high.
 func sidFinding(t *engine.Target, samples []uint32) *engine.Finding {
 	cls, weak := ipmi.ClassifySessionIDs(samples)
 	if !weak {
@@ -90,15 +113,14 @@ func sidFinding(t *engine.Target, samples []uint32) *engine.Finding {
 	risk := "high"
 	checkID := cls.CheckID()
 	smc := t != nil && t.Identity != nil && strings.EqualFold(t.Identity.Vendor, "supermicro")
-	var cve []string
 	if smc {
 		risk = "critical"
-		if checkID == "ipmi.sidPredictable" {
-			cve = []string{"CVE-2026-65217"}
-		}
 	}
+	// No CVE is attached: the Supermicro/ATEN counter defect this reports
+	// (SMC-0011) carries a disputed identifier, so the finding stands on its
+	// own check id and evidence.
 	return &engine.Finding{
-		Check: checkID, Category: "sid", Risk: risk, CVE: cve,
+		Check: checkID, Category: "sid", Risk: risk,
 		Fields: engine.F(
 			"pattern", cls.Pattern,
 			"samples", fmt.Sprintf("%d", len(samples)),
@@ -109,6 +131,11 @@ func sidFinding(t *engine.Target, samples []uint32) *engine.Finding {
 	}
 }
 
+// runIPMISIDClientCorr measures mutual information between the client-supplied
+// Remote Console SID and the BMC-assigned managed SID, under randomized input
+// order (a fixed order correlates spuriously with a merely-monotonic PRNG).
+// Ported from audit case ipmi.sid.client.corr (SevHigh). Fires only when at
+// least one managed-SID bit is significantly correlated after randomization.
 func runIPMISIDClientCorr(ctx context.Context, t *engine.Target) []engine.Finding {
 	if !t.IPMIFull {
 		return nil
@@ -119,7 +146,7 @@ func runIPMISIDClientCorr(ctx context.Context, t *engine.Target) []engine.Findin
 	}
 	cfg := &ipmi.SIDCorrelationConfig{
 		RandomizeInputOrder: true,
-		Seed:                0,
+		Seed:                0, // time-seed unavailable in the check context
 		ConfidenceLevel:     0.95,
 		Logf:                t.Progress,
 	}
@@ -128,7 +155,7 @@ func runIPMISIDClientCorr(ctx context.Context, t *engine.Target) []engine.Findin
 		return nil
 	}
 	if len(res.SignificantBits) == 0 {
-
+		// No statistically significant client->managed correlation: emit nothing.
 		return nil
 	}
 	mp := minP(res.PerBitPValue)
@@ -142,17 +169,21 @@ func runIPMISIDClientCorr(ctx context.Context, t *engine.Target) []engine.Findin
 	}}, t.IPMIPort())
 }
 
+// runIPMINetFnOEM sweeps a sample of OEM NetFn commands (0x2E-0x3F) pre-session
+// and flags any command that returns CC=0x00 (success without auth). Ported from
+// audit case ipmi.netfn.oem.presession (SevCritical). Emits nothing when nothing
+// is accepted.
 func runIPMINetFnOEM(ctx context.Context, t *engine.Target) []engine.Finding {
 	if !t.IPMIFull {
 		return nil
 	}
-
+	// Fast audit sample; the exhaustive sweep lives in ipmi.fullWalk / --destructive.
 	sampleCmds := []byte{0x00, 0x01, 0x02, 0x03, 0x10, 0x11, 0x40, 0x41, 0x80, 0x81, 0xFE, 0xFF}
 	res, err := ipmi.SweepOEMNetFnsSample(t.Host, t.IPMIPort(), ipmi.SweepPreSession, sampleCmds, t.Timeout, t.Progress)
 	if err != nil || res == nil || len(res.Accepted) == 0 {
 		return nil
 	}
-
+	// Build a terse evidence list (cap at 20 to keep output readable).
 	n := min(len(res.Accepted), 20)
 	var ev strings.Builder
 	for i := range n {
@@ -175,12 +206,18 @@ func runIPMINetFnOEM(ctx context.Context, t *engine.Target) []engine.Finding {
 	}}, t.IPMIPort())
 }
 
+// runIPMIRAKPRateLimit checks whether a burst of RAKP-1 messages is throttled or
+// locked out at the network layer. Ported from audit case
+// ipmi.rakp.ratelimit.absent (SevMedium for the unthrottled FAIL; the partial /
+// full-throttle outcomes were WARN -> medium). A baseline must work first, else
+// we cannot tell "throttled" from "unreachable" and emit nothing.
 func runIPMIRAKPRateLimit(ctx context.Context, t *engine.Target) []engine.Finding {
 	if !t.IPMIFull {
 		return nil
 	}
 	user := deepIPMIUser(t)
-
+	// Baseline: a single unhurried Open Session must work (it returns a BMC SID
+	// for any username before user validation), otherwise skip (emit nothing).
 	base, _ := ipmi.DoRAKP12(t.Host, t.IPMIPort(), user, ipmi.RAKPHMACSHA1, ipmi.IntegrityNone, ipmi.ConfNone, t.Timeout)
 	if base == nil || base.BMCSID == 0 {
 		return nil
@@ -203,14 +240,15 @@ func runIPMIRAKPRateLimit(ctx context.Context, t *engine.Target) []engine.Findin
 	el := time.Since(t0).Round(time.Millisecond)
 	switch {
 	case ok >= N-1:
-
+		// Baseline works and the burst is unthrottled -> the vulnerable case.
 		return stampIPMI([]engine.Finding{{
 			Check: "ipmi.rakpRatelimit", Category: "auth", Risk: "medium",
 			Fields: engine.F(
 				"proof", proofKV("baseline", "ok", "attempts", fmt.Sprintf("%d", N), "succeeded", fmt.Sprintf("%d", ok), "elapsed", el.String(), "throttle", "none")),
 		}}, t.IPMIPort())
 	case ok == 0:
-
+		// Baseline worked but the whole burst was dropped -> a mild mitigation
+		// (distinct from unreachable), still WARN -> medium in the source case.
 		return stampIPMI([]engine.Finding{{
 			Check: "ipmi.rakpRatelimit", Category: "auth", Risk: "medium",
 			Fields: engine.F(

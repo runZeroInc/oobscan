@@ -4,6 +4,9 @@ package engine
 
 import "syscall"
 
+// raiseFileLimit bumps RLIMIT_NOFILE toward the largest value the OS will
+// accept, so a high worker count doesn't exhaust file descriptors. Ported from
+// sshamble. Best-effort: failure is silently ignored.
 func raiseFileLimit() {
 	var lim syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {

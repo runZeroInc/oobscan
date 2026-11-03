@@ -7,17 +7,30 @@ import (
 	"time"
 )
 
+// DCMICapabilities holds the parsed reply to Get DCMI Capabilities Info (Group Extension
+// NetFn 0x2C / Cmd 0x01, group ID 0xDC, parameter selector 0x01 = Supported DCMI
+// capabilities). A valid reply confirms the DCMI group extension, and the version plus
+// parameter revision are a sessionless fingerprint. The command is answered without a
+// session on BMCs that gate group-extension discovery on the 0xDC group byte, so it belongs
+// with the other unauthenticated reads.
 type DCMICapabilities struct {
-	MajorVersion  byte
-	MinorVersion  byte
-	ParamRevision byte
-	ParamData     []byte
+	MajorVersion  byte   // DCMI specification conformance, major (e.g. 1)
+	MinorVersion  byte   // DCMI specification conformance, minor (e.g. 5 => DCMI 1.5)
+	ParamRevision byte   // parameter data revision
+	ParamData     []byte // raw parameter data for the Supported-capabilities selector
 }
 
+// Version renders the DCMI specification version as major.minor.
 func (d *DCMICapabilities) Version() string {
 	return fmt.Sprintf("%d.%d", d.MajorVersion, d.MinorVersion)
 }
 
+// GetDCMICapabilities15 sends an unauthenticated Get DCMI Capabilities Info
+// (NetFn Group 0x2C / Cmd 0x01) over the sessionless IPMI 1.5 wrapper. The
+// request carries the DCMI group ID (0xDC) followed by a parameter selector
+// (0x01 = Supported DCMI capabilities). A non-DCMI BMC drops the request or
+// returns a non-zero completion code; a DCMI BMC echoes the 0xDC group byte and
+// its spec version.
 func GetDCMICapabilities15(host string, port int, timeout time.Duration) (*DCMICapabilities, error) {
 	c, err := NewClient(host, port, timeout)
 	if err != nil {
@@ -32,6 +45,12 @@ func GetDCMICapabilities15(host string, port int, timeout time.Duration) (*DCMIC
 	return ParseDCMICapabilitiesReply(reply)
 }
 
+// ParseDCMICapabilitiesReply parses a Get DCMI Capabilities Info reply. It anchors on the
+// IPMB response header (rsAddr 0x81/0x8c followed by rqAddr 0x20), the same anchoring as
+// ParseDeviceIDReply, then reads the completion code at start+6 and the data at start+7:
+// group ID, major version, minor version, parameter revision, parameter data. The group ID
+// has to be 0xDC, which is what separates a DCMI reply from a generic Group Extension
+// error/echo; anything else is rejected rather than mis-reported as DCMI-capable.
 func ParseDCMICapabilitiesReply(reply []byte) (*DCMICapabilities, error) {
 	start := -1
 	for i := 0; i+7 < len(reply); i++ {
@@ -64,6 +83,8 @@ func ParseDCMICapabilitiesReply(reply []byte) (*DCMICapabilities, error) {
 	return dc, nil
 }
 
+// SupportedCapsHex returns the raw Supported-DCMI-capabilities parameter bytes
+// as hex, or "" when absent. Reported as evidence for later analysis.
 func (d *DCMICapabilities) SupportedCapsHex() string {
 	if len(d.ParamData) == 0 {
 		return ""

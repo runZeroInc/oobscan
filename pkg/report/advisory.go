@@ -22,6 +22,9 @@ var advisoryRisks = map[string]int{
 	"INFO":     1,
 }
 
+// LoadAdvisoryInventory reads the standalone advisory files under root and the
+// disclosure-state table in README.md. Counts come from the files themselves;
+// only coordination state comes from the inventory table.
 func LoadAdvisoryInventory(root string) (AdvisoryView, error) {
 	view := AdvisoryView{}
 	riskCounts := newCounter()

@@ -13,6 +13,15 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/scanfile"
 )
 
+// This file holds the source-independent runZero model and its projection onto the
+// native schema. Both runZero inputs (SQL asset+services export, flattened services
+// export) decode into rzHost; everything downstream is shared.
+//
+// The projection is lossless-first: every service_data key and asset attribute is
+// carried through verbatim into the per-service and host attribute bags, and only
+// then is the native view (identity, findings, RAKP rows) derived on top.
+
+// rzService is one runZero service with its flattened service_data bag.
 type rzService struct {
 	Port      int
 	Transport string
@@ -23,6 +32,7 @@ type rzService struct {
 	Data      map[string]string
 }
 
+// get returns a service_data value, tolerating a nil map.
 func (s *rzService) get(key string) string {
 	if s.Data == nil {
 		return ""
@@ -30,14 +40,17 @@ func (s *rzService) get(key string) string {
 	return s.Data[key]
 }
 
+// hasProto reports whether the service advertises the named protocol.
 func (s *rzService) hasProto(name string) bool {
 	return slices.Contains(s.Protocols, name)
 }
 
+// portKey renders the oobscan open-port key ("623/udp").
 func (s *rzService) portKey() string {
 	return fmt.Sprintf("%d/%s", s.Port, s.Transport)
 }
 
+// rzAsset is the asset-level view of a runZero export.
 type rzAsset struct {
 	ID             string
 	Type           string
@@ -60,11 +73,14 @@ type rzAsset struct {
 	Unindexed      map[string]string
 }
 
+// rzHost is one runZero asset with all of its services.
 type rzHost struct {
 	asset    rzAsset
 	services []rzService
 }
 
+// addr returns the host address for the record: the asset's first address,
+// falling back to the first address any of its services was seen on.
 func (h *rzHost) addr() string {
 	for _, a := range h.asset.Addresses {
 		if a = strings.TrimSpace(a); a != "" {
@@ -79,6 +95,7 @@ func (h *rzHost) addr() string {
 	return ""
 }
 
+// record projects the runZero host onto an oobscan record.
 func (h *rzHost) record() *scanfile.Record {
 	rec := &scanfile.Record{
 		Host:       h.addr(),
@@ -90,6 +107,9 @@ func (h *rzHost) record() *scanfile.Record {
 	rec.Identity = h.identity()
 	rec.Findings = h.findings()
 
+	// Reuse the scanner's own id.final derivation so a converted host carries the
+	// same flags/topRisk projection a scanned one does, rather than a second
+	// implementation that could drift from it.
 	rec.Final = engine.Finalize(&engine.Target{
 		Host:     rec.Host,
 		Open:     rec.Ports,
@@ -99,6 +119,7 @@ func (h *rzHost) record() *scanfile.Record {
 	return rec
 }
 
+// ports renders the services as the oobscan open-port map.
 func (h *rzHost) ports() engine.OpenPorts {
 	if len(h.services) == 0 {
 		return nil
@@ -110,7 +131,8 @@ func (h *rzHost) ports() engine.OpenPorts {
 			continue
 		}
 		key := s.portKey()
-
+		// A service seen on several addresses of the same asset repeats its port;
+		// merge the protocol lists instead of letting the last row win.
 		ports[key] = engine.SortedCSVString(joinCSV(ports[key], strings.Join(s.Protocols, ",")))
 	}
 	if len(ports) == 0 {
@@ -119,6 +141,8 @@ func (h *rzHost) ports() engine.OpenPorts {
 	return ports
 }
 
+// serviceRecords projects the runZero services onto oobscan service records,
+// preserving the whole service_data bag.
 func (h *rzHost) serviceRecords() []output.ServiceRecord {
 	if len(h.services) == 0 {
 		return nil
@@ -148,6 +172,10 @@ func (h *rzHost) serviceRecords() []output.ServiceRecord {
 	return out
 }
 
+// attributes renders the asset-level bag: every raw runZero attribute, then the
+// typed asset columns under their runZero names, then the oobscan-canonical
+// class/vendor/product/version. Later writes win, so the canonical keys and the
+// typed columns are authoritative over a same-named raw attribute.
 func (h *rzHost) attributes() map[string]string {
 	a := h.asset
 	out := boundedAttrs(a.Unindexed)
@@ -162,7 +190,8 @@ func (h *rzHost) attributes() map[string]string {
 		}
 	}
 	setList := func(k string, v []string) {
-
+		// Tab separation is runZero's own multi-value convention; keeping it means
+		// a converted record reads the same way the source did.
 		set(k, strings.Join(v, "\t"))
 	}
 	set("type", a.Type)
@@ -193,6 +222,10 @@ func (h *rzHost) attributes() map[string]string {
 	return out
 }
 
+// identity resolves the oobscan identity from the runZero asset columns, with
+// the observed services as the tiebreaker. Confidence is high when runZero
+// itself typed the device as out-of-band gear and medium when the class was
+// recovered from a port or protocol.
 func (h *rzHost) identity() *engine.Identity {
 	class, fromType := h.class()
 	conf := engine.ConfMedium
@@ -215,6 +248,8 @@ func (h *rzHost) identity() *engine.Identity {
 	return id
 }
 
+// identityAttrs carries the identity-shaped facts oobscan's own identify step
+// would have recorded, so id.final can read a version off them.
 func (h *rzHost) identityAttrs() map[string]string {
 	attrs := map[string]string{}
 	if v := h.version(); v != "" {
@@ -237,6 +272,8 @@ func (h *rzHost) identityAttrs() map[string]string {
 	return attrs
 }
 
+// signals records where the attribution came from, mirroring the Signal rows a
+// live identify pass would have produced.
 func (h *rzHost) signals() []engine.Signal {
 	var sigs []engine.Signal
 	if h.asset.Type != "" || h.asset.HWVendor != "" || h.asset.OSVendor != "" {
@@ -259,6 +296,7 @@ func (h *rzHost) signals() []engine.Signal {
 	return sigs
 }
 
+// version resolves a firmware/software version for the host.
 func (h *rzHost) version() string {
 	if v := firstNonEmpty(h.asset.OSVersion, h.asset.HWVersion); v != "" {
 		return v
@@ -274,6 +312,9 @@ func (h *rzHost) version() string {
 	return ""
 }
 
+// vendor resolves the lowercase oobscan vendor slug. It prefers the hardware
+// vendor (a BMC's own maker) over the OS vendor, and falls back to the IPMI
+// GUID vendor, which is the one vendor signal a sessionless probe always gets.
 func (h *rzHost) vendor() string {
 	cands := []string{h.asset.HWVendor, h.asset.HWProduct, h.asset.OSVendor, h.asset.OSProduct, h.asset.HW, h.asset.OS}
 	for i := range h.services {
@@ -288,6 +329,9 @@ func (h *rzHost) vendor() string {
 	return ""
 }
 
+// rzTypeClass maps a runZero asset type onto an oobscan device class. Matching
+// is on a lowercased substring because the runZero type vocabulary is
+// fingerprint-driven and not a closed set.
 var rzTypeClass = []struct {
 	match string
 	class engine.DeviceClass
@@ -304,6 +348,15 @@ var rzTypeClass = []struct {
 	{"console server", engine.ClassSerialConsole},
 }
 
+// class resolves the device class, reporting whether runZero's own asset type
+// decided it rather than a service-shape inference.
+//
+// The service fallback accepts only a positive discriminator: the IPMI protocol or
+// its attributes, or one of the two dedicated Intel AMT ports. It must not class
+// off the KVM/virtual-media port list even though those ports do produce a
+// kvm.exposure finding, because a host exposing a sequential serial-console range
+// collides with that list by arithmetic accident. A wrong class propagates into
+// every downstream count, so an unclassed host is the better failure.
 func (h *rzHost) class() (engine.DeviceClass, bool) {
 	t := strings.ToLower(strings.TrimSpace(h.asset.Type))
 	for _, r := range rzTypeClass {
@@ -327,6 +380,8 @@ func (h *rzHost) class() (engine.DeviceClass, bool) {
 	return engine.ClassUnknown, false
 }
 
+// boundedAttrs copies an attribute bag, dropping empty keys and capping
+// oversized values at the emitted-record ceiling. Returns nil when empty.
 func boundedAttrs(in map[string]string) map[string]string {
 	if len(in) == 0 {
 		return nil
@@ -347,6 +402,7 @@ func boundedAttrs(in map[string]string) map[string]string {
 	return out
 }
 
+// truncUTF8 truncates s to at most max bytes without splitting a rune.
 func truncUTF8(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -361,6 +417,7 @@ func truncUTF8(s string, max int) string {
 	return string(b)
 }
 
+// tabValues splits a runZero multi-value attribute (tab separated).
 func tabValues(v string) []string {
 	if v == "" {
 		return nil
@@ -375,6 +432,7 @@ func tabValues(v string) []string {
 	return out
 }
 
+// containsFlag reports whether a tab-separated flag string contains flag.
 func containsFlag(val, flag string) bool {
 	return slices.Contains(tabValues(val), flag)
 }

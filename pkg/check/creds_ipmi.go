@@ -11,6 +11,11 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// The IPMI credential check is the heart of the default scan: it extracts the
+// pre-auth RAKP-2 hash (CVE-2013-4786), cracks it offline against the vendor-
+// prioritized default-credential knowledge base (no lockout risk), and - for
+// BMCs that do not leak - falls back to a capped online RAKP-3/4 login. It also
+// flags cipher-0 (CVE-2013-4782) and missing username validation.
 func init() {
 	Register(Check{
 		Name:        "ipmi.defaultCreds",
@@ -22,6 +27,8 @@ func init() {
 	})
 }
 
+// userLabel renders a username for display, showing the null/anonymous account
+// as "(null)" instead of an empty string.
 func userLabel(u string) string {
 	if u == "" {
 		return "(null)"
@@ -29,6 +36,8 @@ func userLabel(u string) string {
 	return u
 }
 
+// rakpAuthAlgoName maps the RAKP authentication algorithm byte to a short
+// label suitable for the ipmi.v20.rakpHash finding's hashAlgo field.
 func rakpAuthAlgoName(a byte) string {
 	switch a {
 	case ipmi.RAKPHMACSHA1:
@@ -44,6 +53,9 @@ func rakpAuthAlgoName(a byte) string {
 	}
 }
 
+// allZeroBytes reports whether every byte in b is 0x00. Used to flag
+// RAKP-1 bmc_rand fields that collapse the offline-crack salt to a trivial
+// constant on some Supermicro X9 firmwares.
 func allZeroBytes(b []byte) bool {
 	for _, c := range b {
 		if c != 0 {
@@ -63,11 +75,13 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 	}
 	opts := ipmi.AuthOptions{
 		Vendor:       vendor,
-		Online:       !t.DisableLogins,
+		Online:       !t.DisableLogins, // active RAKP-3/4 only fires when the hash does not leak
 		OfflineCrack: true,
 		Timeout:      t.Timeout,
 	}
-
+	// Pass the advertised cipher suites (identify stashed them) so RAKP negotiates
+	// a suite the BMC accepts - hardened BMCs (OpenBMC = suite 17) reject weak
+	// integrity/confidentiality and won't hand out a RAKP-2 otherwise.
 	if v, ok := t.Evidenced("ipmi.ciphers"); ok {
 		if ids, ok := v.([]int); ok {
 			opts.Ciphers = ids
@@ -99,14 +113,17 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 	t.SetEvidence("ipmi.auth", rep)
 
 	var findings []engine.Finding
-
+	// Cipher suite 0 is confirmed here: RunAuth actually opened an RMCP+ session
+	// with auth algorithm None (rep.CipherZero), not just an advertised suite.
+	// Session establishment alone does not establish administrative reach.
 	if rep.CipherZero {
 		findings = append(findings, engine.Finding{
 			Check: "ipmi.v20.cipherZero", Category: "auth", Risk: "critical",
 			CVE: []string{"CVE-2013-4782"},
 			Fields: engine.F(
 				"suite", "0",
-
+				// The BMC-assigned session ID is the evidence a no-auth session opened;
+				// restating the constants this branch already tested would prove nothing.
 				"bmcSessionId", fmt.Sprintf("0x%08x", rep.CipherZeroSID),
 				"proof", fmt.Sprintf("openSessionCc=0x00 bmcSessionId=0x%08x", rep.CipherZeroSID),
 			),
@@ -119,7 +136,8 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 				"test", "random_16hex_username",
 				"result", "wildcardUsername",
 				"wildcard", "true",
-
+				// Name the nonexistent account the BMC accepted, and the session it opened
+				// for it, so the proof varies per host.
 				"acceptedUsername", rep.FakeUsernameProbe,
 				"proof", fmt.Sprintf("rakp2Cc=0x00 acceptedUsername=%s bmcSessionId=0x%08x",
 					rep.FakeUsernameProbe, rep.FakeUsernameSID),
@@ -130,7 +148,9 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 		t.SetEvidence("ipmi.openBmcSetupState", p)
 		if p.SetupCommandsWork {
 			findings = append(findings, engine.Finding{
-
+				// Reported at info: setup-state local command authorization before
+				// RAKP3 password proof is currently a quirk of the RMCP+ setup
+				// session, not a confirmed standalone exposure.
 				Check: "ipmi.rakp.state.setupLocalPreRakp3", Category: "auth", Risk: "info", Fields: append(engine.F(
 					"username", userLabel(p.Username),
 					"suite", fmt.Sprintf("%d", p.Suite),
@@ -143,18 +163,22 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 			})
 		}
 	}
-
+	// One finding per account with a leaked RAKP-2 hash (CVE-2013-4786). The
+	// crackable hashcat -m 7300 line (or raw salt:hash for MD5/SHA256) is a field
+	// so it can be lifted straight into a cracker; the recovered plaintext and
+	// whether it is a default are separate fields.
 	for i := range rep.Results {
 		r := &rep.Results[i]
 		if len(r.RAKPHash) == 0 {
 			continue
 		}
-
+		// SMCRAKP fixed-key path is not an offline password leak for a user
+		// credential, so do not emit the generic RAKP hash finding.
 		if (r.Crack != nil && r.Crack.PasswordType == "smcrakp-fixed-key") || r.UsesSMCRAKPFixedKey() {
 			continue
 		}
 		line := r.Hashcat()
-		if line == "" {
+		if line == "" { // hashcat -m 7300 is SHA1-only; raw salt:hash otherwise
 			line = r.SaltHashLine()
 		}
 		algName := rakpAuthAlgoName(r.AuthAlgo)
@@ -163,7 +187,9 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 			"hash", line,
 			"hashAlgo", algName,
 		)
-
+		// bmc_rand entropy signal: an all-zero 16-byte BMC random makes offline
+		// cracking near-trivial (the salt collapses on the RAKP-1 nonce). Flag
+		// it so downstream triage can prioritise these hashes.
 		if len(r.BMCRand) > 0 && allZeroBytes(r.BMCRand) {
 			f = append(f, engine.Field{Key: "crackableZeroRand", Val: "true"})
 		}
@@ -187,14 +213,25 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 			Fields: f, CVE: []string{"CVE-2013-4786"},
 		})
 	}
-
+	// Recovered credentials. On a username-validating BMC the RAKP-2 HMAC matching
+	// the password is cryptographic proof of a working credential (critical). On an
+	// accepts-any-username BMC the recovered key cannot be attributed to an account
+	// from the hash alone, so it is only critical when an actual RAKP-3/4 login
+	// confirms it; otherwise it is a downgraded candidate.
 	for _, cr := range rep.Cracked {
 		if cr.PasswordType == "smcrakp-fixed-key" {
 			username := firstNonEmptySMCRAKP(cr.Username, smcrakpResultUsername(rep), "")
+			// The bypass is only exploitable when a forged session actually executes
+			// an unprotected (no-integrity/no-encrypt) command - the ATEN H3 path.
+			// If the BMC forges the session but enforces per-session integrity and
+			// rejects the cleartext command (X14/OpenBMC), SMCRAKP is enabled but not
+			// command-exploitable: report it low rather than as a working bypass.
 			exploitable := cr.CommandCapable
 			risk := "low"
 			state := "enabled-not-exploitable"
 			if exploitable {
+				// Unauthenticated IPMI command execution over a forged session (read
+				// users/hashes, power control, etc.) - a full auth bypass.
 				risk = "critical"
 				state = "exploitable"
 			}
@@ -233,7 +270,7 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 				Check:    "ipmi.v20.smcrakpBypass",
 				Category: "auth",
 				Risk:     risk,
-				CVE:      []string{"CVE-2026-65214"},
+				CVE:      []string{"CVE-2026-18449"},
 				Fields:   fields,
 			})
 			continue
@@ -251,7 +288,8 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 		var risk string
 		switch {
 		case cr.Verified:
-
+			// RAKP-2 HMAC matched the recovered password (or an RAKP-3/4 login
+			// completed): a usable credential. The recovered pass is in the field.
 			risk = "critical"
 			proof := cr.Proof
 			if proof == "" {
@@ -259,11 +297,11 @@ func runIPMICreds(ctx context.Context, t *engine.Target) []engine.Finding {
 			}
 			f = append(f, engine.Field{Key: "proof", Val: proof})
 		case cr.LoginTested:
-
+			// Accepts-any BMC, login attempted and did not complete: candidate key.
 			risk = "medium"
 			f = append(f, engine.Field{Key: "proof", Val: proofKV("state", "candidate", "loginTested", "true", "loginSucceeded", "false")})
 		default:
-
+			// Accepts-any BMC in offline mode: cannot disambiguate without a login.
 			risk = "medium"
 			f = append(f, engine.Field{Key: "proof", Val: proofKV("state", "candidate", "loginTested", "false", "verified", "false")})
 		}
@@ -362,7 +400,12 @@ func isLikelyOpenBMC(t *engine.Target, vendor string) bool {
 	if strings.EqualFold(vendor, "openbmc") {
 		return true
 	}
-
+	// H3C HDM3 (2.06.02+) runs netipmid, forked from the phosphor-net-ipmid
+	// reference, so it shares the OpenBMC family's active-session RAKP1 relabel
+	// and setup-state primitives. HDM2 is Debian-based (not OpenBMC) but the
+	// probe self-proves and emits nothing there, so gating on the h3c vendor is
+	// safe even though pre-auth identification never sets an openbmc/phosphor
+	// product string for it.
 	if strings.EqualFold(vendor, "h3c") {
 		return true
 	}

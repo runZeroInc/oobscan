@@ -39,12 +39,18 @@ var (
 	hashcrackImportPots  []string
 )
 
+// hashcrackCmd cracks the RAKP HMAC hashes captured in scan JSONL, natively for
+// all three algorithms (SHA1/MD5/SHA256).
 var hashcrackCmd = &cobra.Command{
 	Use:   "hashcrack [flags] <scan.jsonl>...",
-	Short: "Crack IPMI RAKP hashes (SHA1/MD5/SHA256) from scan results offline.",
-	Long: `hashcrack reads one or more oobscan scan JSONL files and cracks the captured
-IPMI RAKP HMAC hashes offline, using all CPU cores. Unlike hashcat / stock John
-(SHA1 only), it cracks HMAC-MD5 and HMAC-SHA256 too -- the majority of hosts.
+	Short: "Audit captured IPMI RAKP hashes for weak passwords offline.",
+	Long: `hashcrack audits IPMI RAKP HMAC hashes from authorized scan results for
+recoverable passwords. It supports HMAC-SHA1, HMAC-MD5, and HMAC-SHA256 and uses
+all CPU cores. This operation does not contact the scanned devices.
+
+Use only authentication material within the assessment scope. Recovered
+passwords, terminal output, and potfiles are sensitive evidence: restrict access
+and retention, and rotate exposed credentials through an approved process.
 
 Candidate sources, tried in order:
   1. common BMC defaults + light variations (always on; --no-defaults to skip,
@@ -74,7 +80,7 @@ needed):
 
 Examples:
   oobscan hashcrack results.jsonl
-  oobscan hashcrack --wordlist rockyou.txt --pattern '?d?d?d?d?d?d' oob*.json
+	oobscan hashcrack --wordlist audit-passwords.txt --pattern '?d?d?d?d?d?d' results.jsonl
   oobscan hashcrack --ciphers md5,sha256 --potfile rakp.pot results.jsonl
   oobscan hashcrack --import-pot hashcat.potfile --import-pot john.pot results.jsonl
   oobscan hashcrack --show`,
@@ -107,9 +113,13 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		lg.Warn(strings.TrimRight(fmt.Sprintf(format, a...), "\n"))
 	}
 
+	// Resolve and load the potfile up front: --import-pot writes into it, and
+	// both --show and resume read from it.
 	hashcrackPotfile = resolvePotfilePath(hashcrackPotfile)
 	pot := loadPotfile(hashcrackPotfile)
 
+	// Import external hashcat/John pot files before anything else, so imported
+	// cracks are immediately available to --show and to resume-skip.
 	if len(hashcrackImportPots) > 0 {
 		added, parsed, unparsed, ierr := importPotfiles(hashcrackImportPots, hashcrackPotfile, pot)
 		if ierr != nil {
@@ -122,6 +132,8 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 			"potfile", hashcrackPotfile)
 	}
 
+	// Potfile-only modes need no scan files: --show dumps every cracked hash,
+	// and a bare --import-pot just merges and exits.
 	if len(args) == 0 {
 		switch {
 		case hashcrackShow:
@@ -177,11 +189,15 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("no RAKP hashes found in the given scan file(s)")
 	}
 
+	// --show is read-only: display the cracked credentials for the loaded hosts
+	// and stop, without opening the potfile for append or running the SMC / pot
+	// pre-solve pass (which would mutate the potfile).
 	if hashcrackShow {
 		showCrackedFromPot(hashes, pot)
 		return nil
 	}
 
+	// Potfile resume uses the pot loaded (and possibly imported into) up top.
 	var potMu sync.Mutex
 	var potFH *os.File
 	if hashcrackPotfile != "" {
@@ -194,6 +210,7 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Results sink.
 	var results []crackOut
 	var resMu sync.Mutex
 	var outFH *os.File
@@ -206,6 +223,7 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		defer outFH.Close()
 	}
 
+	// record captures a newly cracked password (append to potfile + print live).
 	record := func(h *hashcrack.Hash, pw string) {
 		co := crackOut{IP: h.IP, Vendor: h.Vendor, Product: h.Product, Version: h.Version,
 			Services: h.Services, Username: h.Username, Password: pw, Algo: hashcrack.AlgoName(h.Algo), Source: h.Source}
@@ -230,6 +248,7 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 			"pass", pw)
 	}
 
+	// Apply potfile pre-solves; drop those hashes from the active set.
 	active := hashes[:0]
 	preSolved := 0
 	fixedKeySolved := 0
@@ -288,6 +307,10 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		lg.Info("Proceeding with wordlist", "path", wl)
 	}
 
+	// Harvest cleartext user/pass observed in the scans (RAKP usernames, cracked
+	// passwords, default-login hits, enumerated accounts) plus every password
+	// already cracked in the potfile, and reuse them as always-on candidates. In
+	// --deep they also seed permutations. --no-scan-creds opts out.
 	var extraSeeds []string
 	if !hashcrackNoScanCreds {
 		seedSet := map[string]struct{}{}
@@ -310,7 +333,8 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 			addSeed(s)
 		}
 		scanSeeds := len(extraSeeds)
-
+		// Cracked passwords already in the potfile: a password recovered on any
+		// prior run is worth trying against every remaining host+account.
 		for _, pw := range pot {
 			addSeed(pw)
 		}
@@ -323,6 +347,7 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Candidate producer -> batched channel.
 	stop := make(chan struct{})
 	rawCands := make(chan []string, 64)
 	cands := make(chan []string, 64)
@@ -354,6 +379,7 @@ func runHashcrack(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
+	// Progress ticker + on-demand status (press Enter in TTY mode).
 	start := time.Now()
 	stats := &hashcrack.CrackStats{}
 	doneCh := make(chan struct{})
@@ -490,6 +516,9 @@ func printCrackSummary(results []crackOut, tally hashcrack.Tally, preSolved int,
 	log().Info("Tip: use hashcrack --show to display cracked results from the potfile")
 }
 
+// showEntirePot prints every cracked password in the potfile, independent of
+// any scan. Without scan context there is no host/username to attribute, so it
+// keys each row on the HMAC (the hash's stable identity) plus its algorithm.
 func showEntirePot(pot map[string]string) {
 	lg := log()
 	keys := make([]string, 0, len(pot))
@@ -498,7 +527,7 @@ func showEntirePot(pot map[string]string) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-
+		// k = "algo:salt:mac"
 		algo, rest, _ := strings.Cut(k, ":")
 		mac := k
 		if _, m, ok := strings.Cut(rest, ":"); ok {
@@ -518,7 +547,9 @@ func showCrackedFromPot(hashes []*hashcrack.Hash, pot map[string]string) {
 	for _, h := range hashes {
 		pw, ok := pot[hashcrack.AlgoName(h.Algo)+":"+h.SaltHashLine()]
 		if !ok {
-
+			// A Supermicro fixed-key hash is cracked-equivalent (the account
+			// authenticates against a known firmware key, not a password), so
+			// surface it even if it was never written to the potfile.
 			if !h.SMCFixedKey {
 				continue
 			}
@@ -648,6 +679,7 @@ func commaDigits(s string) string {
 	return sign + b.String()
 }
 
+// cut truncates s to n runes with an ellipsis.
 func cut(s string, n int) string {
 	if len(s) <= n {
 		return s

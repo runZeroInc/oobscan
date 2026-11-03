@@ -1,3 +1,15 @@
+// Package hashcrack loads IPMI 2.0 RAKP HMAC hashes out of scan JSONL and cracks
+// them offline, backing the `hashdump` and `hashcrack` subcommands.
+//
+// All three RAKP authentication algorithms are cracked natively: HMAC-SHA1
+// (auth_algo 1), HMAC-MD5 (2), HMAC-SHA256 (3). hashcat and stock John implement
+// only SHA1 (-m 7300 / --format=RAKP), so MD5/SHA256 hashes are crackable here or
+// with the custom John formats `hashdump --john` targets.
+//
+// The salt layout must not be reimplemented here: LoadScans reconstructs an
+// ipmi.RAKPResult per record and calls its Salt() method, so the offline crack uses
+// the same bytes as the live probe and the hashcat/John export. pkg/ipmi/rakp.go is
+// the single source of truth.
 package hashcrack
 
 import (
@@ -21,12 +33,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// RAKP authentication algorithm numbers (IPMI 2.0, RMCP+ Table 13-17).
 const (
 	AlgoSHA1   byte = 1
 	AlgoMD5    byte = 2
 	AlgoSHA256 byte = 3
 )
 
+// AlgoName renders an algorithm number as its cipher name.
 func AlgoName(a byte) string {
 	switch a {
 	case AlgoSHA1:
@@ -39,6 +53,8 @@ func AlgoName(a byte) string {
 	return "?"
 }
 
+// AlgoFromName parses a cipher token ("md5"/"sha1"/"sha256", the numeric algo, or
+// the hashcat mode 7300) into an algorithm number.
 func AlgoFromName(s string) (byte, bool) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "sha1", "1", "7300":
@@ -51,10 +67,15 @@ func AlgoFromName(s string) (byte, bool) {
 	return 0, false
 }
 
+// AllAlgos is the default cipher set (md5,sha1,sha256).
 var AllAlgos = []byte{AlgoMD5, AlgoSHA1, AlgoSHA256}
 
 var smcRAKPFixedKey = mustHex("fab979d849be933dd0c41fd2c9d77a30aa8d3f50") //nolint:gosec // this is a secret, but not OUR secret
 
+// SMCRAKPOEMKeyLabel is the synthetic *password* value used to mark hashes that
+// validate with the fixed Supermicro OEM key: the real account has no bearing on
+// the HMAC, so there is no password to recover, but the account name is still
+// meaningful and is preserved (see Hash.SMCFixedKey / Hash.Username).
 const SMCRAKPOEMKeyLabel = "(SMC-RAKP-OEM-KEY)"
 
 func mustHex(s string) []byte {
@@ -65,6 +86,8 @@ func mustHex(s string) []byte {
 	return b
 }
 
+// MatchSMCRAKPFixedKey reports whether h validates with the known fixed
+// Supermicro SMCRAKP OEM key observed in ATEN firmware.
 func MatchSMCRAKPFixedKey(h *Hash) bool {
 	if h == nil || len(h.MAC) == 0 {
 		return false
@@ -80,11 +103,15 @@ func MatchSMCRAKPFixedKey(h *Hash) bool {
 
 func labelSMCRAKPFixedKey(h *Hash) {
 	if MatchSMCRAKPFixedKey(h) {
-
+		// The username is authenticated against a fixed firmware key, not a
+		// password, so flag the hash rather than overwriting the account name.
+		// The synthetic label is applied to the *password* at report time.
 		h.SMCFixedKey = true
 	}
 }
 
+// ParseCiphers turns a cipher list ("md5,sha256") into a want-set. Unknown
+// tokens are returned so callers can warn. An empty/all-unknown list yields nil.
 func ParseCiphers(tokens []string) (want map[byte]bool, unknown []string) {
 	want = map[byte]bool{}
 	for _, t := range tokens {
@@ -103,6 +130,7 @@ func ParseCiphers(tokens []string) (want map[byte]bool, unknown []string) {
 	return want, unknown
 }
 
+// hashCtor returns the hash constructor for an algorithm (for crypto/hmac.New).
 func hashCtor(a byte) func() hash.Hash {
 	switch a {
 	case AlgoSHA1:
@@ -115,20 +143,23 @@ func hashCtor(a byte) func() hash.Hash {
 	return nil
 }
 
+// macLen returns the full HMAC digest length (bytes) for an algorithm, or 0 if
+// unknown. A valid RAKP-2 auth code is always exactly this long.
 func macLen(a byte) int {
 	switch a {
 	case AlgoSHA1:
-		return sha1.Size
+		return sha1.Size // 20
 	case AlgoMD5:
-		return md5.Size
+		return md5.Size // 16
 	case AlgoSHA256:
-		return sha256.Size
+		return sha256.Size // 32
 	}
 	return 0
 }
 
 func algoCrackCost(a byte) int {
-
+	// Heuristic ordering for "cheapest first" target selection.
+	// Lower score = preferred when multiple algos exist for one host+user.
 	switch a {
 	case AlgoMD5:
 		return 1
@@ -141,30 +172,46 @@ func algoCrackCost(a byte) int {
 	}
 }
 
+// Hash is one RAKP-2 HMAC to crack, with the source-host metadata carried
+// alongside so crack output can report IP / fingerprint / services / user.
 type Hash struct {
-	GID      int
+	GID      int // global index (for the solved bitmap)
 	IP       string
 	Vendor   string
 	Product  string
 	Version  string
 	Services string
-	Source   string
+	Source   string // scan file basename
 	Username string
 	Algo     byte
 	Salt     []byte
 	MAC      []byte
-
+	// SMCFixedKey marks a hash that validates against the fixed Supermicro/ATEN
+	// OEM RAKP key rather than an account password. Username stays the real
+	// account; the recovered "password" is reported as SMCRAKPOEMKeyLabel.
 	SMCFixedKey bool
 }
 
+// SaltHashLine renders "salthex:machex" (the hashcat -m 7300 line for SHA1, and
+// the salt$hmac body used for the John $rakp$ formats).
 func (h *Hash) SaltHashLine() string { return fmt.Sprintf("%x:%x", h.Salt, h.MAC) }
 
+// JohnLine renders the John "$rakp$<salt>$<hmac>" line. The HMAC hex length
+// (40/32/64) selects the RAKP / RAKP-MD5 / RAKP-SHA256 format.
 func (h *Hash) JohnLine() string { return fmt.Sprintf("$rakp$%x$%x", h.Salt, h.MAC) }
 
+// Tally counts hashes per algorithm.
 type Tally map[byte]int
 
+// Total returns the sum across algorithms.
 func (t Tally) Total() int { return t[AlgoSHA1] + t[AlgoMD5] + t[AlgoSHA256] }
 
+// --- scan JSONL parsing -------------------------------------------------------
+
+// scanRec mirrors the fields of output.Result / output.RAKPRecord that we need.
+// It is intentionally a loose local struct (not an import of pkg/output) so the
+// reader accepts known finding ID field variants without pulling in the TTY
+// renderer.
 type scanRec struct {
 	Host     string `json:"host"`
 	Identity struct {
@@ -251,6 +298,7 @@ func firstAttrStr(m map[string]any, keys ...string) string {
 	return ""
 }
 
+// findingID returns the finding's identifier under either known schema field.
 func findingID(f map[string]any) string {
 	if v, ok := f["check"]; ok {
 		return fmt.Sprint(v)
@@ -261,6 +309,7 @@ func findingID(f map[string]any) string {
 	return ""
 }
 
+// deriveVersion pulls a best-effort firmware/version string.
 func deriveVersion(r *scanRec) string {
 	for _, k := range []string{"ipmiFirmwareVersion", "iloFirmwareVersion", "redfishFirmwareVersion", "idracFirmwareVersion", "firmwareVersion", "ipmi.fw", "ilo.fw", "redfish.fw", "idrac.fw", "fw", "version"} {
 		if v := attrStr(r.Identity.Attributes, k); v != "" {
@@ -284,6 +333,7 @@ func deriveVersion(r *scanRec) string {
 	return ""
 }
 
+// deriveServices summarizes exposed services as a compact "proto/port,..." set.
 func deriveServices(r *scanRec) string {
 	set := map[string]struct{}{}
 	for _, f := range r.Findings {
@@ -320,6 +370,16 @@ func deriveServices(r *scanRec) string {
 	return strings.Join(out, ",")
 }
 
+// LoadScans parses the scan JSONL files, reconstructs each RAKP hash + salt (via
+// ipmi.RAKPResult.Salt), and returns them plus a per-algo tally.
+//
+// wantAlgo, when non-nil, restricts the loaded algorithms.
+//
+// dedupHostUser controls the dedup key. When true, one hash is kept per (host,
+// username), preferring the cheapest algorithm among the selected ciphers, since
+// multiple sessions of one account carry different nonces (different salts) but the
+// same password. When false, only exact (algo, salt, mac) duplicates are dropped,
+// which is what `hashdump` wants so it emits every distinct hash.
 func LoadScans(paths []string, wantAlgo map[byte]bool, dedupHostUser bool) ([]*Hash, Tally, error) {
 	var out []*Hash
 	seenExact := map[string]struct{}{}
@@ -327,6 +387,8 @@ func LoadScans(paths []string, wantAlgo map[byte]bool, dedupHostUser bool) ([]*H
 	tally := Tally{}
 	gid := 0
 
+	// processLine folds one NDJSON record into the accumulators. It is a closure
+	// so the read loop below can stay a thin, robust line reader.
 	processLine := func(line []byte, base string) {
 		var r scanRec
 		if json.Unmarshal(line, &r) != nil {
@@ -350,11 +412,14 @@ func LoadScans(paths []string, wantAlgo map[byte]bool, dedupHostUser bool) ([]*H
 			if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
 				continue
 			}
-
+			// A RAKP-2 auth code is always a full HMAC digest; a short/long value
+			// is a truncated or error response (uncrackable), so drop it. This
+			// also makes hashdump --hashcat byte-match ipmi.Hashcat()'s own gate.
 			if want := macLen(a); want == 0 || len(mac) != want {
 				continue
 			}
-
+			// Reconstruct via ipmi.RAKPResult so the salt bytes are byte-identical
+			// to the live probe / hashcat / John export (single source of truth).
 			rr := &ipmi.RAKPResult{
 				Username:   e.Username,
 				AuthAlgo:   a,
@@ -375,7 +440,7 @@ func LoadScans(paths []string, wantAlgo map[byte]bool, dedupHostUser bool) ([]*H
 			if dedupHostUser {
 				key := r.Host + "|" + h.Username
 				if prev, ok := bestByHostUser[key]; ok {
-
+					// Keep the cheaper algorithm for this host+user pair.
 					if algoCrackCost(a) >= algoCrackCost(prev.Algo) {
 						continue
 					}
@@ -419,7 +484,9 @@ func LoadScans(paths []string, wantAlgo map[byte]bool, dedupHostUser bool) ([]*H
 			}
 			src = gz
 		}
-
+		// A bufio.Reader grows to hold a whole line, so a record carrying a large
+		// post-auth blob, web-login transcript or preserved runZero service_data
+		// no longer trips a fixed scan-token cap (bufio.Scanner: token too long).
 		rdr := bufio.NewReaderSize(src, 1<<20)
 		var readErr error
 		for {
@@ -463,11 +530,20 @@ func LoadScans(paths []string, wantAlgo map[byte]bool, dedupHostUser bool) ([]*H
 	return out, tally, nil
 }
 
+// credFieldKeys are the finding.fields keys that carry cleartext credential
+// material worth reusing as crack candidates (recovered/observed passwords and
+// account names). SMCRAKP fixed-key labels and empty/synthetic values are
+// filtered by HarvestSeeds.
 var credFieldKeys = []string{
 	"password", "pass", "cracked", "credential",
 	"username", "user", "usernames",
 }
 
+// HarvestSeeds scans the same JSONL file(s) and returns the distinct cleartext
+// credential strings observed in them: RAKP usernames plus cleartext user/password
+// values from finding fields. The deduplicated, stably-ordered result feeds
+// Options.ExtraSeeds, so a password recovered on one host is tried against every
+// other host and account.
 func HarvestSeeds(paths []string) ([]string, error) {
 	seen := map[string]struct{}{}
 	var out []string
@@ -476,7 +552,7 @@ func HarvestSeeds(paths []string) ([]string, error) {
 		if v == "" {
 			return
 		}
-
+		// Skip synthetic / non-password labels.
 		if v == SMCRAKPOEMKeyLabel || strings.HasPrefix(v, "<") || strings.HasPrefix(v, "(") {
 			return
 		}
@@ -506,9 +582,9 @@ func HarvestSeeds(paths []string) ([]string, error) {
 					continue
 				}
 				s := fmt.Sprint(v)
-
+				// "usernames" is a comma-joined list; split it.
 				if key == "usernames" && strings.Contains(s, ",") {
-					for part := range strings.SplitSeq(s, ",") {
+					for _, part := range strings.Split(s, ",") {
 						add(part)
 					}
 					continue

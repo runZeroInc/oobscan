@@ -9,6 +9,9 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// The full IPMI walk is a deep, higher-volume probe (broad NetFn/Cmd sweep +
+// IPMB satellite discovery). It self-gates on the target's IPMIFull flag
+// (--ipmi-full) so the default scan never triggers it.
 func init() {
 	Register(Check{
 		Name:        "ipmi.fullWalk",
@@ -36,7 +39,8 @@ func runIPMIFull(ctx context.Context, t *engine.Target) []engine.Finding {
 		Concurrency:         16,
 		Logf:                t.Progress,
 	}
-
+	// A full command walk is only reached with the explicit opt-in; widen the
+	// command space when the operator also accepts destructive probing.
 	if t.Destructive {
 		cfg.Cmds = ipmi.AllCmds()
 	}
@@ -65,6 +69,7 @@ func runIPMIFull(ctx context.Context, t *engine.Target) []engine.Finding {
 			"probes", fmt.Sprintf("%d", len(res.Requests))),
 	}}
 
+	// Surface IPMB satellite controllers reachable pre-auth as their own finding.
 	if ipmb, err := ipmi.SweepIPMBBridge(t.Host, port, t.Timeout, t.Progress); err == nil && ipmb != nil && len(ipmb.Reachable) > 0 {
 		t.SetEvidence("ipmi.ipmb", ipmb)
 		findings = append(findings, engine.Finding{

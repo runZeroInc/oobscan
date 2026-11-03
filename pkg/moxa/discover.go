@@ -1,3 +1,12 @@
+// Package moxa implements the Moxa NPort / ioLogik "DeviceSearch" discovery
+// protocol (UDP/4800). Unauthenticated; returns model, firmware version,
+// MAC, and IP of every NPort on the management LAN.
+//
+// Packet format (from Moxa's DeviceSearch v1.x documented source):
+//
+//	type(1) | opcode(1) | length(2 BE) | data...
+//
+// Opcode 0x01 + type 0x00 = query; reply opcode 0x81.
 package moxa
 
 import (
@@ -12,8 +21,13 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// fwVersionRE matches a Moxa firmware version token such as "V1.15" or
+// "V3.4.2". Anchoring on a strict V<major>.<minor> shape avoids matching the
+// stray capital V inside a model/hostname string (e.g. the "V"-free "NPort").
 var fwVersionRE = regexp.MustCompile(`(?i)V(?:er\.?\s*)?\d+\.\d+(?:\.\d+)?[0-9A-Za-z.]*`)
 
+// extractFirmware pulls a Moxa firmware version from the reply data using the
+// strict V<major>.<minor> shape, or returns "" when none is present.
 func extractFirmware(data []byte) string {
 	if m := fwVersionRE.Find(data); m != nil {
 		s := string(m)
@@ -25,12 +39,24 @@ func extractFirmware(data []byte) string {
 	return ""
 }
 
+// DiscoveryPort is the DeviceSearch UDP port.
 const DiscoveryPort = 4800
 
+// maxDiscoverReads bounds the broadcast read loop so a host flooding the
+// socket with DeviceSearch-shaped or junk datagrams cannot keep it busy until
+// the deadline. A real LAN yields a bounded set of appliance replies.
 const maxDiscoverReads = 128
 
+// MagicQuery is the canonical DeviceSearch identify query.
+//
+// Verified against Metasploit's Moxa modules:
+//
+//	\x01\x00\x00\x08\x00\x00\x00\x00
+//
+// where byte 0 is function code 0x01 and byte 3 is payload length.
 var MagicQuery = []byte{0x01, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00}
 
+// Response is one device's reply.
 type Response struct {
 	From     string
 	Raw      []byte
@@ -44,6 +70,8 @@ type Response struct {
 	Ports    int
 }
 
+// Discover broadcasts a DeviceSearch query. Broadcast defaults to
+// 255.255.255.255 if blank.
 func Discover(broadcast string, timeout time.Duration) ([]Response, error) {
 	if broadcast == "" {
 		broadcast = "255.255.255.255"
@@ -76,6 +104,7 @@ func Discover(broadcast string, timeout time.Duration) ([]Response, error) {
 	return out, nil
 }
 
+// Query hits a specific host on UDP/4800.
 func Query(host string, timeout time.Duration) (*Response, error) {
 	conn, err := net.DialTimeout("udp", netaddr.DialHostPort(host, DiscoveryPort), timeout)
 	if err != nil {
@@ -114,7 +143,8 @@ func parseCanonicalReply(r Response, b []byte) (Response, bool) {
 	if len(b) < 24 || b[0] != 0x81 {
 		return r, false
 	}
-
+	// Metasploit and Talos docs describe a fixed 24-byte identify response.
+	// Some devices may append bytes, so require a minimum length only.
 	mac := b[14:20]
 	ip := b[20:24]
 	if slicesEqual(mac, []byte{0, 0, 0, 0, 0, 0}) || slicesEqual(mac, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
@@ -253,7 +283,7 @@ func parseMAC(data []byte) (int, string) {
 			}
 		}
 	}
-
+	// Fallback for variant layouts: first plausible OUI-bearing 6-byte run.
 	for i := 0; i+6 <= len(data); i++ {
 		if mac := moxaMAC(data[i : i+6]); mac != "" {
 			return i, mac

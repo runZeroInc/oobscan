@@ -9,6 +9,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/ipmi"
 )
 
+// The IPMI 1.5 session check covers the pre-2.0 LAN login path (Get Session
+// Challenge -> Activate Session, pkg/ipmi/session15.go) that the RAKP
+// credential check cannot touch. It emits three findings: authNoneSession and
+// defaultCreds at critical (a no-auth session established, and a default
+// credential accepted by Activate Session -- a real login gated on
+// !t.DisableLogins), and usernameOracle at low (accounts distinguished
+// pre-auth via the Get Session Challenge completion code). Auth-caps are
+// reused from evidence key "ipmi.authCaps" rather than re-probed.
 func init() {
 	Register(Check{
 		Name:        "ipmi.v15.session",
@@ -28,10 +36,12 @@ func runIPMI15Session(ctx context.Context, t *engine.Target) []engine.Finding {
 
 	opts := ipmi.V15Options{
 		Vendor:  vendor,
-		Online:  !t.DisableLogins,
+		Online:  !t.DisableLogins, // Activate-Session login is a real login (lockout risk)
 		Timeout: t.Timeout,
 	}
-
+	// Gate on the already-parsed auth-caps when identify stashed them, so the
+	// engine skips paths the BMC's advertised auth modes make pointless (e.g. no
+	// auth-None probe when auth-None is not advertised) with no extra probe.
 	var caps *ipmi.AuthCaps
 	if v, ok := t.Evidenced("ipmi.authCaps"); ok {
 		if ac, ok := v.(*ipmi.AuthCaps); ok && ac != nil {
@@ -39,7 +49,15 @@ func runIPMI15Session(ctx context.Context, t *engine.Target) []engine.Finding {
 			opts.Caps = ac
 		}
 	}
-
+	// Some BMC stacks (e.g. OpenBMC's phosphor-net-ipmid) speak RMCP+/IPMI 2.0
+	// over UDP/623 but silently ignore every legacy 1.5 sessionless frame,
+	// including the Get Channel Auth Caps probe identify already retried before
+	// giving up. If that probe got no answer (caps == nil) but 2.0 cipher-suite
+	// enumeration did, the BMC is proven reachable yet proven to ignore 1.5
+	// framing, so running the full blind 1.5 suite would just burn a dozen-plus
+	// timeouts for a guaranteed-empty result and stall the RAKP/2.0 checks
+	// queued behind it in the serial IPMI lane -- skip outright rather than
+	// probe blind.
 	if caps == nil {
 		if _, ok := t.Evidenced("ipmi.ciphers"); ok {
 			if t.DebugLog != nil {
@@ -48,15 +66,26 @@ func runIPMI15Session(ctx context.Context, t *engine.Target) []engine.Finding {
 			return nil
 		}
 	}
+	// A supplied credential is worth trying via the online 1.5 login too, so it is
+	// not silently confined to the RAKP path. Prefer it as the first candidate by
+	// leaving vendor prioritization intact - CredsFor already puts operator-
+	// supplied usernames' vendor rows first; the explicit pair still flows through
+	// the cred KB, so we do not special-case it here beyond enabling online.
 
 	rep := ipmi.RunSession15(ctx, t.Host, t.IPMIPort(), opts)
 	if rep == nil {
-		return nil
+		return nil // unreachable / no 1.5 session surface; emit nothing (no none-noise)
 	}
 	t.SetEvidence("ipmi.v15", rep)
 
 	var findings []engine.Finding
 
+	// (1) auth-None session confirmed: a session was actually established with
+	// authType=None and a null user. This is unauthenticated access, the 1.5
+	// analog of cipher-0 (ipmi.v20.cipherZero), so critical with matching proof text.
+	// The post-login capability probe (Set Session Privilege + a read-only
+	// in-session command) upgrades "session established" to "in-session commands
+	// executed at <priv>".
 	if rep.AuthNoneOK {
 		proof := proofKV("authType", "none")
 		if c := rep.AuthNoneCaps; c != nil {
@@ -70,6 +99,9 @@ func runIPMI15Session(ctx context.Context, t *engine.Target) []engine.Finding {
 		})
 	}
 
+	// (2) default credential accepted by Activate Session. Verified by an actual
+	// login (not a hash match), so critical. The capability probe reports what the
+	// authenticated session could actually do.
 	if rep.DefaultCred != nil {
 		dc := rep.DefaultCred
 		proof := proofKV("activateSession", "ok")
@@ -89,6 +121,8 @@ func runIPMI15Session(ctx context.Context, t *engine.Target) []engine.Finding {
 
 	findings = append(findings, v15UsernameOracleFindings(rep)...)
 
+	// Nothing found: emit no finding rather than a risk=none placeholder, in line
+	// with suppressing non-actionable negative results across the scan.
 	return stampIPMI(findings, t.IPMIPort())
 }
 
@@ -96,8 +130,11 @@ func v15UsernameOracleFindings(rep *ipmi.V15Report) []engine.Finding {
 	if rep == nil || len(rep.ValidUsernames) == 0 {
 		return nil
 	}
-
-	nonNullOracleCount := len(ipmi.V15OracleUserList()) - 1
+	// Some BMCs return CC 0x00 for every non-null username in Get Session
+	// Challenge regardless of whether the account exists. When all non-null oracle
+	// candidates pass, the oracle cannot discriminate real accounts; report the
+	// wildcard behavior, not a long list of supposedly valid usernames.
+	nonNullOracleCount := len(ipmi.V15OracleUserList()) - 1 // first entry is null/anonymous
 	if len(rep.ValidUsernames) >= nonNullOracleCount {
 		return []engine.Finding{{
 			Check: "ipmi.v15.oracleBlind", Category: "auth", Risk: "info",
@@ -114,7 +151,9 @@ func v15UsernameOracleFindings(rep *ipmi.V15Report) []engine.Finding {
 		names = append(names, userLabel(e.Username))
 		validCC = e.CC
 	}
-
+	// Proof is the completion-code differential the oracle keys on: CC 0x00 for
+	// the accounts that exist vs the rejection CC for one that does not, e.g.
+	// "Get Session Challenge cc=0x00 for ADMIN,root (valid); cc=0x81 for guest (invalid)".
 	proof := proofKV("validCc", fmt.Sprintf("0x%02x", validCC), "validUsers", strings.Join(names, ","))
 	if rep.OracleInvalidUser != "" {
 		proof += " " + proofKV("invalidCc", fmt.Sprintf("0x%02x", rep.OracleInvalidCC), "invalidUser", rep.OracleInvalidUser)
@@ -128,6 +167,7 @@ func v15UsernameOracleFindings(rep *ipmi.V15Report) []engine.Finding {
 	}}
 }
 
+// privName renders an IPMI privilege-level number as its spec name for output.
 func privName(p byte) string {
 	switch p & 0x0f {
 	case 0x01:
@@ -144,6 +184,12 @@ func privName(p byte) string {
 		return fmt.Sprintf("0x%02x", p)
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Explainers -- registered next to the check that emits each finding so that
+// changing the finding fields and updating the validation guide happen in the
+// same diff.
+// ----------------------------------------------------------------------------
 
 func init() {
 	RegisterExplain("ipmi.v15.authNoneSession", explainIPMI15AuthNone)

