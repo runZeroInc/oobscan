@@ -11,11 +11,8 @@ and support authorized incident investigation. It provides:
 - Network inventory and exposure assessment to help operators prioritize fixes.
 - Manual protocol diagnostics for IPMI and vendor-specific management operations.
 
-## See it in action
+## Demonstrations
 
-These looping terminal demos were recorded against an authorized mixed-device
-lab. Target addresses and sensitive output are redacted before publication.
-The original asciinema recordings are stored beside each GIF as `.cast` files.
 
 ### Scan a management network
 
