@@ -11,6 +11,72 @@ and support authorized incident investigation. It provides:
 - Network inventory and exposure assessment to help operators prioritize fixes.
 - Manual protocol diagnostics for IPMI and vendor-specific management operations.
 
+## See it in action
+
+These looping terminal demos were recorded against an authorized mixed-device
+lab. Target addresses and sensitive output are redacted before publication.
+The original asciinema recordings are stored beside each GIF as `.cast` files.
+
+### Scan a management network
+
+Discover and assess BMCs and other out-of-band devices across multiple subnets.
+
+![Demo 1: 01-scan](docs/demos/01-scan.gif)
+![Demo 2: 02-hashdump](docs/demos/02-hashdump.gif)
+![Demo 3: 03-hashcrack](docs/demos/03-hashcrack.gif)
+![Demo 4: 04-explain](docs/demos/04-explain.gif)
+![Demo 5: 05-report](docs/demos/05-report.gif)
+![Demo 6: 06-smc-rakp-bypass](docs/demos/06-smc-rakp-bypass.gif)
+![Demo 7: 07-smc-priv-esc](docs/demos/07-smc-priv-esc.gif)
+![Demo 8: 08-ipmi-user-list](docs/demos/08-ipmi-user-list.gif)
+
+<details>
+<summary><strong>Explore seven more workflows</strong></summary>
+
+### Export RAKP audit inputs
+
+Prepare captured weak hashes for authorized offline audits with hashcat or John.
+
+![Looping terminal demo of oobscan hash export](docs/demos/02-hashdump.gif)
+
+### Crack weak RAKP hashes
+
+Audit captured RAKP hashes against vendor defaults and operator-supplied candidates.
+
+![Looping terminal demo of oobscan offline hash cracking](docs/demos/03-hashcrack.gif)
+
+### Generate a validation guide
+
+Turn findings into scoped validation and remediation guidance.
+
+![Looping terminal demo of oobscan explain](docs/demos/04-explain.gif)
+
+### Build an offline report
+
+Generate a self-contained HTML exposure report from a redacted corpus.
+
+![Looping terminal demo of oobscan report generation](docs/demos/05-report.gif)
+
+### Validate the Supermicro RAKP bypass
+
+Probe for the ATEN unordered-RAKP authentication bypass without opening a session.
+
+![Looping terminal demo of the Supermicro RAKP bypass probe](docs/demos/06-smc-rakp-bypass.gif)
+
+### Validate ATEN privilege escalation
+
+Probe whether a reserved RAKP role can inherit Administrator privileges.
+
+![Looping terminal demo of the ATEN privilege-escalation probe](docs/demos/07-smc-priv-esc.gif)
+
+### Inspect BMC users over IPMI
+
+Use a recovered weak credential to review account status and privilege levels.
+
+![Looping terminal demo of IPMI user inventory](docs/demos/08-ipmi-user-list.gif)
+
+</details>
+
 ## Research and disclosures
 
 The [Lights Out: The server in your server, exposed and disclosed](https://www.runzero.com/blog/lights-out-exposed/)

@@ -1,0 +1,7 @@
+{"version":3,"term":{"cols":80,"rows":30,"type":"xterm-256color","version":"xterm.js(6.1.0-beta.304)"},"timestamp":1793737404,"idle_time_limit":1.5,"command":"/tmp/oobscan-demo-wrapper.sh oobscan\\ report\\ --no-artifacts\\ -o\\ report\\ shareable.jsonl.gz rm\\ -rf\\ report\\;\\ TERM=xterm-256color\\ /dev/shm/oobscan\\ report\\ --no-artifacts\\ --output\\ report\\ --title\\ \\'BMC\\ Lab\\ Assessment\\'\\ shareable.jsonl.gz\\;\\ find\\ report\\ -maxdepth\\ 1\\ -type\\ f\\ -printf\\ \\'%f\\ \\ %s\\ bytes\\\\n\\'\\ \\|\\ sort","env":{"SHELL":"/bin/zsh"}}
+[0.045, "o", "\u001b[1;32mroot@bmc-lab\u001b[0m:\u001b[1;34m~\u001b[0m# oobscan report --no-artifacts -o report shareable.jsonl.gz\r\r\n"]
+[0.894, "o", "\r\u001b[K  Reading shareable.jsonl.gz  1 records · 6/s · 0s"]
+[0.012, "o", "\r\u001b[K\u001b[38;5;245mINFO    \u001b[0m Loaded source \u001b[38;5;248mname=shareable hosts=53 redacted=true\u001b[0m\r\n"]
+[0.002, "o", "\u001b[38;5;245mINFO    \u001b[0m Report written \u001b[38;5;248mindex=report/index.html sources=1 comparison=false\u001b[0m\r\n"]
+[0.006, "o", "index.html  121619 bytes\r\n"]
+[0.002, "x", "0"]
